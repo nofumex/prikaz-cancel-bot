@@ -36,26 +36,25 @@ def to_attachments(keyboard: MaxKeyboard | None) -> list[dict] | None:
 
 def main_menu() -> MaxKeyboard:
     return [
-        [btn("Подготовить заявление", "case:new")],
-        [btn("Профиль", "profile:show")],
-        [btn("Связаться с менеджером", "chat:start")],
+        [btn("📝 Подготовить заявление", "case:new")],
+        [btn("👤 Профиль", "profile:show"), btn("💬 Менеджер", "chat:start")],
     ]
 
 
 def envelope_choice() -> MaxKeyboard:
-    return [[btn("Отправить фото конверта", "case:envelope_photo")], [btn("Указать дату вручную", "case:manual_date")]]
+    return [[btn("📸 Отправить фото конверта", "case:envelope_photo")], [btn("✍️ Указать дату вручную", "case:manual_date")]]
 
 
 def pay_menu(payment_url: str | None = None) -> MaxKeyboard:
     rows: MaxKeyboard = []
     if payment_url:
-        rows.append([btn("Оплатить", url=payment_url)])
-    rows.append([btn("Я оплатил", "payment:check")])
-    rows.append([btn("Главное меню", "menu:main")])
+        rows.append([btn("💳 Оплатить", url=payment_url)])
+    rows.append([btn("✅ Я оплатил", "payment:check")])
+    rows.append([btn("🏠 Главное меню", "menu:main")])
     return rows
 
 
 def chat_end_menu() -> MaxKeyboard:
-    return [[btn("Завершить чат", "chat:end")]]
+    return [[btn("✅ Завершить чат", "chat:end")]]
 
 

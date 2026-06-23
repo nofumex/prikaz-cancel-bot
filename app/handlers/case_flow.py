@@ -13,15 +13,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.enums import CaseStatus
-from app.keyboards.common import case_menu, confirm_extraction, envelope_choice, main_menu
+from app.keyboards.common import case_menu, confirm_extraction, edit_fields_menu, envelope_choice, main_menu
 from app.models import Case, User
 from app.services.cases import create_case, latest_case, latest_open_case, save_photo_path, set_received_date
 from app.services.documents import create_case_documents, extraction_preview
-from app.services.llm import extract_envelope_date, extract_order_data, missing_order_fields
 from app.services.app_settings import payments_enabled
+from app.services.legal_data import FIELD_LABELS, missing_order_fields, normalize_order_data, validate_before_generation
+from app.services.llm import extract_envelope_date, extract_order_data
 from app.services.payments import ensure_payment
 from app.texts import case_summary, payment_text
-from app.utils import ensure_dir, parse_russian_date
+from app.utils import ensure_dir, h, parse_russian_date
 
 router = Router(name="case_flow")
 logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ class CaseStates(StatesGroup):
     waiting_envelope_photo = State()
     waiting_manual_date = State()
     waiting_manual_fields = State()
+    waiting_field_value = State()
 
 
 async def _download_photo(bot: Bot, message: Message, case_id: int, kind: str) -> Path:
@@ -185,54 +187,89 @@ async def _extract_and_confirm(message: Message, state: FSMContext, session: Asy
             "Нейросеть не смогла прочитать приказ. Можно ввести ключевые данные вручную или связаться с менеджером.",
             reply_markup=confirm_extraction(),
         )
-    missing = missing_order_fields(extracted)
+    extracted = normalize_order_data(extracted)
+    missing = missing_order_fields(extracted, case.received_date)
     case.extracted_json = json.dumps(extracted, ensure_ascii=False)
     case.missing_fields = json.dumps(missing, ensure_ascii=False)
     case.status = CaseStatus.NEEDS_REVIEW.value if missing else CaseStatus.PROCESSING.value
     await session.commit()
-    await message.answer(extraction_preview(extracted, case.received_date, missing), reply_markup=confirm_extraction())
+    await message.answer(extraction_preview(extracted, case.received_date, missing, case.deadline_date), reply_markup=confirm_extraction())
 
 
 @router.callback_query(F.data == "case:manual_fields")
-async def manual_fields(callback: CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User) -> None:
+@router.callback_query(F.data == "case:edit_fields")
+async def edit_fields(callback: CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User) -> None:
     case = await latest_open_case(session, current_user.id)
     if not case:
         await callback.message.answer("Не нашел активное заявление.", reply_markup=main_menu())
         await callback.answer()
         return
     await state.update_data(case_id=case.id)
-    await state.set_state(CaseStates.waiting_manual_fields)
     await callback.message.answer(
-        "Отправьте данные одним сообщением в свободной форме:\n\n"
-        "Суд, адрес суда, ФИО должника, адрес должника, взыскатель, номер дела, дата приказа, сумма долга.\n\n"
-        "Я добавлю это в заявление вместо пропусков."
+        "✏️ <b>Что нужно исправить?</b>\n\nВыберите поле, отправьте новое значение, и я снова покажу карточку проверки.",
+        reply_markup=edit_fields_menu(),
     )
     await callback.answer()
+
+@router.callback_query(F.data == "case:review")
+async def review_case(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+    case = await latest_open_case(session, current_user.id)
+    if not case:
+        await callback.message.answer("Не нашел активное заявление.", reply_markup=main_menu())
+        await callback.answer()
+        return
+    data = normalize_order_data(json.loads(case.extracted_json or "{}"))
+    missing = missing_order_fields(data, case.received_date)
+    case.missing_fields = json.dumps(missing, ensure_ascii=False)
+    case.status = CaseStatus.NEEDS_REVIEW.value if missing else CaseStatus.PROCESSING.value
+    await session.commit()
+    await callback.message.answer(extraction_preview(data, case.received_date, missing, case.deadline_date), reply_markup=confirm_extraction())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("case:field:"))
+async def choose_field(callback: CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User) -> None:
+    case = await latest_open_case(session, current_user.id)
+    if not case:
+        await callback.message.answer("Не нашел активное заявление.", reply_markup=main_menu())
+        await callback.answer()
+        return
+    field = callback.data.split(":")[-1]
+    label = FIELD_LABELS.get(field, field)
+    data = normalize_order_data(json.loads(case.extracted_json or "{}"))
+    current = data.get(field) or "пусто"
+    await state.update_data(case_id=case.id, edit_field=field)
+    await state.set_state(CaseStates.waiting_field_value)
+    await callback.message.answer(f"Введите новое значение для поля <b>{label}</b>.\n\nСейчас: <code>{h(current)}</code>")
+    await callback.answer()
+
+
+@router.message(CaseStates.waiting_field_value)
+async def process_field_value(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    state_data = await state.get_data()
+    case = await session.get(Case, state_data["case_id"])
+    field = state_data["edit_field"]
+    value = (message.text or "").strip()
+    if not value:
+        await message.answer("Значение не должно быть пустым. Напишите новое значение текстом.")
+        return
+    extracted = normalize_order_data(json.loads(case.extracted_json or "{}"))
+    extracted[field] = value
+    extracted = normalize_order_data(extracted)
+    missing = missing_order_fields(extracted, case.received_date)
+    case.extracted_json = json.dumps(extracted, ensure_ascii=False)
+    case.missing_fields = json.dumps(missing, ensure_ascii=False)
+    case.status = CaseStatus.NEEDS_REVIEW.value if missing else CaseStatus.PROCESSING.value
+    await session.commit()
+    await state.clear()
+    await message.answer("✅ Поле обновлено.")
+    await message.answer(extraction_preview(extracted, case.received_date, missing, case.deadline_date), reply_markup=confirm_extraction())
 
 
 @router.message(CaseStates.waiting_manual_fields)
 async def process_manual_fields(message: Message, state: FSMContext, session: AsyncSession) -> None:
-    data = await state.get_data()
-    case = await session.get(Case, data["case_id"])
-    extracted = json.loads(case.extracted_json or "{}")
-    extracted["manual_note"] = message.text or ""
-    for key, label in {
-        "court_name": "суд",
-        "debtor_full_name": "фио должника",
-        "debtor_address": "адрес должника",
-        "creditor_name": "взыскатель",
-        "case_number": "номер дела",
-        "order_date": "дата приказа",
-        "debt_amount": "сумма долга",
-    }.items():
-        if not extracted.get(key):
-            extracted[key] = f"уточнить по сообщению клиента: {label}"
-    case.extracted_json = json.dumps(extracted, ensure_ascii=False)
-    case.missing_fields = "[]"
-    case.status = CaseStatus.PROCESSING.value
-    await session.commit()
     await state.clear()
-    await message.answer("Данные добавлены. Можно готовить документы.", reply_markup=confirm_extraction())
+    await message.answer("Теперь данные исправляются по одному полю через кнопки.", reply_markup=edit_fields_menu())
 
 
 @router.callback_query(F.data == "case:generate")
@@ -242,8 +279,28 @@ async def generate_documents(callback: CallbackQuery, session: AsyncSession, set
         await callback.message.answer("Не нашел активное заявление.", reply_markup=main_menu())
         await callback.answer()
         return
+    data = normalize_order_data(json.loads(case.extracted_json or "{}"))
+    validation = validate_before_generation(data, case.received_date)
+    if not validation.ok:
+        case.missing_fields = json.dumps(validation.missing, ensure_ascii=False)
+        case.status = CaseStatus.NEEDS_REVIEW.value
+        await session.commit()
+        await callback.message.answer(
+            "⚠️ Документ пока нельзя готовить: есть пустые или технические поля.\n\n"
+            + extraction_preview(data, case.received_date, validation.missing, case.deadline_date),
+            reply_markup=confirm_extraction(),
+        )
+        await callback.answer()
+        return
     await callback.message.answer("📄 Готовлю полный и скрытый варианты заявления.")
-    full_path, preview_path, instruction_path = create_case_documents(case, current_user)
+    try:
+        full_path, preview_path, instruction_path = create_case_documents(case, current_user)
+    except ValueError as exc:
+        case.status = CaseStatus.NEEDS_REVIEW.value
+        await session.commit()
+        await callback.message.answer(f"⚠️ {exc}", reply_markup=edit_fields_menu())
+        await callback.answer()
+        return
     case.full_doc_path = str(full_path)
     case.preview_doc_path = str(preview_path)
     case.instruction_path = str(instruction_path)

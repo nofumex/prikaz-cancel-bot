@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import CaseStatus
 from app.models import Case, User
-from app.utils import deadline_from_received
+from app.services.legal_data import legal_deadline_from_received
 
 
 async def create_case(session: AsyncSession, user: User) -> Case:
@@ -58,7 +58,7 @@ async def save_photo_path(session: AsyncSession, case: Case, kind: str, path: Pa
 
 async def set_received_date(session: AsyncSession, case: Case, received_date) -> None:
     case.received_date = received_date
-    case.deadline_date = deadline_from_received(received_date)
+    case.deadline_date = legal_deadline_from_received(received_date)
     case.status = CaseStatus.PROCESSING.value
     await session.commit()
 

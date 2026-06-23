@@ -9,6 +9,7 @@ from typing import Any
 import aiohttp
 
 from app.config import Settings
+from app.services.legal_data import missing_order_fields, normalize_order_data
 from app.utils import parse_russian_date
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ ORDER_SCHEMA_HINT = {
     "debt_period": "",
     "debt_amount": "",
     "state_duty": "",
+    "total_amount": "",
 }
 
 
@@ -135,7 +137,7 @@ async def extract_order_data(settings: Settings, order_photo_path: str) -> dict[
         schema_name="court_order_extraction",
         schema=ORDER_JSON_SCHEMA,
     )
-    return {key: str(result.get(key) or "").strip() for key in ORDER_SCHEMA_HINT}
+    return normalize_order_data({key: str(result.get(key) or "").strip() for key in ORDER_SCHEMA_HINT})
 
 
 async def extract_envelope_date(settings: Settings, envelope_photo_path: str) -> dict[str, Any]:
@@ -153,8 +155,3 @@ async def extract_envelope_date(settings: Settings, envelope_photo_path: str) ->
     latest = parse_russian_date(str(result.get("latest_date") or ""))
     result["latest_date_normalized"] = latest.isoformat() if latest else ""
     return result
-
-
-def missing_order_fields(data: dict[str, Any]) -> list[str]:
-    required = ["court_name", "debtor_full_name", "debtor_address", "creditor_name", "case_number", "order_date"]
-    return [key for key in required if not str(data.get(key) or "").strip()]

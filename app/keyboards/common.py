@@ -57,8 +57,23 @@ def confirm_extraction() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [btn("✅ Все верно, готовить документы", "case:generate")],
-            [btn("✍️ Ввести данные вручную", "case:manual_fields")],
+            [btn("✏️ Исправить поле", "case:edit_fields")],
+            [btn("📷 Загрузить приказ заново", "case:new")],
             [btn("💬 Связаться с менеджером", "chat:start")],
+        ]
+    )
+
+
+def edit_fields_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn("⚖️ Суд", "case:field:court_name"), btn("📍 Адрес суда", "case:field:court_address")],
+            [btn("👤 Должник", "case:field:debtor_full_name"), btn("🏠 Адрес должника", "case:field:debtor_address")],
+            [btn("🏦 Взыскатель", "case:field:creditor_name"), btn("📄 Номер дела", "case:field:case_number")],
+            [btn("📅 Дата приказа", "case:field:order_date"), btn("🔖 УИД", "case:field:uid")],
+            [btn("🧾 Договор", "case:field:debt_contract"), btn("📆 Период", "case:field:debt_period")],
+            [btn("💰 Сумма долга", "case:field:debt_amount"), btn("⚖️ Госпошлина", "case:field:state_duty")],
+            [btn("↩️ Назад к проверке", "case:review")],
         ]
     )
 
