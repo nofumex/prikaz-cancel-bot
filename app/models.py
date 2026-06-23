@@ -1,0 +1,114 @@
+from __future__ import annotations
+
+from datetime import date, datetime
+
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (UniqueConstraint("platform", "platform_user_id", name="uq_users_platform_user"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    platform: Mapped[str] = mapped_column(String(32), default="telegram", index=True, nullable=False)
+    platform_user_id: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    telegram_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, index=True, nullable=True)
+    username: Mapped[str | None] = mapped_column(String(255), index=True)
+    first_name: Mapped[str | None] = mapped_column(String(255))
+    last_name: Mapped[str | None] = mapped_column(String(255))
+    phone: Mapped[str | None] = mapped_column(String(64))
+    is_manager: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    admin_notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class Case(Base):
+    __tablename__ = "cases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    platform: Mapped[str] = mapped_column(String(32), default="telegram", index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="draft", index=True, nullable=False)
+    order_photo_path: Mapped[str | None] = mapped_column(Text)
+    envelope_photo_path: Mapped[str | None] = mapped_column(Text)
+    received_date: Mapped[date | None] = mapped_column(Date)
+    deadline_date: Mapped[date | None] = mapped_column(Date)
+    extracted_json: Mapped[str | None] = mapped_column(Text)
+    missing_fields: Mapped[str | None] = mapped_column(Text)
+    full_doc_path: Mapped[str | None] = mapped_column(Text)
+    preview_doc_path: Mapped[str | None] = mapped_column(Text)
+    instruction_path: Mapped[str | None] = mapped_column(Text)
+    payment_label: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    payment_url: Mapped[str | None] = mapped_column(Text)
+    reminders_sent: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_reminder_at: Mapped[datetime | None] = mapped_column(DateTime)
+    amo_lead_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    amo_sync_status: Mapped[str | None] = mapped_column(String(32))
+    amo_sync_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    user: Mapped[User] = relationship(lazy="selectin")
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("cases.id"), index=True, nullable=False)
+    label: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True, nullable=False)
+    operation_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    raw_notification: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    case: Mapped[Case] = relationship(lazy="selectin")
+
+
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    manager_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="open", index=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    connected_at: Mapped[datetime | None] = mapped_column(DateTime)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    user: Mapped[User] = relationship(foreign_keys=[user_id], lazy="selectin")
+    manager: Mapped[User | None] = relationship(foreign_keys=[manager_id], lazy="selectin")
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("chat_sessions.id"), index=True, nullable=False)
+    sender_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    sender_role: Mapped[str] = mapped_column(String(32), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class UserState(Base):
+    __tablename__ = "user_states"
+    __table_args__ = (UniqueConstraint("platform", "platform_user_id", name="uq_user_states_platform_user"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    platform: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    platform_user_id: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    state: Mapped[str | None] = mapped_column(String(255))
+    data_json: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
