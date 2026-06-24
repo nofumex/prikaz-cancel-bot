@@ -16,6 +16,7 @@ async def get_or_create_telegram_user(session: AsyncSession, tg_user: TelegramUs
         user = User(platform="telegram", platform_user_id=platform_user_id, telegram_id=tg_user.id)
         session.add(user)
     user.username = tg_user.username
+    user.telegram_username = tg_user.username
     user.first_name = tg_user.first_name
     user.last_name = tg_user.last_name
     user.is_admin = tg_user.id in settings.admin_ids
@@ -40,6 +41,7 @@ async def get_or_create_platform_user(
         user = User(platform=platform, platform_user_id=str(platform_user_id))
         session.add(user)
     user.username = username
+    user.telegram_username = username
     user.first_name = first_name
     user.last_name = last_name
     await session.commit()

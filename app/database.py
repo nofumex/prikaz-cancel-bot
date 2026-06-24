@@ -42,6 +42,7 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("amocrm_lead_id", "amocrm_lead_id INTEGER"),
             ("amocrm_pipeline_id", "amocrm_pipeline_id INTEGER"),
             ("amocrm_status_id", "amocrm_status_id INTEGER"),
+            ("amocrm_status_name", "amocrm_status_name TEXT"),
             ("amocrm_last_sync_at", "amocrm_last_sync_at DATETIME"),
             ("amocrm_sync_error", "amocrm_sync_error TEXT"),
             ("amocrm_synced", "amocrm_synced BOOLEAN DEFAULT 0"),
@@ -52,6 +53,7 @@ async def _upgrade_sqlite_schema(conn) -> None:
         "users",
         [
             ("amocrm_contact_id", "amocrm_contact_id INTEGER"),
+            ("telegram_username", "telegram_username TEXT"),
         ],
     )
     await conn.exec_driver_sql(

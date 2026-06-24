@@ -6,8 +6,10 @@ from datetime import datetime
 
 from aiogram import Bot
 
+from app.config import get_settings
 from app.database import SessionLocal
 from app.keyboards.common import case_menu
+from app.services.amocrm import get_amocrm_service
 from app.services.cases import due_unpaid_cases
 from app.texts import deadline_warning
 
@@ -15,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 
 async def run_payment_reminders(bot: Bot) -> None:
+    settings = get_settings()
+    crm = get_amocrm_service(settings)
     while True:
         try:
             async with SessionLocal() as session:
@@ -30,6 +34,14 @@ async def run_payment_reminders(bot: Bot) -> None:
                     )
                     case.reminders_sent = reminder_no
                     case.last_reminder_at = datetime.utcnow()
+                    if reminder_no >= 3:
+                        await crm.sync_case_event(
+                            session,
+                            case,
+                            case.user,
+                            "payment_abandoned",
+                            {"note": "Пользователь не оплатил после 3 напоминаний"},
+                        )
                 await session.commit()
         except asyncio.CancelledError:
             raise

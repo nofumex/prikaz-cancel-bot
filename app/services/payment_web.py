@@ -10,6 +10,7 @@ from aiogram.types import FSInputFile
 from app.config import Settings
 from app.database import SessionLocal
 from app.enums import CaseStatus
+from app.services.amocrm import get_amocrm_service
 from app.services.payments import mark_paid_by_label, verify_yoomoney_sign
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,9 @@ async def run_payment_webhook(bot: Bot, settings: Settings) -> None:
                 if case.user.platform == "telegram" and case.user.telegram_id:
                     await _deliver(bot, case)
                     case.status = CaseStatus.DELIVERED.value
+                    crm = get_amocrm_service(settings)
+                    await crm.sync_case_event(session, case, case.user, "payment_paid", {"payment": label, "note": "Оплата подтверждена webhook"})
+                    await crm.sync_case_event(session, case, case.user, "documents_delivered", {"note": "Полный комплект выдан после webhook оплаты"})
                     await session.commit()
         return web.Response(text="OK")
 

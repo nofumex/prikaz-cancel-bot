@@ -1,5 +1,5 @@
-case_id=15
-full_docx=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_15\statement_in_time_15.docx
-full_pdf=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_15\statement_in_time_15.pdf
-preview_pdf=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_15\preview_statement_in_time_15.pdf
-instruction_docx=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_15\instruction_15.docx
+case_id=20
+full_docx=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_20\statement_in_time_20.docx
+full_pdf=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_20\statement_in_time_20.pdf
+preview_pdf=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_20\preview_statement_in_time_20.pdf
+instruction_docx=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_20\instruction_20.docx

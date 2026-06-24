@@ -1,7 +1,8 @@
-"""Generate test document artifacts for the Belsky court order case."""
+"""Generate and validate PDF pipeline artifacts for a smoke case."""
 from __future__ import annotations
 
 import asyncio
+import argparse
 import json
 import sys
 from datetime import date
@@ -17,6 +18,7 @@ from app.database import SessionLocal, init_db
 from app.models import Case, User
 from app.services.documents import create_case_documents
 from app.services.legal_data import legal_deadline_from_received, normalize_order_data
+from app.services.pdf_tools import check_pdf_dependencies, pdf_text
 
 
 BELSKY_DATA = {
@@ -39,14 +41,17 @@ BELSKY_DATA = {
 }
 
 
-async def main() -> None:
+async def main(allow_dev_fallback: bool) -> None:
     import os
 
-    os.environ["ALLOW_DEV_DOCX_PREVIEW"] = "true"
+    os.environ["ALLOW_DEV_DOCX_PREVIEW"] = "true" if allow_dev_fallback else "false"
     from app.config import get_settings
 
     get_settings.cache_clear()
     settings = get_settings()
+    deps_ok, dep_errors = check_pdf_dependencies(require_preview_pdf_for_payment=settings.require_pdf_preview_for_payment)
+    if not deps_ok and not allow_dev_fallback:
+        raise RuntimeError("PDF dependencies are not ready: " + "; ".join(dep_errors))
     await init_db()
     received = date(2026, 6, 19)
     data = normalize_order_data(BELSKY_DATA)
@@ -69,6 +74,22 @@ async def main() -> None:
         await session.commit()
         await session.refresh(case)
         full_docx, full_pdf, preview_pdf, preview_docx, instruction = create_case_documents(case, user, settings)
+        if not full_docx.exists():
+            raise RuntimeError("full DOCX was not created")
+        if not instruction.exists():
+            raise RuntimeError("instruction DOCX was not created")
+        if not full_pdf or not full_pdf.exists():
+            raise RuntimeError("full PDF was not created")
+        if not preview_pdf or not preview_pdf.exists():
+            raise RuntimeError("preview PDF was not created")
+        if preview_docx and not allow_dev_fallback:
+            raise RuntimeError("dev DOCX preview fallback was used while ALLOW_DEV_DOCX_PREVIEW=false")
+        if full_pdf.read_bytes() == preview_pdf.read_bytes():
+            raise RuntimeError("preview PDF equals full PDF")
+        full_text = pdf_text(full_pdf)
+        preview_text = pdf_text(preview_pdf)
+        if full_text and full_text.strip() and full_text.strip() == preview_text.strip():
+            raise RuntimeError("preview PDF contains full readable text")
         case.full_doc_path = str(full_docx)
         case.full_pdf_path = str(full_pdf) if full_pdf else None
         case.preview_pdf_path = str(preview_pdf) if preview_pdf else None
@@ -114,7 +135,13 @@ async def main() -> None:
         print(f"  Preview PDF: {preview_pdf}")
         print(f"  Instruction: {instruction}")
         print(f"  Case ID: {case.id}")
+        print(f"  Dependencies OK: {deps_ok}")
+        if dep_errors:
+            print(f"  Dependency warnings: {'; '.join(dep_errors)}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--allow-dev-fallback", action="store_true", help="Allow DOCX/PDF dev fallback when LibreOffice is unavailable")
+    args = parser.parse_args()
+    asyncio.run(main(args.allow_dev_fallback))

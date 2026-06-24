@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.keyboards.common import chat_end_menu, connect_chat_keyboard, main_menu, manager_panel
 from app.models import User
+from app.services.amocrm import get_amocrm_service
+from app.services.cases import latest_open_case
 from app.services.chat import (
     close_session,
     connect_manager,
@@ -29,23 +31,27 @@ async def _notify_staff(bot: Bot, session: AsyncSession, text: str, reply_markup
             await bot.send_message(user.telegram_id, text, reply_markup=reply_markup)
 
 
-async def _start_chat(message: Message, bot: Bot, session: AsyncSession, current_user: User) -> None:
+async def _start_chat(message: Message, bot: Bot, session: AsyncSession, current_user: User, settings) -> None:
     chat = await open_session(session, current_user)
     await message.answer(
         "Чат с менеджером открыт. Напишите вопрос следующим сообщением, менеджер увидит его здесь.",
         reply_markup=chat_end_menu(),
     )
     await _notify_staff(bot, session, manager_request_text(current_user), reply_markup=connect_chat_keyboard(chat.id))
+    case = await latest_open_case(session, current_user.id)
+    if case:
+        crm = get_amocrm_service(settings)
+        await crm.sync_case_event(session, case, current_user, "manager_requested", {"note": "Пользователь запросил менеджера"})
 
 
 @router.message(Command("tutor"))
-async def cmd_tutor(message: Message, bot: Bot, session: AsyncSession, current_user: User) -> None:
-    await _start_chat(message, bot, session, current_user)
+async def cmd_tutor(message: Message, bot: Bot, session: AsyncSession, current_user: User, settings) -> None:
+    await _start_chat(message, bot, session, current_user, settings)
 
 
 @router.callback_query(F.data == "chat:start")
-async def cb_start_chat(callback: CallbackQuery, bot: Bot, session: AsyncSession, current_user: User) -> None:
-    await _start_chat(callback.message, bot, session, current_user)
+async def cb_start_chat(callback: CallbackQuery, bot: Bot, session: AsyncSession, current_user: User, settings) -> None:
+    await _start_chat(callback.message, bot, session, current_user, settings)
     await callback.answer()
 
 

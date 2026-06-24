@@ -79,6 +79,7 @@ class Settings:
     amocrm_auto_create_statuses: bool
     amocrm_attach_files: bool
     amocrm_debug: bool
+    amocrm_rps_limit: int
     amocrm_pipeline_id: int | None
     amocrm_status_id_new: int | None
     amocrm_status_id_in_progress: int | None
@@ -136,6 +137,7 @@ def get_settings() -> Settings:
         amocrm_auto_create_statuses=_parse_bool(getenv("AMOCRM_AUTO_CREATE_STATUSES"), True),
         amocrm_attach_files=_parse_bool(getenv("AMOCRM_ATTACH_FILES"), True),
         amocrm_debug=_parse_bool(getenv("AMOCRM_DEBUG"), False),
+        amocrm_rps_limit=_parse_int(getenv("AMOCRM_RPS_LIMIT"), 5),
         amocrm_pipeline_id=_parse_int(getenv("AMOCRM_PIPELINE_ID"), 0) or None,
         amocrm_status_id_new=_parse_int(getenv("AMOCRM_STATUS_ID_NEW"), 85847178) or None,
         amocrm_status_id_in_progress=_parse_int(getenv("AMOCRM_STATUS_ID_IN_PROGRESS"), 85847182) or None,

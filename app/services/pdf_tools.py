@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -10,16 +11,37 @@ except Exception:  # pragma: no cover - optional dependency
     fitz = None
 
 
-def _find_soffice() -> str | None:
+WINDOWS_SOFFICE_CANDIDATES = (
+    r"C:\Program Files\LibreOffice\program\soffice.exe",
+    r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+)
+
+
+def find_soffice() -> str | None:
     for name in ("soffice", "libreoffice"):
         path = shutil.which(name)
         if path:
             return path
+    if os.name == "nt":
+        for candidate in WINDOWS_SOFFICE_CANDIDATES:
+            if Path(candidate).exists():
+                return candidate
     return None
 
 
+def check_pdf_dependencies(*, require_preview_pdf_for_payment: bool = True) -> tuple[bool, list[str]]:
+    errors: list[str] = []
+    if not find_soffice():
+        errors.append("LibreOffice не найден. Установите LibreOffice и проверьте PATH.")
+    if fitz is None:
+        errors.append("PyMuPDF (fitz) не установлен.")
+    if require_preview_pdf_for_payment and errors:
+        return False, errors
+    return len(errors) == 0, errors
+
+
 def convert_docx_to_pdf(docx_path: str | Path, outdir: str | Path | None = None, *, allow_dev_fallback: bool = False) -> Path:
-    soffice = _find_soffice()
+    soffice = find_soffice()
     docx_path = Path(docx_path)
     outdir_path = Path(outdir or docx_path.parent)
     outdir_path.mkdir(parents=True, exist_ok=True)
@@ -27,7 +49,7 @@ def convert_docx_to_pdf(docx_path: str | Path, outdir: str | Path | None = None,
     if not soffice:
         if allow_dev_fallback and fitz is not None:
             return _convert_docx_to_pdf_fitz_fallback(docx_path, pdf_path)
-        raise RuntimeError("LibreOffice/soffice is not available for DOCX -> PDF conversion")
+        raise RuntimeError("LibreOffice не найден. Установите LibreOffice и проверьте PATH.")
     result = subprocess.run(
         [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(outdir_path), str(docx_path)],
         check=False,

@@ -44,6 +44,7 @@ def _settings(**kwargs):
         amocrm_auto_create_statuses=True,
         amocrm_attach_files=True,
         amocrm_debug=False,
+        amocrm_rps_limit=5,
         amocrm_pipeline_id=None,
         amocrm_status_id_new=None,
         amocrm_status_id_in_progress=None,
@@ -61,12 +62,13 @@ async def test_crm_disabled_does_not_crash():
     service = AmoCrmService(_settings(amocrm_enabled=False))
     case = Case(id=1, user_id=1)
     user = User(id=1, platform="telegram", platform_user_id="1", telegram_id=1)
-    await service.sync_case_event(None, case, user, "start")
+    await service.sync_case_event(None, case, user, "user_started_bot")
 
 
 def test_event_status_map_contains_required_stages():
-    assert EVENT_STATUS_MAP["start"] == "Подписался на бота"
-    assert EVENT_STATUS_MAP["order_photo"] == "Отправил фотографию приказа"
-    assert EVENT_STATUS_MAP["preview_ready"] == "Сформирован предпросмотр"
+    assert EVENT_STATUS_MAP["user_started_bot"] == "Подписался на бота"
+    assert EVENT_STATUS_MAP["order_photo_uploaded"] == "Отправил фотографию приказа"
+    assert EVENT_STATUS_MAP["preview_generated"] == "Сформирован предпросмотр"
     assert EVENT_STATUS_MAP["payment_created"] == "Ожидает оплату"
-    assert EVENT_STATUS_MAP["paid"] == "Оплатил"
+    assert EVENT_STATUS_MAP["payment_paid"] == "Оплатил"
+    assert EVENT_STATUS_MAP["documents_delivered"] == "Получил документы"

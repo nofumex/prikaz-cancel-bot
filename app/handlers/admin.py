@@ -188,7 +188,8 @@ async def cb_case_detail(callback: CallbackQuery, session: AsyncSession, current
         "<b>CRM:</b>",
         f"Контакт: {case.amocrm_contact_id or '—'}",
         f"Сделка: {case.amocrm_lead_id or case.amo_lead_id or '—'}",
-        f"Этап ID: {case.amocrm_status_id or '—'}",
+        f"Воронка: Судебный приказ (ID {case.amocrm_pipeline_id or '—'})",
+        f"Этап: {case.amocrm_status_name or '—'} (ID {case.amocrm_status_id or '—'})",
         f"Последняя синхронизация: {case.amocrm_last_sync_at.strftime('%d.%m.%Y %H:%M') if case.amocrm_last_sync_at else '—'}",
     ]
     if case.amocrm_sync_error:
@@ -294,8 +295,70 @@ async def cb_crm_sync(callback: CallbackQuery, session: AsyncSession, settings: 
         return
     await session.refresh(case, ["user"])
     crm = get_amocrm_service(settings)
-    await crm.sync_case_event(session, case, case.user, "start")
+    await crm.sync_case_current_state(session, case, case.user)
     await callback.message.answer(f"CRM-синхронизация для заявки #{case.id} выполнена.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:check_crm")
+async def cb_check_crm(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    crm = get_amocrm_service(settings)
+    report = await crm.ensure_pipeline_and_statuses()
+    if not report.get("pipeline"):
+        await callback.message.answer("amoCRM недоступна или воронка не найдена.")
+        await callback.answer()
+        return
+    lines = [
+        "amoCRM проверена",
+        "",
+        f"Воронка: {report['pipeline'].get('name')}",
+        f"Pipeline ID: {report['pipeline'].get('id')}",
+        "",
+        "Этапы:",
+    ]
+    for status_name in [
+        "Подписался на бота",
+        "Отправил фотографию приказа",
+        "Ввел дату получения",
+        "Данные распознаны",
+        "Сформирован предпросмотр",
+        "Ожидает оплату",
+        "Оплатил",
+        "Получил документы",
+        "Нужна проверка",
+        "Связался с менеджером",
+        "Отказ / не оплатил",
+    ]:
+        sid = report.get("statuses", {}).get(status_name)
+        mark = "✅" if sid else "❌"
+        lines.append(f"{mark} {status_name}" + (f" — id {sid}" if sid else ""))
+    lines.append("")
+    lines.append(f"Создано новых этапов: {report.get('created', 0)}")
+    lines.append("Ошибки: " + (", ".join(report.get("errors", [])) if report.get("errors") else "none"))
+    await callback.message.answer("\n".join(lines), reply_markup=admin_panel(payments_enabled()))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:crm_stats")
+async def cb_crm_stats(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    synced = int(await session.scalar(select(func.count(Case.id)).where(Case.amocrm_synced.is_(True))) or 0)
+    errors = int(await session.scalar(select(func.count(CrmSyncLog.id)).where(CrmSyncLog.success.is_(False))) or 0)
+    pending = int(await session.scalar(select(func.count(Case.id)).where(Case.amocrm_synced.is_(False))) or 0)
+    last_error = await session.scalar(
+        select(CrmSyncLog.error_message).where(CrmSyncLog.success.is_(False)).order_by(CrmSyncLog.created_at.desc()).limit(1)
+    )
+    await callback.message.answer(
+        "CRM:\n"
+        f"Сделок синхронизировано: {synced}\n"
+        f"Ошибки синхронизации: {errors}\n"
+        f"Ожидают синхронизации: {pending}\n"
+        f"Последняя ошибка: {h(last_error) if last_error else 'нет'}",
+        reply_markup=admin_panel(payments_enabled()),
+    )
     await callback.answer()
 
 
@@ -327,7 +390,14 @@ async def cb_mark_paid(callback: CallbackQuery, bot: Bot, session: AsyncSession,
         paid_case.status = CaseStatus.DELIVERED.value
         paid_case.delivered_at = datetime.utcnow()
         crm = get_amocrm_service(settings)
-        await crm.sync_case_event(session, paid_case, paid_case.user, "paid", {"note": "Оплата подтверждена вручную админом."})
+        await crm.sync_case_event(session, paid_case, paid_case.user, "payment_paid", {"note": "Оплата подтверждена вручную админом."})
+        await crm.sync_case_event(
+            session,
+            paid_case,
+            paid_case.user,
+            "documents_delivered",
+            {"note": "Документы выданы клиенту после ручного подтверждения оплаты"},
+        )
         await session.commit()
     await callback.answer()
 

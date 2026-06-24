@@ -56,6 +56,7 @@ def test_cost_not_double_counting_cached():
         amocrm_auto_create_statuses=True,
         amocrm_attach_files=True,
         amocrm_debug=False,
+        amocrm_rps_limit=5,
         amocrm_pipeline_id=None,
         amocrm_status_id_new=None,
         amocrm_status_id_in_progress=None,

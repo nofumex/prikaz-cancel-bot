@@ -28,7 +28,7 @@ from app.services.legal_data import (
     validate_before_generation,
 )
 from app.services.name_normalizer import make_short_name
-from app.services.pdf_tools import convert_docx_to_pdf, create_preview_pdf, pdf_text
+from app.services.pdf_tools import check_pdf_dependencies, convert_docx_to_pdf, create_preview_pdf, pdf_text
 from app.utils import ensure_dir, h, safe_json_loads
 
 
@@ -446,6 +446,9 @@ def create_case_documents(case: Case, user: User, settings: Settings, *, restore
         raise ValueError("Нельзя сформировать заявление: " + ", ".join(labels))
     if not case.received_date:
         raise ValueError("Нельзя сформировать заявление без даты получения")
+    deps_ok, dep_errors = check_pdf_dependencies(require_preview_pdf_for_payment=settings.require_pdf_preview_for_payment)
+    if not deps_ok and settings.require_pdf_preview_for_payment:
+        raise ValueError("; ".join(dep_errors))
 
     restore_term = is_deadline_missed(case.deadline_date)
     debtor = _required(data, "debtor_full_name")
