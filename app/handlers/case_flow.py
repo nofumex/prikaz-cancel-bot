@@ -19,16 +19,24 @@ from app.services.amocrm import get_amocrm_service
 from app.services.cases import create_case, latest_case, latest_open_case, save_photo_path, set_received_date
 from app.services.documents import create_case_documents, extraction_preview
 from app.services.app_settings import payments_enabled
+from app.services.amount_recovery import (
+    AmountRecoveryResult,
+    format_amount_mismatch_admin_report,
+    recover_amounts_from_mismatch,
+    save_amount_debug_snapshot,
+)
 from app.services.legal_data import (
     FIELD_LABELS,
+    AmountValidationResult,
     is_deadline_missed,
     missing_order_fields,
     normalize_debtor_name_fields,
     normalize_order_data,
     suggest_nominative_full_name,
+    validate_amounts,
     validate_before_generation,
 )
-from app.services.llm import extract_envelope_date, extract_order_data
+from app.services.llm import extract_envelope_date, extract_order_amounts, extract_order_data
 from app.services.payments import ensure_payment
 from app.texts import case_summary, payment_text
 from app.utils import ensure_dir, h, parse_russian_date
@@ -58,6 +66,18 @@ async def _download_photo(bot: Bot, message: Message, case_id: int, kind: str) -
     return path
 
 
+async def _download_document_image(bot: Bot, message: Message, case_id: int, kind: str) -> Path:
+    ensure_dir("storage/photos")
+    doc = message.document
+    file = await bot.get_file(doc.file_id)
+    suffix = Path(doc.file_name or file.file_path or "").suffix or ".jpg"
+    if suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".heic"}:
+        suffix = ".jpg"
+    path = Path("storage/photos") / f"case_{case_id}_{kind}_{doc.file_unique_id}{suffix}"
+    await bot.download_file(file.file_path, destination=path)
+    return path
+
+
 @router.callback_query(F.data == "case:new")
 @router.message(F.text == "/new")
 async def start_case(event: Message | CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User, settings: Settings) -> None:
@@ -70,7 +90,8 @@ async def start_case(event: Message | CallbackQuery, state: FSMContext, session:
     await target.answer(
         "📝 <b>Новое заявление</b>\n\n"
         "Отправьте фото судебного приказа целиком.\n\n"
-        "Лучше сфотографировать ровно сверху, без обрезанных краев, чтобы были видны суд, номер дела, должник и взыскатель."
+        "Лучше сфотографировать ровно сверху, без обрезанных краев, чтобы были видны суд, номер дела, должник и взыскатель.\n\n"
+        "💡 Лучше отправьте фото как файл, если текст мелкий или размытый."
     )
     if isinstance(event, CallbackQuery):
         await event.answer()
@@ -105,14 +126,44 @@ async def receive_order_photo(message: Message, bot: Bot, state: FSMContext, ses
     )
     await state.set_state(CaseStates.waiting_envelope_choice)
     await message.answer(
-        "✅ Фото приказа принято.\n\nТеперь отправьте фото конверта со штампами или сразу напишите дату получения в формате <code>ДД.ММ.ГГГГ</code>.",
+        "✅ Фото приказа принято.\n\n"
+        "Теперь отправьте фото конверта со штампами или сразу напишите дату получения в формате <code>ДД.ММ.ГГГГ</code>.\n\n"
+        "💡 Если текст на приказе мелкий, в следующий раз отправьте фото как файл без сжатия.",
+        reply_markup=envelope_choice(),
+    )
+
+
+@router.message(CaseStates.waiting_order_photo, F.document)
+async def receive_order_document(message: Message, bot: Bot, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    if not message.document or not (message.document.mime_type or "").startswith("image/"):
+        await message.answer("Нужно изображение судебного приказа. Отправьте фото или файл-картинку (JPEG/PNG).")
+        return
+    data = await state.get_data()
+    case = await session.get(Case, data["case_id"])
+    path = await _download_document_image(bot, message, case.id, "order")
+    await save_photo_path(session, case, "order", path)
+    crm = get_amocrm_service(settings)
+    await crm.sync_case_event(
+        session,
+        case,
+        current_user,
+        "order_photo_uploaded",
+        {"note": "Пользователь отправил приказ как файл без сжатия", "files": [{"path": str(path), "caption": "Фото приказа (файл)"}]},
+    )
+    await state.set_state(CaseStates.waiting_envelope_choice)
+    await message.answer(
+        "✅ Файл приказа принят без сжатия.\n\n"
+        "Теперь отправьте фото конверта со штампами или сразу напишите дату получения в формате <code>ДД.ММ.ГГГГ</code>.",
         reply_markup=envelope_choice(),
     )
 
 
 @router.message(CaseStates.waiting_order_photo)
 async def receive_order_photo_wrong(message: Message) -> None:
-    await message.answer("Нужно именно фото судебного приказа. Отправьте изображение одним сообщением.")
+    await message.answer(
+        "Нужно именно фото судебного приказа. Отправьте изображение одним сообщением "
+        "или прикрепите файл-картинку без сжатия."
+    )
 
 
 @router.message(CaseStates.waiting_envelope_choice, F.photo)
@@ -357,9 +408,85 @@ async def process_manual_fields(message: Message, state: FSMContext, session: As
 async def _notify_admin_qa_failure(bot: Bot, settings: Settings, case: Case, reason: str) -> None:
     for admin_id in settings.admin_ids:
         try:
-            await bot.send_message(admin_id, f"⚠️ QA не пройден по заявке #{case.id}: {reason}")
+            await bot.send_message(admin_id, reason)
         except Exception:
             logger.exception("Failed to notify admin %s", admin_id)
+
+
+async def _notify_admin_amount_warning(bot: Bot, settings: Settings, case: Case, recovery: AmountRecoveryResult) -> None:
+    text = (
+        f"⚠️ Заявка #{case.id}: суммы автоматически восстановлены ({recovery.recovery_method}).\n"
+        f"Было: {recovery.old_debt_amount}\n"
+        f"Стало: {recovery.new_debt_amount}"
+    )
+    for admin_id in settings.admin_ids:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            logger.exception("Failed to notify admin %s about amount recovery", admin_id)
+
+
+async def _resolve_amount_mismatch(
+    settings: Settings,
+    session: AsyncSession,
+    case: Case,
+    current_user: User,
+    data: dict,
+    *,
+    bot: Bot | None = None,
+    force_retry: bool = False,
+) -> tuple[dict, AmountValidationResult, AmountRecoveryResult | None, dict | None]:
+    amount_check = validate_amounts(data)
+    if amount_check.ok and not force_retry:
+        return data, amount_check, None, None
+
+    retry_amounts: dict | None = None
+    recovery: AmountRecoveryResult | None = None
+
+    if settings.amount_retry_on_mismatch and case.order_photo_path and ("amount_mismatch" in amount_check.errors or force_retry):
+        try:
+            retry_amounts = await extract_order_amounts(
+                settings,
+                session,
+                case_id=case.id,
+                user_id=current_user.id,
+                order_photo_path=case.order_photo_path,
+            )
+        except Exception:
+            logger.exception("Targeted amount OCR failed for case %s", case.id)
+
+    if settings.auto_recover_amount_mismatch:
+        recovery = recover_amounts_from_mismatch(
+            data,
+            retry_amounts,
+            min_confidence=settings.auto_recover_amount_min_confidence,
+            auto_recover=True,
+        )
+        if recovery.applied:
+            data = recovery.order_data
+            case.extracted_json = json.dumps(data, ensure_ascii=False)
+            if session is not None:
+                await session.commit()
+            amount_check = validate_amounts(data)
+            save_amount_debug_snapshot(
+                case.id,
+                {
+                    "amount_recovery_applied": True,
+                    "recovery_method": recovery.recovery_method,
+                    "qa_report": recovery.qa_report,
+                },
+            )
+            if bot:
+                await _notify_admin_amount_warning(bot, settings, case, recovery)
+            logger.warning(
+                "Amount recovery applied for case %s method=%s old=%s new=%s",
+                case.id,
+                recovery.recovery_method,
+                recovery.old_debt_amount,
+                recovery.new_debt_amount,
+            )
+
+    return data, amount_check, recovery, retry_amounts
 
 
 async def _generate_documents_flow(
@@ -393,6 +520,30 @@ async def _generate_documents_flow(
             reply_markup=restore_reason_menu(),
         )
         return False
+
+    data, amount_check, recovery, retry_amounts = await _resolve_amount_mismatch(
+        settings, session, case, current_user, data, bot=bot
+    )
+    if not amount_check.ok:
+        admin_report = format_amount_mismatch_admin_report(
+            case.id,
+            normalize_order_data(json.loads(case.extracted_json or "{}")),
+            retry_amounts,
+            amount_check,
+            recovery,
+        )
+        case.status = CaseStatus.NEEDS_REVIEW.value
+        await session.commit()
+        crm = get_amocrm_service(settings)
+        await crm.sync_case_event(session, case, current_user, "document_qa_failed", {"note": admin_report[:65000]})
+        if bot:
+            await _notify_admin_qa_failure(bot, settings, case, admin_report)
+        await message.answer(
+            "⚠️ Не удалось автоматически согласовать суммы по приказу. Менеджер проверит заявку вручную.",
+            reply_markup=edit_fields_menu(),
+        )
+        return False
+
     await message.answer("📄 Готовлю полный и скрытый варианты заявления.")
     try:
         full_docx, full_pdf, preview_pdf, preview_docx, instruction_path = create_case_documents(
@@ -407,7 +558,7 @@ async def _generate_documents_flow(
         crm = get_amocrm_service(settings)
         await crm.sync_case_event(session, case, current_user, "document_qa_failed", {"note": str(exc)})
         if bot:
-            await _notify_admin_qa_failure(bot, settings, case, str(exc))
+            await _notify_admin_qa_failure(bot, settings, case, f"⚠️ QA не пройден по заявке #{case.id}: {exc}")
         await message.answer(f"⚠️ {exc}", reply_markup=edit_fields_menu())
         return False
     case.full_doc_path = str(full_docx)

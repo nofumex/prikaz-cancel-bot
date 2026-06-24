@@ -86,6 +86,10 @@ class Settings:
     amocrm_status_id_consultation: int | None
     amocrm_write_enabled: bool
 
+    amount_retry_on_mismatch: bool
+    auto_recover_amount_mismatch: bool
+    auto_recover_amount_min_confidence: float
+
     company_name: str
     manager_contact_text: str
 
@@ -131,7 +135,10 @@ def get_settings() -> Settings:
         openai_model_pricing_json=(getenv("OPENAI_MODEL_PRICING_JSON") or "").strip(),
         amocrm_base_url=(getenv("AMOCRM_BASE_URL") or "").strip().rstrip("/") or None,
         amocrm_access_token=(getenv("AMOCRM_ACCESS_TOKEN") or "").strip() or None,
-        amocrm_enabled=_parse_bool(getenv("AMOCRM_ENABLED"), False),
+        amocrm_enabled=_parse_bool(
+            getenv("AMOCRM_ENABLED"),
+            bool((getenv("AMOCRM_ACCESS_TOKEN") or "").strip() and (getenv("AMOCRM_BASE_URL") or "").strip()),
+        ),
         amocrm_pipeline_name=(getenv("AMOCRM_PIPELINE_NAME") or "Судебный приказ").strip(),
         amocrm_auto_create_pipeline=_parse_bool(getenv("AMOCRM_AUTO_CREATE_PIPELINE"), False),
         amocrm_auto_create_statuses=_parse_bool(getenv("AMOCRM_AUTO_CREATE_STATUSES"), True),
@@ -143,6 +150,9 @@ def get_settings() -> Settings:
         amocrm_status_id_in_progress=_parse_int(getenv("AMOCRM_STATUS_ID_IN_PROGRESS"), 85847182) or None,
         amocrm_status_id_consultation=_parse_int(getenv("AMOCRM_STATUS_ID_CONSULTATION"), 85847186) or None,
         amocrm_write_enabled=_parse_bool(getenv("AMOCRM_WRITE_ENABLED"), False),
+        amount_retry_on_mismatch=_parse_bool(getenv("AMOUNT_RETRY_ON_MISMATCH"), True),
+        auto_recover_amount_mismatch=_parse_bool(getenv("AUTO_RECOVER_AMOUNT_MISMATCH"), True),
+        auto_recover_amount_min_confidence=float(getenv("AUTO_RECOVER_AMOUNT_MIN_CONFIDENCE") or 0.75),
         company_name=getenv("COMPANY_NAME", "Юридическая компания «Синай»"),
         manager_contact_text=getenv("MANAGER_CONTACT_TEXT", "Напишите менеджеру, и мы подключимся к диалогу."),
     )

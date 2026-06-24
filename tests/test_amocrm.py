@@ -50,6 +50,9 @@ def _settings(**kwargs):
         amocrm_status_id_in_progress=None,
         amocrm_status_id_consultation=None,
         amocrm_write_enabled=False,
+        amount_retry_on_mismatch=True,
+        auto_recover_amount_mismatch=True,
+        auto_recover_amount_min_confidence=0.75,
         company_name="test",
         manager_contact_text="test",
     )

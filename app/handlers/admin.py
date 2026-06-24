@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
+import json
 import math
 
 from sqlalchemy import func, select
@@ -19,10 +23,15 @@ from app.services.amocrm import get_amocrm_service
 from app.services.app_settings import payments_enabled, toggle_payments
 from app.services.payments import mark_paid_by_label
 from app.texts import case_summary
-from app.utils import full_name, h, username_text
+from app.services.legal_data import FIELD_LABELS, normalize_order_data
+from app.utils import full_name, h, safe_json_loads, username_text
 
 router = Router(name="admin")
 PAGE_SIZE = 5
+
+
+class AdminAmountStates(StatesGroup):
+    waiting_amount_value = State()
 
 
 def _money_usd(value: float | None) -> str:
@@ -300,6 +309,121 @@ async def cb_crm_sync(callback: CallbackQuery, session: AsyncSession, settings: 
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("admin:retry_amounts:"))
+async def cb_retry_amounts(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User, bot: Bot) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    case = await session.get(Case, int(callback.data.split(":")[-1]))
+    if not case or not case.order_photo_path:
+        await callback.answer("Нет фото приказа", show_alert=True)
+        return
+    await session.refresh(case, ["user"])
+    from app.handlers.case_flow import _resolve_amount_mismatch
+    from app.services.amount_recovery import format_amount_mismatch_admin_report
+    data, amount_check, recovery, retry_amounts = await _resolve_amount_mismatch(
+        settings, session, case, case.user, data, bot=bot, force_retry=True
+    )
+    if amount_check.ok:
+        await callback.message.answer(f"✅ Суммы согласованы для заявки #{case.id}. Можно генерировать документы.")
+    else:
+        report = format_amount_mismatch_admin_report(case.id, data, retry_amounts, amount_check, recovery)
+        await callback.message.answer(report)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:apply_suggested:"))
+async def cb_apply_suggested_amount(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    case_id = int(callback.data.split(":")[-1])
+    case = await session.get(Case, case_id)
+    if not case:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    debug_path = Path("storage/debug") / f"case_{case_id}" / "amount_recovery.json"
+    if not debug_path.exists():
+        await callback.answer("Нет предложенной суммы", show_alert=True)
+        return
+    payload = json.loads(debug_path.read_text(encoding="utf-8"))
+    qa = payload.get("qa_report") or {}
+    new_debt = qa.get("new_debt_amount") or qa.get("debt_candidate")
+    if not new_debt:
+        await callback.answer("Нет предложенной суммы", show_alert=True)
+        return
+    data = normalize_order_data(safe_json_loads(case.extracted_json, {}))
+    data["debt_amount"] = new_debt
+    data = normalize_order_data(data)
+    case.extracted_json = json.dumps(data, ensure_ascii=False)
+    await session.commit()
+    await callback.message.answer(f"✅ Применена сумма долга: {new_debt}")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:edit_amount:"))
+async def cb_edit_amount(callback: CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    _, _, case_id, field = callback.data.split(":")
+    case = await session.get(Case, int(case_id))
+    if not case:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    label = FIELD_LABELS.get(field, field)
+    await state.update_data(case_id=int(case_id), edit_amount_field=field)
+    await state.set_state(AdminAmountStates.waiting_amount_value)
+    await callback.message.answer(f"Введите новое значение для поля <b>{label}</b>.")
+    await callback.answer()
+
+
+@router.message(AdminAmountStates.waiting_amount_value)
+async def admin_receive_amount_value(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    state_data = await state.get_data()
+    case = await session.get(Case, state_data["case_id"])
+    field = state_data["edit_amount_field"]
+    value = (message.text or "").strip()
+    if not case or not value:
+        await message.answer("Значение не должно быть пустым.")
+        return
+    data = normalize_order_data(safe_json_loads(case.extracted_json, {}))
+    data[field] = value
+    data = normalize_order_data(data)
+    case.extracted_json = json.dumps(data, ensure_ascii=False)
+    await session.commit()
+    await state.clear()
+    await message.answer(f"✅ Поле {FIELD_LABELS.get(field, field)} обновлено: {data.get(field)}")
+
+
+@router.callback_query(F.data.startswith("admin:rerun_qa:"))
+async def cb_rerun_qa(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User, bot: Bot) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    case = await session.get(Case, int(callback.data.split(":")[-1]))
+    if not case:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    await session.refresh(case, ["user"])
+    from app.handlers.case_flow import _generate_documents_flow
+
+    await callback.message.answer(f"🔄 Повторная генерация для заявки #{case.id}...")
+    await _generate_documents_flow(callback.message, session, settings, case.user, case, bot=bot)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:generate:"))
+async def cb_admin_generate(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User, bot: Bot) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    case = await session.get(Case, int(callback.data.split(":")[-1]))
+    if not case:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    await session.refresh(case, ["user"])
+    from app.handlers.case_flow import _generate_documents_flow
+
+    await _generate_documents_flow(callback.message, session, settings, case.user, case, bot=bot)
+    await callback.answer()
+
+
 @router.callback_query(F.data == "admin:check_crm")
 async def cb_check_crm(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User) -> None:
     if not await _ensure_admin_callback(callback, current_user):
@@ -320,16 +444,11 @@ async def cb_check_crm(callback: CallbackQuery, session: AsyncSession, settings:
     ]
     for status_name in [
         "Подписался на бота",
-        "Отправил фотографию приказа",
-        "Ввел дату получения",
-        "Данные распознаны",
-        "Сформирован предпросмотр",
-        "Ожидает оплату",
+        "Отправил приказ",
+        "Ввел дату",
         "Оплатил",
-        "Получил документы",
+        "Получил заявление",
         "Нужна проверка",
-        "Связался с менеджером",
-        "Отказ / не оплатил",
     ]:
         sid = report.get("statuses", {}).get(status_name)
         mark = "✅" if sid else "❌"

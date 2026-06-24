@@ -9,6 +9,7 @@ venv/
 
 storage/photos/*
 storage/documents/*
+storage/debug/*
 !storage/photos/.gitkeep
 !storage/documents/.gitkeep
 

@@ -124,6 +124,14 @@ def admin_panel(payments_enabled: bool = True) -> InlineKeyboardMarkup:
 
 def admin_case_actions(case_id: int, paid: bool = False, back: str = "admin:cases:0") -> InlineKeyboardMarkup:
     rows = [
+        [btn("🔁 Повторно распознать суммы", f"admin:retry_amounts:{case_id}")],
+        [
+            btn("✏️ Исправить долг", f"admin:edit_amount:{case_id}:debt_amount"),
+            btn("✏️ Исправить госпошлину", f"admin:edit_amount:{case_id}:state_duty"),
+        ],
+        [btn("✏️ Исправить итог", f"admin:edit_amount:{case_id}:total_amount")],
+        [btn("✅ Применить предложенную сумму", f"admin:apply_suggested:{case_id}")],
+        [btn("✅ Повторить QA", f"admin:rerun_qa:{case_id}"), btn("📄 Сгенерировать документы", f"admin:generate:{case_id}")],
         [btn("💬 Открыть чат", f"chat:case:{case_id}")],
         [btn("👤 Профиль клиента", f"admin:user:{case_id}")],
     ]

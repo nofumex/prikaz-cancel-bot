@@ -105,21 +105,43 @@ def money_to_decimal(value: object | None) -> Decimal | None:
     if not text:
         return None
     text = text.lower().replace("\xa0", " ")
-    pattern = re.search(r"(\d[\d\s]*)\s*руб\.?\s*(\d{1,2})?\s*коп\.?", text)
-    if pattern:
-        rubles = re.sub(r"\s+", "", pattern.group(1))
-        kopeks = pattern.group(2) or "0"
-        text = f"{rubles}.{kopeks}"
-    else:
-        text = text.replace(" ", "").replace(",", ".")
-        match = re.search(r"\d+(?:\.\d{1,2})?", text)
-        if not match:
+    text = text.replace("рублей", "руб.").replace("рубля", "руб.").replace("рубль", "руб.")
+    text = text.replace("копейки", "коп.").replace("копеек", "коп.").replace("копейка", "коп.")
+
+    comma_rub = re.search(r"(\d[\d\s]*),(\d{1,2})\s*руб\.?", text)
+    if comma_rub:
+        rubles = re.sub(r"[\s.]", "", comma_rub.group(1))
+        kopeks = comma_rub.group(2)
+        try:
+            return Decimal(f"{rubles}.{kopeks}")
+        except InvalidOperation:
             return None
-        text = match.group(0)
+
+    pattern = re.search(r"(\d[\d\s.]*)\s*руб\.?\s*(\d{1,2})?\s*коп\.?", text)
+    if pattern:
+        rubles_raw = pattern.group(1)
+        kopeks = pattern.group(2) or "0"
+        if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", rubles_raw.replace(" ", "")):
+            rubles = rubles_raw.replace(" ", "").replace(".", "")
+        else:
+            rubles = re.sub(r"[\s.]", "", rubles_raw)
+        try:
+            return Decimal(f"{rubles}.{kopeks}")
+        except InvalidOperation:
+            return None
+
+    compact = text.replace(" ", "").replace(",", ".")
+    match = re.search(r"\d+(?:\.\d{1,2})?", compact)
+    if not match:
+        return None
     try:
-        return Decimal(text)
+        return Decimal(match.group(0))
     except InvalidOperation:
         return None
+
+
+def parse_money(value: object | None) -> Decimal | None:
+    return money_to_decimal(value)
 
 
 def format_money_rub_kop(value: Decimal | int | float | str | None) -> str:
