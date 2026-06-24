@@ -53,6 +53,18 @@ def envelope_choice() -> InlineKeyboardMarkup:
     )
 
 
+def restore_reason_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn("📬 Получил приказ поздно", "case:restore_reason:late")],
+            [btn("🏥 Болезнь", "case:restore_reason:illness"), btn("🚗 Командировка / отъезд", "case:restore_reason:trip")],
+            [btn("🏠 Не проживал по адресу", "case:restore_reason:not_living")],
+            [btn("✍️ Написать свою причину", "case:restore_reason:custom")],
+            [btn("💬 Связаться с менеджером", "chat:start")],
+        ]
+    )
+
+
 def confirm_extraction() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -74,6 +86,16 @@ def edit_fields_menu() -> InlineKeyboardMarkup:
             [btn("🧾 Договор", "case:field:debt_contract"), btn("📆 Период", "case:field:debt_period")],
             [btn("💰 Сумма долга", "case:field:debt_amount"), btn("⚖️ Госпошлина", "case:field:state_duty")],
             [btn("↩️ Назад к проверке", "case:review")],
+        ]
+    )
+
+
+def debtor_name_fix_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn("✅ Применить исправление", "case:fix_debtor_name")],
+            [btn("✏️ Исправить вручную", "case:field:debtor_full_name")],
+            [btn("💬 Связаться с менеджером", "chat:start")],
         ]
     )
 

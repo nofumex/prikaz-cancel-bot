@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
@@ -10,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import CaseStatus
 from app.keyboards.common import admin_case_actions, admin_cases_page, admin_panel, manager_panel
-from app.models import Case, User
+from app.models import Case, OpenAIUsage, User
 from app.services.app_settings import payments_enabled, toggle_payments
 from app.services.payments import mark_paid_by_label
 from app.texts import case_summary
@@ -18,6 +19,45 @@ from app.utils import full_name, h, username_text
 
 router = Router(name="admin")
 PAGE_SIZE = 5
+
+
+def _money_usd(value: float | None) -> str:
+    return f"${(value or 0.0):.4f}"
+
+
+async def _usage_totals(session: AsyncSession, *, case_filter=None) -> tuple[float, int, int, int, int, int]:
+    stmt = select(
+        func.coalesce(func.sum(OpenAIUsage.total_cost_usd), 0.0),
+        func.coalesce(func.sum(OpenAIUsage.total_tokens), 0),
+        func.coalesce(func.sum(OpenAIUsage.input_tokens), 0),
+        func.coalesce(func.sum(OpenAIUsage.cached_input_tokens), 0),
+        func.coalesce(func.sum(OpenAIUsage.output_tokens), 0),
+        func.coalesce(func.sum(OpenAIUsage.reasoning_tokens), 0),
+    ).select_from(OpenAIUsage)
+    if case_filter is not None:
+        stmt = stmt.join(Case, Case.id == OpenAIUsage.case_id).where(case_filter)
+    result = await session.execute(stmt)
+    row = result.one()
+    return float(row[0] or 0.0), int(row[1] or 0), int(row[2] or 0), int(row[3] or 0), int(row[4] or 0), int(row[5] or 0)
+
+
+async def _avg_per_case(session: AsyncSession, case_filter) -> tuple[float, int]:
+    usage_case = (
+        select(
+            OpenAIUsage.case_id.label("case_id"),
+            func.sum(OpenAIUsage.total_cost_usd).label("total_cost_usd"),
+            func.sum(OpenAIUsage.total_tokens).label("total_tokens"),
+        )
+        .group_by(OpenAIUsage.case_id)
+        .subquery()
+    )
+    stmt = select(
+        func.coalesce(func.avg(usage_case.c.total_cost_usd), 0.0),
+        func.coalesce(func.avg(usage_case.c.total_tokens), 0),
+    ).select_from(usage_case).join(Case, Case.id == usage_case.c.case_id).where(case_filter)
+    result = await session.execute(stmt)
+    row = result.one()
+    return float(row[0] or 0.0), int(row[1] or 0)
 
 
 async def _ensure_admin_message(message: Message, user: User) -> bool:
@@ -159,12 +199,35 @@ async def cb_stats(callback: CallbackQuery, session: AsyncSession, current_user:
     cases_total = int(await session.scalar(select(func.count(Case.id))) or 0)
     pending = int(await session.scalar(select(func.count(Case.id)).where(Case.status == CaseStatus.PAYMENT_PENDING.value)) or 0)
     paid = int(await session.scalar(select(func.count(Case.id)).where(Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]))) or 0)
+    total_cost, total_tokens, input_tokens, cached_tokens, output_tokens, reasoning_tokens = await _usage_totals(session)
+    manual_cost, manual_tokens = await _avg_per_case(session, Case.envelope_photo_path.is_(None))
+    envelope_cost, envelope_tokens = await _avg_per_case(session, Case.envelope_photo_path.is_not(None))
+    completed_cost, completed_tokens = await _avg_per_case(session, Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]))
+    ten_dollars = 10.0
+    manual_gen = int(ten_dollars / manual_cost) if manual_cost else 0
+    envelope_gen = int(ten_dollars / envelope_cost) if envelope_cost else 0
+    completed_gen = int(ten_dollars / completed_cost) if completed_cost else 0
     await callback.message.answer(
         "<b>Статистика</b>\n\n"
         f"Пользователей: {users_total}\n"
         f"Заявлений всего: {cases_total}\n"
         f"Ожидают оплату: {pending}\n"
-        f"Оплачено/выдано: {paid}",
+        f"Оплачено/выдано: {paid}\n\n"
+        "<b>OpenAI API</b>\n"
+        f"Всего потрачено: {_money_usd(total_cost)}\n"
+        f"Всего токенов: {total_tokens}\n"
+        f"Input: {input_tokens}\n"
+        f"Cached input: {cached_tokens}\n"
+        f"Output: {output_tokens}\n"
+        f"Reasoning: {reasoning_tokens}\n\n"
+        "<b>Средний расход на 1 генерацию</b>\n"
+        f"- приказ + ручная дата: {_money_usd(manual_cost)}, {manual_tokens} токенов\n"
+        f"- приказ + конверт: {_money_usd(envelope_cost)}, {envelope_tokens} токенов\n"
+        f"- среднее по всем завершенным заявкам: {_money_usd(completed_cost)}, {completed_tokens} токенов\n\n"
+        "<b>Примерно генераций на $10</b>\n"
+        f"- по среднему расходу: {completed_gen}\n"
+        f"- если без конверта: {manual_gen}\n"
+        f"- если с конвертом: {envelope_gen}",
         reply_markup=admin_panel(payments_enabled()),
     )
     await callback.answer()
@@ -203,9 +266,12 @@ async def cb_mark_paid(callback: CallbackQuery, bot: Bot, session: AsyncSession,
 
         if paid_case.full_doc_path:
             await bot.send_document(paid_case.user.telegram_id, FSInputFile(paid_case.full_doc_path), caption="Полный вариант заявления.")
+        if paid_case.full_pdf_path:
+            await bot.send_document(paid_case.user.telegram_id, FSInputFile(paid_case.full_pdf_path), caption="Полный PDF.")
         if paid_case.instruction_path:
             await bot.send_document(paid_case.user.telegram_id, FSInputFile(paid_case.instruction_path), caption="Инструкция по отправке в суд.")
         paid_case.status = CaseStatus.DELIVERED.value
+        paid_case.delivered_at = datetime.utcnow()
         await session.commit()
     await callback.answer()
 

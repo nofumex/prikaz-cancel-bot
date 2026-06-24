@@ -54,12 +54,18 @@ class Settings:
     llm_timeout_seconds: int
 
     document_price_rub: int
+    document_preview_mode: str
     yoomoney_receiver: str | None
     yoomoney_success_url: str | None
     yoomoney_notification_secret: str | None
     payment_public_base_url: str | None
     payment_web_host: str
     payment_web_port: int
+
+    openai_input_price_per_1m: float
+    openai_cached_input_price_per_1m: float
+    openai_output_price_per_1m: float
+    openai_model_pricing_json: str
 
     amocrm_base_url: str | None
     amocrm_access_token: str | None
@@ -97,12 +103,17 @@ def get_settings() -> Settings:
         text_model=(getenv("TEXT_MODEL") or getenv("VISION_MODEL") or "gpt-5.4-mini").strip(),
         llm_timeout_seconds=_parse_int(getenv("LLM_TIMEOUT_SECONDS"), 90),
         document_price_rub=_parse_int(getenv("DOCUMENT_PRICE_RUB"), 990),
+        document_preview_mode=(getenv("DOCUMENT_PREVIEW_MODE") or "pdf").strip().lower(),
         yoomoney_receiver=(getenv("YOOMONEY_RECEIVER") or "").strip() or None,
         yoomoney_success_url=(getenv("YOOMONEY_SUCCESS_URL") or "").strip() or None,
         yoomoney_notification_secret=(getenv("YOOMONEY_NOTIFICATION_SECRET") or "").strip() or None,
         payment_public_base_url=(getenv("PAYMENT_PUBLIC_BASE_URL") or "").strip().rstrip("/") or None,
         payment_web_host=getenv("PAYMENT_WEB_HOST", "0.0.0.0"),
         payment_web_port=_parse_int(getenv("PAYMENT_WEB_PORT"), 8080),
+        openai_input_price_per_1m=float(getenv("OPENAI_INPUT_PRICE_PER_1M") or 0.75),
+        openai_cached_input_price_per_1m=float(getenv("OPENAI_CACHED_INPUT_PRICE_PER_1M") or 0.075),
+        openai_output_price_per_1m=float(getenv("OPENAI_OUTPUT_PRICE_PER_1M") or 4.50),
+        openai_model_pricing_json=(getenv("OPENAI_MODEL_PRICING_JSON") or "").strip(),
         amocrm_base_url=(getenv("AMOCRM_BASE_URL") or "").strip().rstrip("/") or None,
         amocrm_access_token=(getenv("AMOCRM_ACCESS_TOKEN") or "").strip() or None,
         amocrm_pipeline_id=_parse_int(getenv("AMOCRM_PIPELINE_ID"), 10915210) or None,

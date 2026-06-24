@@ -19,6 +19,8 @@ async def _deliver(bot: Bot, case) -> None:
     await bot.send_message(case.user.telegram_id, "Оплата подтверждена. Отправляю полный комплект документов.")
     if case.full_doc_path:
         await bot.send_document(case.user.telegram_id, FSInputFile(case.full_doc_path), caption="Полный вариант заявления.")
+    if case.full_pdf_path:
+        await bot.send_document(case.user.telegram_id, FSInputFile(case.full_pdf_path), caption="Полный PDF.")
     if case.instruction_path:
         await bot.send_document(case.user.telegram_id, FSInputFile(case.instruction_path), caption="Инструкция по отправке в суд.")
 

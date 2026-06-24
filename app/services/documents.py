@@ -12,16 +12,22 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
+from app.config import Settings
 from app.models import Case, User
 from app.services.legal_data import (
     FIELD_LABELS,
+    format_money_rub_kop,
+    bad_tokens_in_text,
+    bad_tokens_in_preview_text,
     clean_case_number,
     clean_uid,
     is_deadline_missed,
+    looks_like_dative_full_name,
     normalize_order_data,
     validate_before_generation,
     validate_docx_clean,
 )
+from app.services.pdf_tools import convert_docx_to_pdf, create_preview_pdf, pdf_text
 from app.utils import ensure_dir, h, safe_json_loads
 
 
@@ -40,11 +46,48 @@ def _optional(data: dict, key: str) -> str:
 
 
 def _short_name(full_name: str) -> str:
-    parts = full_name.split()
+    parts = [part for part in re.split(r"\s+", full_name.strip()) if part]
     if len(parts) < 2:
         return full_name
     initials = "".join(f"{part[0]}." for part in parts[1:] if part)
     return f"{parts[0]} {initials}".strip()
+
+
+def _date_long_text(raw: str) -> str:
+    parsed = None
+    try:
+        from app.utils import parse_russian_date
+
+        parsed = parse_russian_date(raw)
+    except Exception:
+        parsed = None
+    if not parsed:
+        return raw
+    months = [
+        "января",
+        "февраля",
+        "марта",
+        "апреля",
+        "мая",
+        "июня",
+        "июля",
+        "августа",
+        "сентября",
+        "октября",
+        "ноября",
+        "декабря",
+    ]
+    return f"{parsed.day} {months[parsed.month - 1]} {parsed.year} года"
+
+
+def _normalize_creditor_address(address: str) -> str:
+    text = re.sub(r"\s+", " ", address).strip(" ,.;")
+    text = text.replace("в городе ", "г. ")
+    text = re.sub(r"^город\s+", "г. ", text, flags=re.IGNORECASE)
+    text = re.sub(r"^г\.\s*Москва", "г. Москва", text, flags=re.IGNORECASE)
+    text = re.sub(r"^107061,\s*в\s+г\.?\s*Москва", "107061, г. Москва", text, flags=re.IGNORECASE)
+    text = re.sub(r"^107061,\s*в\s+городе\s+Москва", "107061, г. Москва", text, flags=re.IGNORECASE)
+    return text
 
 
 def _normalize_court_for_addressee(court: str) -> str:
@@ -75,6 +118,10 @@ def _normalize_court_for_body(court: str) -> str:
         normalized = re.sub(r"№\s*(\d+)", r"№ \1", normalized)
         return f"мировым судьей {normalized}"
     return court
+
+
+def _court_instrumental(court: str) -> str:
+    return _normalize_court_for_body(court)
 
 
 def _case_identifier(data: dict) -> str:
@@ -143,7 +190,7 @@ def _setup_styles(doc: Document) -> None:
     normal = doc.styles["Normal"]
     normal.font.name = "Times New Roman"
     normal._element.rPr.rFonts.set(qn("w:eastAsia"), "Times New Roman")
-    normal.font.size = Pt(12)
+    normal.font.size = Pt(14)
     normal.paragraph_format.space_after = Pt(6)
     normal.paragraph_format.line_spacing = 1.15
 
@@ -180,44 +227,46 @@ def _address_block(doc: Document, data: dict, user: User) -> None:
     table.alignment = WD_TABLE_ALIGNMENT.RIGHT
     table.autofit = False
     table.columns[0].width = Cm(7.0)
-    table.columns[1].width = Cm(9.2)
+    table.columns[1].width = Cm(9.5)
     left, right = table.rows[0].cells
     _set_cell_borderless(left)
     _set_cell_borderless(right)
     right.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+    debtor_full_name = _required(data, "debtor_full_name")
+    if looks_like_dative_full_name(debtor_full_name):
+        raise ValueError("Поле debtor_full_name выглядит как ФИО не в именительном падеже. Исправьте его перед генерацией.")
     lines = [
         _normalize_court_for_addressee(_required(data, "court_name")),
         _required(data, "court_address"),
         "",
-        f"Должник: {_required(data, 'debtor_full_name')}",
-        _optional(data, "debtor_birth_date"),
-        _optional(data, "debtor_passport"),
-        f"Адрес: {_required(data, 'debtor_address')}",
+        f"Должник:",
+        debtor_full_name,
+        f"адрес: {_required(data, 'debtor_address')}",
     ]
-    if user.phone:
-        lines.append(f"Тел.: {user.phone}")
     lines.extend(
         [
             "",
             f"Взыскатель: {_required(data, 'creditor_name')}",
-            _optional(data, "creditor_address"),
+            _normalize_creditor_address(_required(data, "creditor_address")),
         ]
     )
-    identifiers = " ".join(
-        part
-        for part in [
-            f"ИНН {_optional(data, 'creditor_inn')}" if _optional(data, "creditor_inn") else "",
-            f"ОГРН {_optional(data, 'creditor_ogrn')}" if _optional(data, "creditor_ogrn") else "",
-        ]
-        if part
-    )
-    if identifiers:
+    if _optional(data, "creditor_inn") or _optional(data, "creditor_ogrn"):
+        identifiers = " ".join(
+            part
+            for part in [
+                f"ИНН {_optional(data, 'creditor_inn')}" if _optional(data, "creditor_inn") else "",
+                f"ОГРН {_optional(data, 'creditor_ogrn')}" if _optional(data, "creditor_ogrn") else "",
+            ]
+            if part
+        )
         lines.append(identifiers)
     for line in lines:
         p = right.add_paragraph()
         p.paragraph_format.space_after = Pt(2)
         if line:
-            p.add_run(line)
+            run = p.add_run(line)
+            run.font.size = Pt(12)
+            run.font.name = "Times New Roman"
     doc.add_paragraph()
 
 
@@ -227,45 +276,42 @@ def _meta_line(doc: Document, data: dict) -> None:
         run.font.color.rgb = RGBColor(90, 90, 90)
 
 
-def build_statement_paragraphs(data: dict, received_date: date, deadline_date: date | None) -> list[str]:
-    court_body = _normalize_court_for_body(_required(data, "court_name"))
+def build_statement_paragraphs(data: dict, received_date: date, deadline_date: date | None, restore_reason: str | None = None) -> list[str]:
+    court_body = _court_instrumental(_required(data, "court_name"))
     case_identifier = _case_identifier(data)
     order_date = _required(data, "order_date")
+    order_date_long = _date_long_text(order_date)
     creditor = _required(data, "creditor_name")
     contract = _contract_phrase(_required(data, "debt_contract"))
     period = _period_phrase(_required(data, "debt_period"))
     received = received_date.strftime("%d.%m.%Y")
+    received_long = _date_long_text(received)
     deadline = deadline_date.strftime("%d.%m.%Y") if deadline_date else ""
     money_part = _money_sentence(data)
-    common = [
-        f"{order_date} {court_body} вынесен судебный приказ по делу/производству {case_identifier} о взыскании с меня в пользу {creditor} {money_part} {contract} {period}.",
-        f"Копия судебного приказа получена мной {received}.",
-        "С судебным приказом и заявленными взыскателем требованиями я не согласен. Возражаю относительно исполнения судебного приказа в полном объеме. Считаю требования взыскателя спорными, в том числе в части наличия задолженности, ее размера, периода взыскания, расчета процентов, комиссий, неустоек, государственной пошлины и иных платежей.",
+    base = [
+        f"{order_date_long} {court_body} вынесен судебный приказ по делу/производству {case_identifier}, о взыскании с меня в пользу {creditor} {money_part} {contract} {period}.",
+        f"Копия судебного приказа получена мной {received_long}, что подтверждается почтовым конвертом / указанной мной датой получения.",
     ]
     if is_deadline_missed(deadline_date):
-        common.extend(
-            [
-                f"Десятидневный срок для подачи возражений истек {deadline}. Прошу восстановить срок, поскольку копия судебного приказа была фактически получена мной {received}, а возможность своевременно обратиться в суд зависит от даты фактического получения судебного акта и подтверждается представленными документами.",
-                "В соответствии со статьями 112, 128, 129 ГПК РФ пропущенный процессуальный срок может быть восстановлен судом при наличии уважительных причин, а при поступлении возражений должника относительно исполнения судебного приказа судья отменяет судебный приказ.",
-                "На основании изложенного, руководствуясь статьями 112, 128, 129 ГПК РФ,",
-                "ПРОШУ:",
-                "1. Восстановить срок для подачи возражений относительно исполнения судебного приказа.",
-                f"2. Отменить судебный приказ от {order_date}, вынесенный {court_body} по делу/производству {case_identifier}, о взыскании задолженности в пользу {creditor}.",
-                "3. Направить мне копию определения об отмене судебного приказа по адресу, указанному в настоящем заявлении.",
-            ]
-        )
-    else:
-        common.extend(
-            [
-                f"Настоящие возражения подаются в установленный статьей 128 ГПК РФ десятидневный срок со дня получения копии судебного приказа. Последний день срока с учетом правил исчисления процессуальных сроков: {deadline}.",
-                "В соответствии со статьей 129 ГПК РФ при поступлении в установленный срок возражений должника относительно исполнения судебного приказа судья отменяет судебный приказ. После отмены судебного приказа взыскатель вправе обратиться в суд в порядке искового производства.",
-                "На основании изложенного, руководствуясь статьями 128, 129 ГПК РФ,",
-                "ПРОШУ:",
-                f"1. Отменить судебный приказ от {order_date}, вынесенный {court_body} по делу/производству {case_identifier}, о взыскании задолженности в пользу {creditor}.",
-                "2. Направить мне копию определения об отмене судебного приказа по адресу, указанному в настоящем заявлении.",
-            ]
-        )
-    return common
+        reason = restore_reason or "Причина пропуска срока не указана."
+        return base + [
+            f"Десятидневный срок подачи возражений истек {deadline}. {reason}",
+            "Прошу восстановить пропущенный процессуальный срок.",
+            "С судебным приказом не согласен, возражаю относительно его исполнения в полном объеме.",
+            "На основании изложенного, руководствуясь статьями 112, 128, 129 ГПК РФ,",
+            "ПРОШУ:",
+            f"1. Восстановить срок для подачи возражений относительно исполнения судебного приказа от {order_date_long}, вынесенного {court_body} по делу/производству {case_identifier}.",
+            f"2. Отменить судебный приказ от {order_date_long}, вынесенный {court_body} по делу/производству {case_identifier}.",
+            "3. Направить мне копию определения об отмене судебного приказа по адресу, указанному в настоящих возражениях.",
+        ]
+    return base + [
+        "С судебным приказом не согласен, возражаю относительно его исполнения в полном объеме.",
+        "Настоящие возражения подаются в установленный законом срок.",
+        "На основании изложенного, руководствуясь статьями 128, 129 ГПК РФ,",
+        "ПРОШУ:",
+        f"1. Отменить судебный приказ от {order_date_long}, вынесенный {court_body} по делу/производству {case_identifier}.",
+        "2. Направить мне копию определения об отмене судебного приказа по адресу, указанному в настоящих возражениях.",
+    ]
 
 
 def _redacted_line(doc: Document, prefix: str = "") -> None:
@@ -293,9 +339,10 @@ def _add_preview_text(doc: Document, text: str, line_no: int) -> int:
 
 
 def _add_body(doc: Document, paragraphs: list[str], *, preview: bool, restore_term: bool) -> None:
-    _paragraph(doc, "ЗАЯВЛЕНИЕ", bold=True, size=14, align=WD_ALIGN_PARAGRAPH.CENTER, before=4, after=2)
-    subtitle = "об отмене судебного приказа и восстановлении срока" if restore_term else "об отмене судебного приказа"
-    _paragraph(doc, subtitle, size=12, align=WD_ALIGN_PARAGRAPH.CENTER, after=14)
+    _paragraph(doc, "ВОЗРАЖЕНИЯ", bold=True, size=14, align=WD_ALIGN_PARAGRAPH.CENTER, before=4, after=2)
+    subtitle = "относительно исполнения судебного приказа с ходатайством о восстановлении срока" if restore_term else "относительно исполнения судебного приказа"
+    _paragraph(doc, subtitle, size=12, align=WD_ALIGN_PARAGRAPH.CENTER, after=10)
+    _paragraph(doc, "/ заявление об отмене судебного приказа /", size=11, align=WD_ALIGN_PARAGRAPH.CENTER, after=12)
     line_no = 1
     for text in paragraphs:
         if text == "ПРОШУ:":
@@ -307,7 +354,7 @@ def _add_body(doc: Document, paragraphs: list[str], *, preview: bool, restore_te
             _paragraph(doc, text, first_line=True, after=7)
 
 
-def _add_attachments_and_signature(doc: Document, data: dict, debtor: str, *, preview: bool, restore_term: bool) -> None:
+def _add_attachments_and_signature(doc: Document, data: dict, debtor: str, document_date: date, *, preview: bool, restore_term: bool) -> None:
     _paragraph(doc, "Приложения:", bold=True, before=6, after=4)
     items = [
         f"Копия судебного приказа от {_required(data, 'order_date')}.",
@@ -329,17 +376,62 @@ def _add_attachments_and_signature(doc: Document, data: dict, debtor: str, *, pr
     table.columns[1].width = Cm(7.0)
     for cell in table.rows[0].cells:
         _set_cell_borderless(cell)
-    table.rows[0].cells[0].paragraphs[0].add_run("Дата подачи: поставить от руки")
+    table.rows[0].cells[0].paragraphs[0].add_run(f"«{document_date.day:02d}» {['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'][document_date.month - 1]} {document_date.year} г.")
     right = table.rows[0].cells[1].paragraphs[0]
     right.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    right.add_run("Подпись: поставить от руки")
-    _paragraph(doc, _short_name(debtor), align=WD_ALIGN_PARAGRAPH.RIGHT, after=0)
+    right.add_run(f"_____________ /{_short_name(debtor)}/")
+    if not preview:
+        _paragraph(doc, "Подпись ставится от руки синей ручкой.", size=10, align=WD_ALIGN_PARAGRAPH.LEFT, after=0)
     if preview:
         p = _paragraph(doc, "Предпросмотр: каждая вторая строка скрыта до оплаты.", size=10, align=WD_ALIGN_PARAGRAPH.CENTER, before=10, after=0)
         p.runs[0].font.color.rgb = RGBColor(120, 120, 120)
 
 
-def create_case_documents(case: Case, user: User) -> tuple[Path, Path, Path]:
+def _build_instruction_doc(path: Path, *, deadline: str, restore_term: bool) -> None:
+    doc = Document()
+    _setup_styles(doc)
+    _paragraph(doc, "Инструкция", bold=True, size=14, align=WD_ALIGN_PARAGRAPH.CENTER, after=8)
+    _paragraph(doc, "по подаче возражений в суд", size=12, align=WD_ALIGN_PARAGRAPH.CENTER, after=14)
+    lines = [
+        f"Срок на подачу: до {deadline}.",
+        "Документ можно подать лично в канцелярию мирового судьи.",
+        "Документ можно отправить заказным письмом с описью вложения.",
+        "Если отправка почтой, важно сдать письмо до 24:00 последнего дня срока.",
+        "Сохраните чек, опись и трек-номер.",
+        "Подпись в заявлении ставится от руки синей ручкой.",
+    ]
+    if restore_term:
+        lines.insert(1, "Так как срок пропущен, в заявлении уже включено ходатайство о восстановлении срока.")
+    for line in lines:
+        _paragraph(doc, line, first_line=True, after=6)
+    doc.save(path)
+
+
+def _validate_package_texts(
+    full_docx: Path,
+    full_pdf: Path | None,
+    *,
+    preview_pdf: Path | None = None,
+    preview_docx: Path | None = None,
+    card_text: str,
+) -> None:
+    problems = []
+    problems.extend(validate_docx_clean(str(full_docx)))
+    if full_pdf is not None:
+        try:
+            problems.extend(bad_tokens_in_text(pdf_text(full_pdf)))
+        except Exception:
+            raise
+    if preview_pdf is not None:
+        problems.extend(bad_tokens_in_preview_text(pdf_text(preview_pdf)))
+    if preview_docx is not None:
+        problems.extend(token for token in validate_docx_clean(str(preview_docx)) if token != "▒")
+    problems.extend(bad_tokens_in_text(card_text))
+    if problems:
+        raise ValueError(f"Документ не прошел стоп-лист: {', '.join(sorted(set(problems)))}")
+
+
+def create_case_documents(case: Case, user: User, settings: Settings, *, restore_reason: str | None = None) -> tuple[Path, Path | None, Path | None, Path | None, Path]:
     ensure_dir(DOCUMENT_DIR)
     case_dir = ensure_dir(DOCUMENT_DIR / f"case_{case.id}")
     data = normalize_order_data(safe_json_loads(case.extracted_json, {}))
@@ -352,43 +444,55 @@ def create_case_documents(case: Case, user: User) -> tuple[Path, Path, Path]:
 
     restore_term = is_deadline_missed(case.deadline_date)
     debtor = _required(data, "debtor_full_name")
-    paragraphs = build_statement_paragraphs(data, case.received_date, case.deadline_date)
-    suffix = "s_vosstanovleniem_sroka" if restore_term else "ob_otmene_prikaza"
-    full_path = case_dir / f"zayavlenie_{suffix}_{case.id}.docx"
-    preview_path = case_dir / f"preview_zayavlenie_{suffix}_{case.id}.docx"
-    instruction_path = case_dir / f"instruktsiya_po_otpravke_{case.id}.txt"
+    if looks_like_dative_full_name(debtor):
+        raise ValueError("Поле debtor_full_name выглядит как ФИО не в именительном падеже. Исправьте его перед генерацией.")
+    paragraphs = build_statement_paragraphs(data, case.received_date, case.deadline_date, restore_reason=restore_reason)
+    suffix = "restore_term" if restore_term else "in_time"
+    full_docx = case_dir / f"statement_{suffix}_{case.id}.docx"
+    full_pdf = case_dir / f"statement_{suffix}_{case.id}.pdf"
+    preview_pdf = case_dir / f"preview_statement_{suffix}_{case.id}.pdf"
+    preview_docx = case_dir / f"preview_statement_{suffix}_{case.id}.docx"
+    instruction_path = case_dir / f"instruction_{case.id}.docx"
 
-    for path, preview in ((full_path, False), (preview_path, True)):
-        doc = Document()
-        _setup_styles(doc)
-        _address_block(doc, data, user)
-        _meta_line(doc, data)
-        _add_body(doc, paragraphs, preview=preview, restore_term=restore_term)
-        _add_attachments_and_signature(doc, data, debtor, preview=preview, restore_term=restore_term)
-        doc.save(path)
-        bad_tokens = validate_docx_clean(str(path))
-        if bad_tokens:
-            raise ValueError(f"Документ не прошел стоп-лист: {', '.join(bad_tokens)}")
+    doc = Document()
+    _setup_styles(doc)
+    _address_block(doc, data, user)
+    _add_body(doc, paragraphs, preview=False, restore_term=restore_term)
+    _add_attachments_and_signature(doc, data, debtor, case.received_date, preview=False, restore_term=restore_term)
+    doc.save(full_docx)
+    pdf_conversion_failed = False
+    try:
+        full_pdf = convert_docx_to_pdf(full_docx, case_dir)
+    except Exception:
+        full_pdf = None
+        pdf_conversion_failed = True
+
+    preview_pdf_path: Path | None = None
+    preview_docx_path: Path | None = None
+    if settings.document_preview_mode == "docx" or pdf_conversion_failed:
+        preview_doc = Document()
+        _setup_styles(preview_doc)
+        _address_block(preview_doc, data, user)
+        _add_body(preview_doc, paragraphs, preview=True, restore_term=restore_term)
+        _add_attachments_and_signature(preview_doc, data, debtor, case.received_date, preview=True, restore_term=restore_term)
+        preview_doc.save(preview_docx)
+        preview_docx_path = preview_docx
+    elif full_pdf is not None:
+        preview_pdf_path = create_preview_pdf(full_pdf, preview_pdf)
 
     deadline = case.deadline_date.strftime("%d.%m.%Y") if case.deadline_date else "уточняется"
-    extra = (
-        "Так как срок уже пропущен, заявление включает ходатайство о восстановлении срока. Приложите доказательства даты фактического получения приказа.\n"
-        if restore_term
-        else "Документы можно подать лично в канцелярию или отправить почтой до 24:00 последнего дня срока.\n"
+    _build_instruction_doc(instruction_path, deadline=deadline, restore_term=restore_term)
+
+    card_text = extraction_preview(data, case.received_date, [], case.deadline_date)
+    _validate_package_texts(
+        full_docx,
+        full_pdf,
+        preview_pdf=preview_pdf_path,
+        preview_docx=preview_docx_path,
+        card_text=card_text,
     )
-    instruction_path.write_text(
-        "Инструкция по отправке заявления в суд\n\n"
-        f"Срок на подачу: до {deadline}.\n"
-        f"{extra}\n"
-        "1. Распечатайте заявление в 2 экземплярах.\n"
-        "2. Проверьте реквизиты суда, номер дела, ФИО, адрес и суммы.\n"
-        "3. Поставьте дату и подпись от руки.\n"
-        "4. Приложите копию судебного приказа и конверт/иной документ с датой получения.\n"
-        "5. Передайте заявление в канцелярию мирового судьи или отправьте заказным письмом с описью вложения.\n"
-        "6. Сохраните отметку канцелярии, чек и опись отправления.",
-        encoding="utf-8",
-    )
-    return full_path, preview_path, instruction_path
+
+    return full_docx, full_pdf, preview_pdf_path, preview_docx_path, instruction_path
 
 
 def extraction_preview(data: dict, received_date: date | None, missing: list[str], deadline_date: date | None = None) -> str:

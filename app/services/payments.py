@@ -40,7 +40,7 @@ async def ensure_payment(session: AsyncSession, case: Case, settings: Settings) 
         payment = Payment(case_id=case.id, label=label, amount=settings.document_price_rub)
         session.add(payment)
         case.payment_label = label
-    case.payment_url = build_yoomoney_url(settings, payment.label, payment.amount, f"Заявление об отмене судебного приказа #{case.id}")
+    case.payment_url = build_yoomoney_url(settings, payment.label, payment.amount, f"Возражения относительно исполнения судебного приказа #{case.id}")
     case.status = CaseStatus.PAYMENT_PENDING.value
     await session.commit()
     await session.refresh(payment)

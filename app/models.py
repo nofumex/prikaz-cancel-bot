@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -43,6 +43,8 @@ class Case(Base):
     extracted_json: Mapped[str | None] = mapped_column(Text)
     missing_fields: Mapped[str | None] = mapped_column(Text)
     full_doc_path: Mapped[str | None] = mapped_column(Text)
+    full_pdf_path: Mapped[str | None] = mapped_column(Text)
+    preview_pdf_path: Mapped[str | None] = mapped_column(Text)
     preview_doc_path: Mapped[str | None] = mapped_column(Text)
     instruction_path: Mapped[str | None] = mapped_column(Text)
     payment_label: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
@@ -58,6 +60,35 @@ class Case(Base):
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     user: Mapped[User] = relationship(lazy="selectin")
+
+
+class OpenAIUsage(Base):
+    __tablename__ = "openai_usages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    case_id: Mapped[int | None] = mapped_column(ForeignKey("cases.id"), index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), default="openai", nullable=False)
+    endpoint: Mapped[str] = mapped_column(String(32), default="responses", nullable=False)
+    operation: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str | None] = mapped_column(String(255))
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cached_input_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    reasoning_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    image_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    input_cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    cached_input_cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    output_cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    total_cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    request_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    raw_usage_json: Mapped[str | None] = mapped_column(Text)
+    raw_response_model: Mapped[str | None] = mapped_column(String(255))
+    success: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
 
 
 class Payment(Base):
