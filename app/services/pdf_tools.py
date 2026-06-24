@@ -127,6 +127,16 @@ def create_preview_pdf(full_pdf_path: str | Path, preview_pdf_path: str | Path) 
     return preview_pdf_path
 
 
+def pdf_page_count(path: str | Path | None) -> int | None:
+    if fitz is None or path is None:
+        return None
+    document = fitz.open(str(path))
+    try:
+        return document.page_count
+    finally:
+        document.close()
+
+
 def pdf_text(path: str | Path) -> str:
     if fitz is None:
         raise RuntimeError("PyMuPDF (fitz) is not available for PDF text validation")

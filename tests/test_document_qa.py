@@ -26,7 +26,7 @@ def test_document_qa_rejects_bad_tokens(tmp_path):
         require_preview_pdf=False,
     )
     assert not qa.ok
-    assert any("ЗАЯВЛЕНИЕ" in token or "об отмене" in token for token in qa.bad_tokens)
+    assert "old_statement_title" in qa.bad_tokens
 
 
 def test_document_qa_rejects_dative_name(tmp_path):

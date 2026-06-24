@@ -7,6 +7,7 @@ from pathlib import Path
 from app.services.legal_data import (
     BAD_DOCUMENT_TOKENS,
     FIELD_LABELS,
+    AmountValidationResult,
     VALIDATION_SKIP_KEYS,
     bad_tokens_in_preview_text,
     bad_tokens_in_text,
@@ -41,6 +42,7 @@ def run_document_qa(
     card_text: str = "",
     restore_reason: str | None = None,
     require_preview_pdf: bool = True,
+    amount_check: AmountValidationResult | None = None,
 ) -> DocumentQAResult:
     normalized = normalize_order_data(data)
     missing = missing_order_fields(normalized, received_date)
@@ -72,6 +74,10 @@ def run_document_qa(
 
     if is_deadline_missed(deadline_date) and not restore_reason:
         reasons.append("срок пропущен, но не указана причина восстановления")
+
+    if amount_check and not amount_check.ok:
+        bad.append("amount_mismatch")
+        reasons.append("amount_mismatch: суммы долга, госпошлины и итога не согласованы")
 
     if full_docx and full_docx.exists():
         bad.extend(validate_docx_clean(str(full_docx)))

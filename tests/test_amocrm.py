@@ -67,8 +67,8 @@ async def test_crm_disabled_does_not_crash():
 
 def test_event_status_map_contains_required_stages():
     assert EVENT_STATUS_MAP["user_started_bot"] == "Подписался на бота"
-    assert EVENT_STATUS_MAP["order_photo_uploaded"] == "Отправил фотографию приказа"
-    assert EVENT_STATUS_MAP["preview_generated"] == "Сформирован предпросмотр"
-    assert EVENT_STATUS_MAP["payment_created"] == "Ожидает оплату"
+    assert EVENT_STATUS_MAP["order_photo_uploaded"] == "Отправил приказ"
+    assert EVENT_STATUS_MAP["received_date_entered"] == "Ввел дату"
     assert EVENT_STATUS_MAP["payment_paid"] == "Оплатил"
-    assert EVENT_STATUS_MAP["documents_delivered"] == "Получил документы"
+    assert EVENT_STATUS_MAP["documents_delivered"] == "Получил заявление"
+    assert EVENT_STATUS_MAP["document_qa_failed"] == "Нужна проверка"

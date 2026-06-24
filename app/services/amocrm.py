@@ -20,32 +20,27 @@ logger = logging.getLogger(__name__)
 
 PIPELINE_STATUSES = [
     "Подписался на бота",
-    "Отправил фотографию приказа",
-    "Ввел дату получения",
-    "Данные распознаны",
-    "Сформирован предпросмотр",
-    "Ожидает оплату",
+    "Отправил приказ",
+    "Ввел дату",
     "Оплатил",
-    "Получил документы",
+    "Получил заявление",
     "Нужна проверка",
-    "Связался с менеджером",
-    "Отказ / не оплатил",
 ]
 
 EVENT_STATUS_MAP = {
     "user_started_bot": "Подписался на бота",
-    "order_photo_uploaded": "Отправил фотографию приказа",
-    "envelope_photo_uploaded": "Ввел дату получения",
-    "received_date_entered": "Ввел дату получения",
-    "ocr_completed": "Данные распознаны",
-    "case_data_confirmed": "Данные распознаны",
-    "preview_generated": "Сформирован предпросмотр",
-    "payment_created": "Ожидает оплату",
+    "order_photo_uploaded": "Отправил приказ",
+    "envelope_photo_uploaded": "Ввел дату",
+    "received_date_entered": "Ввел дату",
+    "ocr_completed": "Ввел дату",
+    "case_data_confirmed": "Ввел дату",
+    "preview_generated": "Ввел дату",
+    "payment_created": "Ввел дату",
     "payment_paid": "Оплатил",
-    "documents_delivered": "Получил документы",
+    "documents_delivered": "Получил заявление",
     "document_qa_failed": "Нужна проверка",
-    "manager_requested": "Связался с менеджером",
-    "payment_abandoned": "Отказ / не оплатил",
+    "manager_requested": "Нужна проверка",
+    "payment_abandoned": "Ввел дату",
 }
 
 

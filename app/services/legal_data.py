@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from zipfile import ZipFile
@@ -29,7 +29,6 @@ BAD_DOCUMENT_TOKENS = [
     "▒",
     "Дата подачи: поставить от руки",
     "Подпись: поставить от руки",
-    "ЗАЯВЛЕНИЕ об отмене судебного приказа",
     "Считаю требования взыскателя спорными",
     "Бельскому Владимиру Геннадьевичу",
     "Бельского Владимира Геннадьевича",
@@ -290,9 +289,18 @@ def missing_order_fields(data: dict, received_date: date | None = None) -> list[
     return missing
 
 
+def has_old_statement_title(text: str) -> bool:
+    lower = text.lower()
+    if "возражения" in lower:
+        return False
+    return bool(re.search(r"(?m)^\s*заявление\s+об\s+отмене", lower))
+
+
 def bad_tokens_in_text(text: str) -> list[str]:
     lower = text.lower()
     found: list[str] = []
+    if has_old_statement_title(text):
+        found.append("old_statement_title")
     for token in BAD_DOCUMENT_TOKENS:
         needle = token if token != token.lower() else token.lower()
         haystack = text if token != token.lower() else lower
@@ -336,6 +344,41 @@ VALIDATION_SKIP_KEYS = {
     "court_instrumental",
     "restore_reason",
 }
+
+
+@dataclass
+class AmountValidationResult:
+    ok: bool
+    debt_amount: Decimal | None = None
+    state_duty: Decimal | None = None
+    total_amount: Decimal | None = None
+    computed_total: Decimal | None = None
+    errors: list[str] = field(default_factory=list)
+
+
+def validate_amounts(data: dict) -> AmountValidationResult:
+    normalized = normalize_order_data(data)
+    debt = money_to_decimal(normalized.get("debt_amount"))
+    state_duty = money_to_decimal(normalized.get("state_duty"))
+    total = money_to_decimal(normalized.get("total_amount"))
+    errors: list[str] = []
+    if debt is None and normalized.get("debt_amount"):
+        errors.append("debt_amount: не удалось распознать сумму долга")
+    if state_duty is None and normalized.get("state_duty"):
+        errors.append("state_duty: не удалось распознать госпошлину")
+    computed_total = None
+    if debt is not None and state_duty is not None:
+        computed_total = (debt + state_duty).quantize(Decimal("0.01"))
+        if total is not None and abs(total - computed_total) > Decimal("0.01"):
+            errors.append("amount_mismatch")
+    return AmountValidationResult(
+        ok=not errors,
+        debt_amount=debt,
+        state_duty=state_duty,
+        total_amount=total,
+        computed_total=computed_total,
+        errors=errors,
+    )
 
 
 def validate_before_generation(data: dict, received_date: date | None) -> ValidationResult:

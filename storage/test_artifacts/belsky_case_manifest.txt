@@ -1,5 +1,26 @@
-case_id=20
-full_docx=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_20\statement_in_time_20.docx
-full_pdf=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_20\statement_in_time_20.pdf
-preview_pdf=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_20\preview_statement_in_time_20.pdf
-instruction_docx=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_20\instruction_20.docx
+case_id=24
+full_docx_path=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_24\statement_in_time_24.docx
+full_pdf_path=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_24\statement_in_time_24.pdf
+preview_pdf_path=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_24\preview_statement_in_time_24.pdf
+instruction_docx_path=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_24\instruction_24.docx
+page_count=1
+font_name=Times New Roman
+body_font_size=12.5
+margins={'left': 2.5, 'right': 1.5, 'top': 2.0, 'bottom': 2.0}
+amounts={'debt_amount': '78 472 руб. 87 коп.', 'state_duty': '1 277 руб. 00 коп.', 'total_amount': '79 749 руб. 87 коп.'}
+qa_passed=True
+qa_errors=[]
+qa_warnings=[]
+
+=== Visual QA Report ===
+page_count: 1
+font_name: Times New Roman
+body_font_size: 12.5
+margins: {'left': 2.5, 'right': 1.5, 'top': 2.0, 'bottom': 2.0}
+amounts: {'debt_amount': '78 472 руб. 87 коп.', 'state_duty': '1 277 руб. 00 коп.', 'total_amount': '79 749 руб. 87 коп.'}
+qa_passed: True
+qa_errors: []
+qa_warnings: []
+no_bad_tokens: True
+no_amount_mismatch: True
+no_weird_spaces: True
