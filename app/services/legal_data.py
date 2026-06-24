@@ -6,6 +6,12 @@ from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from zipfile import ZipFile
 
+from app.services.name_normalizer import (
+    NameNormalizationResult,
+    is_probably_not_nominative,
+    make_short_name,
+    normalize_person_name_from_ocr,
+)
 from app.utils import parse_russian_date
 
 
@@ -21,8 +27,14 @@ BAD_DOCUMENT_TOKENS = [
     "{{",
     "}}",
     "▒",
+    "Дата подачи: поставить от руки",
+    "Подпись: поставить от руки",
+    "ЗАЯВЛЕНИЕ об отмене судебного приказа",
+    "Считаю требования взыскателя спорными",
     "Бельскому Владимиру Геннадьевичу",
+    "Бельского Владимира Геннадьевича",
     "Бельскому В.Г.",
+    "Бельского В.Г.",
 ]
 
 PREVIEW_IGNORED_TOKENS = {"▒"}
@@ -33,6 +45,7 @@ FIELD_LABELS = {
     "debtor_full_name": "ФИО должника",
     "debtor_address": "Адрес должника",
     "creditor_name": "Взыскатель",
+    "creditor_address": "Адрес взыскателя",
     "case_number": "Номер дела",
     "order_date": "Дата приказа",
     "debt_contract": "Договор/основание долга",
@@ -50,6 +63,7 @@ REQUIRED_FIELDS = [
     "debtor_full_name",
     "debtor_address",
     "creditor_name",
+    "creditor_address",
     "case_number",
     "order_date",
     "debt_contract",
@@ -121,58 +135,80 @@ def format_money_rub_kop(value: Decimal | int | float | str | None) -> str:
     return f"{rubles:,}".replace(",", " ") + f" руб. {kopeks:02d} коп."
 
 
-def normalize_debtor_full_name(value: object | None) -> str:
+def normalize_debtor_full_name(value: object | None, context: str | None = None) -> str:
     text = clean_text(value)
-    text = re.sub(r"\s+", " ", text)
-    return text
+    if not text:
+        return ""
+    result = normalize_person_name_from_ocr(text, context)
+    return result.normalized or text
+
+
+def normalize_debtor_name_fields(data: dict) -> tuple[dict, NameNormalizationResult | None]:
+    raw = clean_text(data.get("debtor_name_raw") or data.get("debtor_full_name"))
+    context = clean_text(data.get("debtor_name_context") or data.get("debtor_name_source_fragment"))
+    if not raw:
+        return data, None
+    result = normalize_person_name_from_ocr(raw, context or None)
+    updated = dict(data)
+    updated["debtor_name_raw"] = raw
+    if context:
+        updated["debtor_name_context"] = context
+    llm_name = clean_text(data.get("debtor_full_name"))
+    llm_confidence = 0.0
+    try:
+        llm_confidence = float(data.get("debtor_full_name_confidence") or 0)
+    except (TypeError, ValueError):
+        llm_confidence = 0.0
+    if llm_name and llm_confidence >= 0.85 and not is_probably_not_nominative(llm_name):
+        updated["debtor_full_name"] = llm_name
+        result = NameNormalizationResult(
+            raw=raw or llm_name,
+            normalized=llm_name,
+            short_name=make_short_name(llm_name),
+            confidence=llm_confidence,
+            warnings=["llm_nominative"],
+        )
+    elif result.confidence >= 0.85:
+        updated["debtor_full_name"] = result.normalized
+    elif llm_name:
+        updated["debtor_full_name"] = llm_name
+    updated["debtor_short_name"] = make_short_name(updated.get("debtor_full_name") or result.normalized)
+    updated["debtor_name_normalized_from"] = raw if result.normalized != raw else ""
+    updated["debtor_name_confidence"] = str(max(result.confidence, llm_confidence))
+    return updated, result
 
 
 def looks_like_dative_full_name(value: object | None) -> bool:
-    text = clean_text(value)
-    if not text:
-        return False
-    parts = [part for part in text.split() if part]
-    if len(parts) < 2:
-        return False
-    suspicious_suffixes = ("ому", "ему", "ой", "евне", "овичу", "ичу", "ю", "у")
-    suspicious = 0
-    for part in parts:
-        lower = part.lower().strip(".,")
-        if lower.endswith(suspicious_suffixes):
-            suspicious += 1
-    return suspicious >= 2 or (suspicious >= 1 and len(parts) >= 3)
+    return is_probably_not_nominative(clean_text(value))
 
 
 def suggest_nominative_full_name(value: object | None) -> str | None:
     text = clean_text(value)
-    parts = [part for part in text.split() if part]
-    if len(parts) < 3:
+    if not text:
         return None
+    result = normalize_person_name_from_ocr(text)
+    if result.normalized and result.normalized != text:
+        return result.normalized
+    if result.confidence >= 0.75 and not is_probably_not_nominative(result.normalized):
+        return result.normalized
+    return None
 
-    def _fix_surname(token: str) -> str:
-        lower = token.lower().strip(".,")
-        if lower.endswith(("ому", "ему")):
-            stem = token[:-3]
-            if stem.lower().endswith(("ск", "цк", "зьк", "шк", "чк")):
-                return stem + "ий"
-            return stem + "ый"
-        if lower.endswith(("ову", "еву")):
-            return token[:-1]
-        if lower.endswith(("иному", "еному")):
-            return token[:-5] + "ин" if lower.endswith("иному") else token[:-5] + "ен"
-        return token
 
-    def _fix_name(token: str) -> str:
-        lower = token.lower().strip(".,")
-        if lower.endswith(("у", "ю")):
-            return token[:-1]
-        return token
-
-    surname = _fix_surname(parts[0])
-    name = _fix_name(parts[1])
-    patronymic = _fix_name(parts[2])
-    result = " ".join([surname, name, patronymic]).strip()
-    return result if result and result != text else None
+def normalize_court_forms(court_name: str) -> dict[str, str]:
+    court = clean_text(court_name)
+    lower = court.lower()
+    base = court
+    if lower.startswith("мировому судье "):
+        base = court[len("мировому судье ") :].strip()
+    elif lower.startswith("мировой судья "):
+        base = court[len("мировой судья ") :].strip()
+    elif lower.startswith("судебный участок"):
+        base = re.sub(r"^судебный участок", "судебного участка", court, flags=re.IGNORECASE)
+    return {
+        "court_name": base,
+        "court_addressee": f"Мировому судье {base}" if not base.lower().startswith("мировому") else court,
+        "court_instrumental": f"мировым судьей {base}",
+    }
 
 
 def normalize_order_data(data: dict) -> dict:
@@ -181,8 +217,12 @@ def normalize_order_data(data: dict) -> dict:
         normalized["uid"] = clean_uid(normalized["uid"])
     if normalized.get("case_number"):
         normalized["case_number"] = clean_case_number(normalized["case_number"])
-    if normalized.get("debtor_full_name"):
-        normalized["debtor_full_name"] = normalize_debtor_full_name(normalized["debtor_full_name"])
+    normalized, _ = normalize_debtor_name_fields(normalized)
+    if normalized.get("court_name"):
+        court_forms = normalize_court_forms(normalized["court_name"])
+        normalized["court_name"] = court_forms["court_name"]
+        normalized["court_addressee"] = court_forms["court_addressee"]
+        normalized["court_instrumental"] = court_forms["court_instrumental"]
     for key in ("debt_amount", "state_duty", "total_amount"):
         if normalized.get(key):
             normalized[key] = clean_money_text(normalized[key])
@@ -285,13 +325,34 @@ class ValidationResult:
     bad_tokens: list[str]
 
 
+VALIDATION_SKIP_KEYS = {
+    "debtor_name_raw",
+    "debtor_name_context",
+    "debtor_name_source_fragment",
+    "debtor_name_normalized_from",
+    "debtor_name_confidence",
+    "debtor_short_name",
+    "court_addressee",
+    "court_instrumental",
+    "restore_reason",
+}
+
+
 def validate_before_generation(data: dict, received_date: date | None) -> ValidationResult:
     missing = missing_order_fields(data, received_date)
     bad = []
     for key, value in normalize_order_data(data).items():
+        if key in VALIDATION_SKIP_KEYS:
+            continue
         found = bad_tokens_in_text(f"{key}: {value}")
         bad.extend(found)
-    debtor = normalize_order_data(data).get("debtor_full_name", "")
-    if looks_like_dative_full_name(debtor):
+    normalized = normalize_order_data(data)
+    debtor = normalized.get("debtor_full_name", "")
+    confidence = 0.0
+    try:
+        confidence = float(normalized.get("debtor_name_confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if looks_like_dative_full_name(debtor) and confidence < 0.85:
         bad.append("debtor_full_name:dative")
     return ValidationResult(ok=not missing and not bad, missing=missing, bad_tokens=sorted(set(bad)))

@@ -1,54 +1,119 @@
 # prikaz-cancel-bot
 
-Бот для Telegram и базовый каркас MAX, который готовит заявление об отмене судебного приказа:
+Telegram-бот для подготовки **возражений относительно исполнения судебного приказа** с оплатой, безопасным PDF-предпросмотром и синхронизацией в amoCRM.
 
-- принимает фото судебного приказа;
-- принимает фото конверта или ручную дату получения;
-- берет самую позднюю дату со штампов конверта для расчета 10-дневного срока;
-- извлекает данные с фото через OpenAI Vision API;
-- формирует полный DOCX, полный PDF и безопасный PDF-предпросмотр;
-- выдает предпросмотр и ссылку YooMoney;
-- после HTTP-уведомления YooMoney или ручной отметки админа отправляет полный DOCX и инструкцию;
-- три раза напоминает неоплатившему пользователю раз в сутки;
-- дает профиль, админ-панель и чат с менеджером;
-- в админке есть переключатель оплаты: можно выключить оплату для тестов и сразу выдавать полный комплект;
-- заявки в админке показываются страницами по 5 штук со стрелками;
-- amoCRM-записи отключены через `AMOCRM_WRITE_ENABLED=false`; CRM-кнопка убрана из админки.
+## Что генерирует бот
+
+Для каждой заявки создаются:
+
+- полный DOCX;
+- полный PDF (LibreOffice);
+- безопасный preview PDF (PyMuPDF — каждая вторая строка скрыта);
+- инструкция DOCX по подаче в суд.
+
+До оплаты пользователь получает **только preview PDF**. После оплаты — полный DOCX, PDF и инструкцию.
+
+## Зависимости
+
+- Python 3.11+
+- **LibreOffice** (`soffice`) — конвертация DOCX → PDF
+- **PyMuPDF** (`fitz`) — preview PDF и QA
+- **holidays** — расчёт процессуального срока с переносом выходных/праздников РФ
+
+```powershell
+python -m pip install -r requirements.txt
+```
 
 ## Запуск
 
 ```powershell
-python -m pip install -r requirements.txt
 python -m app.main
 ```
 
-## Основные переменные
+## Переменные окружения
 
-Скопируйте недостающие переменные из `.env.example` в `.env`.
+Скопируйте `.env.example` в `.env`.
 
-- `TG_BOT_TOKEN` - токен Telegram-бота.
-- `ADMIN_ID` - Telegram ID администратора.
-- `MANAGER_IDS` - Telegram ID менеджеров через запятую.
-- `OPENAI_API_KEY` - ключ OpenAI API для чтения фото и структурного извлечения данных.
-- `VISION_MODEL` / `TEXT_MODEL` - модели для чтения фото и текста.
-- `DOCUMENT_PREVIEW_MODE=pdf` - production-режим предпросмотра; `docx` только для dev.
-- `YOOMONEY_RECEIVER` - номер кошелька ЮMoney.
-- `YOOMONEY_NOTIFICATION_SECRET` - секрет HTTP-уведомлений ЮMoney.
-- `PAYMENT_PUBLIC_BASE_URL` - публичный URL сервера, где доступен `/payments/yoomoney`.
-- `DOCUMENT_PRICE_RUB` - цена документа.
-- `RUN_MAX=true` и `MAX_BOT_TOKEN` - включение MAX-каркаса.
+### OpenAI
 
-HTTP-уведомление YooMoney должно приходить POST-запросом на:
+- `VISION_MODEL`, `TEXT_MODEL` — модели OCR и нормализации ФИО
+- `OPENAI_INPUT_PRICE_PER_1M`, `OPENAI_CACHED_INPUT_PRICE_PER_1M`, `OPENAI_OUTPUT_PRICE_PER_1M` — учёт расходов
 
-```text
-https://ваш-домен/payments/yoomoney
+### PDF preview
+
+- `ENABLE_PDF_PREVIEW=true`
+- `REQUIRE_PDF_PREVIEW_FOR_PAYMENT=true` — без preview PDF платёж не создаётся
+- `ALLOW_DEV_DOCX_PREVIEW=false` — dev-only DOCX с `▒`, не для production
+
+### Оплата
+
+- `YOOMONEY_RECEIVER`, `YOOMONEY_NOTIFICATION_SECRET`, `PAYMENT_PUBLIC_BASE_URL`
+- В админке: переключатель «Оплата ВКЛ/ВЫКЛ» для тестов
+
+Webhook: `POST https://ваш-домен/payments/yoomoney`
+
+### amoCRM
+
+- `AMOCRM_ENABLED=true`
+- `AMOCRM_BASE_URL`, `AMOCRM_ACCESS_TOKEN`
+- `AMOCRM_PIPELINE_NAME=Судебный приказ`
+- `AMOCRM_AUTO_CREATE_PIPELINE=false` — не создавать чужие воронки
+- `AMOCRM_AUTO_CREATE_STATUSES=true` — создать недостающие этапы в своей воронке
+
+Этапы воронки:
+
+1. Подписался на бота
+2. Отправил фотографию приказа
+3. Сформирован предпросмотр
+4. Ожидает оплату
+5. Оплатил
+6. Нужна проверка
+7. Связался с менеджером
+8. Отказ / не оплатил
+
+## Document QA
+
+Перед созданием платежа проверяется:
+
+- наличие DOCX, PDF, preview PDF, инструкции;
+- стоп-лист (дательный падеж ФИО, старый заголовок, `▒`, плейсхолдеры);
+- заполненность полей;
+- причина восстановления срока, если срок пропущен.
+
+При ошибке QA: статус `needs_review`, админ получает уведомление.
+
+## OpenAI usage
+
+Расходы пишутся в таблицу `openai_usages`. В админке **📊 Статистика**:
+
+- токены и доллары;
+- средний расход на генерацию;
+- оценка генераций на $10.
+
+## Проверки
+
+```powershell
+python -m py_compile (Get-ChildItem -Recurse -Filter *.py | ForEach-Object { $_.FullName })
+pytest
+python scripts/smoke_test.py
 ```
 
-## amoCRM
+Smoke-тест создаёт тестовый комплект документов для дела Бельского в `storage/documents/case_<id>/`.
 
-Записи в CRM намеренно отключены до финального решения по отдельной воронке. Кнопка CRM-структуры убрана из админки.
+## Production readiness
 
-## PDF-предпросмотр
+Перед включением оплаты:
 
-Для production-предпросмотра нужны `LibreOffice/soffice` и `PyMuPDF`.
-Если их нет, `DOCUMENT_PREVIEW_MODE=docx` можно использовать только для dev и без включения оплаты.
+1. `ENABLE_PDF_PREVIEW=true`, `REQUIRE_PDF_PREVIEW_FOR_PAYMENT=true`
+2. LibreOffice и PyMuPDF установлены на сервере
+3. `ALLOW_DEV_DOCX_PREVIEW=false`
+4. Document QA проходит на тестовой заявке
+5. amoCRM токен и воронка «Судебный приказ» настроены
+
+## Тестовый сценарий в боте
+
+1. `/start` → «Подготовить заявление»
+2. Фото приказа → дата/конверт
+3. Проверка карточки (ФИО в именительном падеже)
+4. «Готовить документы» → preview PDF → оплата
+5. После оплаты — полный комплект

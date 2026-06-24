@@ -18,13 +18,16 @@ def _find_soffice() -> str | None:
     return None
 
 
-def convert_docx_to_pdf(docx_path: str | Path, outdir: str | Path | None = None) -> Path:
+def convert_docx_to_pdf(docx_path: str | Path, outdir: str | Path | None = None, *, allow_dev_fallback: bool = False) -> Path:
     soffice = _find_soffice()
-    if not soffice:
-        raise RuntimeError("LibreOffice/soffice is not available for DOCX -> PDF conversion")
     docx_path = Path(docx_path)
     outdir_path = Path(outdir or docx_path.parent)
     outdir_path.mkdir(parents=True, exist_ok=True)
+    pdf_path = outdir_path / (docx_path.stem + ".pdf")
+    if not soffice:
+        if allow_dev_fallback and fitz is not None:
+            return _convert_docx_to_pdf_fitz_fallback(docx_path, pdf_path)
+        raise RuntimeError("LibreOffice/soffice is not available for DOCX -> PDF conversion")
     result = subprocess.run(
         [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(outdir_path), str(docx_path)],
         check=False,
@@ -32,10 +35,38 @@ def convert_docx_to_pdf(docx_path: str | Path, outdir: str | Path | None = None)
         text=True,
     )
     if result.returncode != 0:
+        if allow_dev_fallback and fitz is not None:
+            return _convert_docx_to_pdf_fitz_fallback(docx_path, pdf_path)
         raise RuntimeError(f"Failed to convert DOCX to PDF: {result.stderr.strip() or result.stdout.strip()}")
-    pdf_path = outdir_path / (docx_path.stem + ".pdf")
     if not pdf_path.exists():
+        if allow_dev_fallback and fitz is not None:
+            return _convert_docx_to_pdf_fitz_fallback(docx_path, pdf_path)
         raise RuntimeError(f"LibreOffice reported success but did not create {pdf_path}")
+    return pdf_path
+
+
+def _convert_docx_to_pdf_fitz_fallback(docx_path: Path, pdf_path: Path) -> Path:
+    from app.services.legal_data import docx_text
+
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) is not available for dev PDF fallback")
+    text = docx_text(str(docx_path))
+    document = fitz.open()
+    try:
+        page = document.new_page(width=595, height=842)
+        y = 50
+        for line in text.splitlines():
+            if not line.strip():
+                y += 10
+                continue
+            page.insert_text((50, y), line[:220], fontsize=11, fontname="helv")
+            y += 14
+            if y > 800:
+                page = document.new_page(width=595, height=842)
+                y = 50
+        document.save(pdf_path)
+    finally:
+        document.close()
     return pdf_path
 
 

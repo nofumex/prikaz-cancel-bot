@@ -14,19 +14,20 @@ from docx.shared import Cm, Pt, RGBColor
 
 from app.config import Settings
 from app.models import Case, User
+from app.services.document_qa import run_document_qa
 from app.services.legal_data import (
     FIELD_LABELS,
     format_money_rub_kop,
-    bad_tokens_in_text,
-    bad_tokens_in_preview_text,
     clean_case_number,
     clean_uid,
     is_deadline_missed,
-    looks_like_dative_full_name,
+    missing_order_fields,
+    normalize_debtor_name_fields,
     normalize_order_data,
+    suggest_nominative_full_name,
     validate_before_generation,
-    validate_docx_clean,
 )
+from app.services.name_normalizer import make_short_name
 from app.services.pdf_tools import convert_docx_to_pdf, create_preview_pdf, pdf_text
 from app.utils import ensure_dir, h, safe_json_loads
 
@@ -46,11 +47,7 @@ def _optional(data: dict, key: str) -> str:
 
 
 def _short_name(full_name: str) -> str:
-    parts = [part for part in re.split(r"\s+", full_name.strip()) if part]
-    if len(parts) < 2:
-        return full_name
-    initials = "".join(f"{part[0]}." for part in parts[1:] if part)
-    return f"{parts[0]} {initials}".strip()
+    return make_short_name(full_name)
 
 
 def _date_long_text(raw: str) -> str:
@@ -133,6 +130,14 @@ def _case_identifier(data: dict) -> str:
     return ", ".join(parts)
 
 
+def _case_identifier_short(data: dict) -> str:
+    case_number = clean_case_number(_required(data, "case_number"))
+    uid = clean_uid(_optional(data, "uid"))
+    if uid:
+        return f"№ {case_number}, УИД {uid}"
+    return f"№ {case_number}"
+
+
 def _contract_phrase(value: str) -> str:
     value = re.sub(r"\s+", " ", value).strip(" ,.;")
     lower = value.lower()
@@ -182,10 +187,10 @@ def _setup_styles(doc: Document) -> None:
     section = doc.sections[0]
     section.page_width = Cm(21)
     section.page_height = Cm(29.7)
-    section.top_margin = Cm(1.8)
-    section.bottom_margin = Cm(1.8)
+    section.top_margin = Cm(2.0)
+    section.bottom_margin = Cm(2.0)
     section.left_margin = Cm(2.5)
-    section.right_margin = Cm(1.7)
+    section.right_margin = Cm(1.5)
 
     normal = doc.styles["Normal"]
     normal.font.name = "Times New Roman"
@@ -233,13 +238,12 @@ def _address_block(doc: Document, data: dict, user: User) -> None:
     _set_cell_borderless(right)
     right.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
     debtor_full_name = _required(data, "debtor_full_name")
-    if looks_like_dative_full_name(debtor_full_name):
-        raise ValueError("Поле debtor_full_name выглядит как ФИО не в именительном падеже. Исправьте его перед генерацией.")
+    court_addressee = data.get("court_addressee") or _normalize_court_for_addressee(_required(data, "court_name"))
     lines = [
-        _normalize_court_for_addressee(_required(data, "court_name")),
+        court_addressee,
         _required(data, "court_address"),
         "",
-        f"Должник:",
+        "Должник:",
         debtor_full_name,
         f"адрес: {_required(data, 'debtor_address')}",
     ]
@@ -250,16 +254,11 @@ def _address_block(doc: Document, data: dict, user: User) -> None:
             _normalize_creditor_address(_required(data, "creditor_address")),
         ]
     )
-    if _optional(data, "creditor_inn") or _optional(data, "creditor_ogrn"):
-        identifiers = " ".join(
-            part
-            for part in [
-                f"ИНН {_optional(data, 'creditor_inn')}" if _optional(data, "creditor_inn") else "",
-                f"ОГРН {_optional(data, 'creditor_ogrn')}" if _optional(data, "creditor_ogrn") else "",
-            ]
-            if part
-        )
-        lines.append(identifiers)
+    case_number = clean_case_number(_required(data, "case_number"))
+    uid = clean_uid(_optional(data, "uid"))
+    lines.extend(["", f"Дело/производство № {case_number}"])
+    if uid:
+        lines.append(f"УИД: {uid}")
     for line in lines:
         p = right.add_paragraph()
         p.paragraph_format.space_after = Pt(2)
@@ -277,20 +276,19 @@ def _meta_line(doc: Document, data: dict) -> None:
 
 
 def build_statement_paragraphs(data: dict, received_date: date, deadline_date: date | None, restore_reason: str | None = None) -> list[str]:
-    court_body = _court_instrumental(_required(data, "court_name"))
-    case_identifier = _case_identifier(data)
+    court_body = data.get("court_instrumental") or _court_instrumental(_required(data, "court_name"))
+    case_identifier = _case_identifier_short(data)
     order_date = _required(data, "order_date")
     order_date_long = _date_long_text(order_date)
     creditor = _required(data, "creditor_name")
     contract = _contract_phrase(_required(data, "debt_contract"))
     period = _period_phrase(_required(data, "debt_period"))
-    received = received_date.strftime("%d.%m.%Y")
-    received_long = _date_long_text(received)
+    received_long = _date_long_text(received_date.strftime("%d.%m.%Y"))
     deadline = deadline_date.strftime("%d.%m.%Y") if deadline_date else ""
     money_part = _money_sentence(data)
     base = [
         f"{order_date_long} {court_body} вынесен судебный приказ по делу/производству {case_identifier}, о взыскании с меня в пользу {creditor} {money_part} {contract} {period}.",
-        f"Копия судебного приказа получена мной {received_long}, что подтверждается почтовым конвертом / указанной мной датой получения.",
+        f"Копия судебного приказа получена мной {received_long}.",
     ]
     if is_deadline_missed(deadline_date):
         reason = restore_reason or "Причина пропуска срока не указана."
@@ -381,7 +379,7 @@ def _add_attachments_and_signature(doc: Document, data: dict, debtor: str, docum
     right.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     right.add_run(f"_____________ /{_short_name(debtor)}/")
     if not preview:
-        _paragraph(doc, "Подпись ставится от руки синей ручкой.", size=10, align=WD_ALIGN_PARAGRAPH.LEFT, after=0)
+        pass
     if preview:
         p = _paragraph(doc, "Предпросмотр: каждая вторая строка скрыта до оплаты.", size=10, align=WD_ALIGN_PARAGRAPH.CENTER, before=10, after=0)
         p.runs[0].font.color.rgb = RGBColor(120, 120, 120)
@@ -393,7 +391,7 @@ def _build_instruction_doc(path: Path, *, deadline: str, restore_term: bool) -> 
     _paragraph(doc, "Инструкция", bold=True, size=14, align=WD_ALIGN_PARAGRAPH.CENTER, after=8)
     _paragraph(doc, "по подаче возражений в суд", size=12, align=WD_ALIGN_PARAGRAPH.CENTER, after=14)
     lines = [
-        f"Срок на подачу: до {deadline}.",
+        f"Срок на подачу: до {deadline} включительно.",
         "Документ можно подать лично в канцелярию мирового судьи.",
         "Документ можно отправить заказным письмом с описью вложения.",
         "Если отправка почтой, важно сдать письмо до 24:00 последнего дня срока.",
@@ -414,21 +412,28 @@ def _validate_package_texts(
     preview_pdf: Path | None = None,
     preview_docx: Path | None = None,
     card_text: str,
+    data: dict,
+    received_date: date | None,
+    deadline_date: date | None,
+    instruction_path: Path | None,
+    restore_reason: str | None,
+    require_preview_pdf: bool,
 ) -> None:
-    problems = []
-    problems.extend(validate_docx_clean(str(full_docx)))
-    if full_pdf is not None:
-        try:
-            problems.extend(bad_tokens_in_text(pdf_text(full_pdf)))
-        except Exception:
-            raise
-    if preview_pdf is not None:
-        problems.extend(bad_tokens_in_preview_text(pdf_text(preview_pdf)))
-    if preview_docx is not None:
-        problems.extend(token for token in validate_docx_clean(str(preview_docx)) if token != "▒")
-    problems.extend(bad_tokens_in_text(card_text))
-    if problems:
-        raise ValueError(f"Документ не прошел стоп-лист: {', '.join(sorted(set(problems)))}")
+    qa = run_document_qa(
+        data=data,
+        received_date=received_date,
+        deadline_date=deadline_date,
+        full_docx=full_docx,
+        full_pdf=full_pdf,
+        preview_pdf=preview_pdf,
+        instruction_docx=instruction_path,
+        preview_docx=preview_docx,
+        card_text=card_text,
+        restore_reason=restore_reason,
+        require_preview_pdf=require_preview_pdf,
+    )
+    if not qa.ok:
+        raise ValueError("Документ не прошел QA: " + "; ".join(qa.reasons or qa.bad_tokens))
 
 
 def create_case_documents(case: Case, user: User, settings: Settings, *, restore_reason: str | None = None) -> tuple[Path, Path | None, Path | None, Path | None, Path]:
@@ -444,8 +449,6 @@ def create_case_documents(case: Case, user: User, settings: Settings, *, restore
 
     restore_term = is_deadline_missed(case.deadline_date)
     debtor = _required(data, "debtor_full_name")
-    if looks_like_dative_full_name(debtor):
-        raise ValueError("Поле debtor_full_name выглядит как ФИО не в именительном падеже. Исправьте его перед генерацией.")
     paragraphs = build_statement_paragraphs(data, case.received_date, case.deadline_date, restore_reason=restore_reason)
     suffix = "restore_term" if restore_term else "in_time"
     full_docx = case_dir / f"statement_{suffix}_{case.id}.docx"
@@ -453,49 +456,69 @@ def create_case_documents(case: Case, user: User, settings: Settings, *, restore
     preview_pdf = case_dir / f"preview_statement_{suffix}_{case.id}.pdf"
     preview_docx = case_dir / f"preview_statement_{suffix}_{case.id}.docx"
     instruction_path = case_dir / f"instruction_{case.id}.docx"
+    document_date = date.today()
 
     doc = Document()
     _setup_styles(doc)
     _address_block(doc, data, user)
     _add_body(doc, paragraphs, preview=False, restore_term=restore_term)
-    _add_attachments_and_signature(doc, data, debtor, case.received_date, preview=False, restore_term=restore_term)
+    _add_attachments_and_signature(doc, data, debtor, document_date, preview=False, restore_term=restore_term)
     doc.save(full_docx)
     pdf_conversion_failed = False
     try:
-        full_pdf = convert_docx_to_pdf(full_docx, case_dir)
+        full_pdf = convert_docx_to_pdf(
+            full_docx,
+            case_dir,
+            allow_dev_fallback=settings.allow_dev_docx_preview,
+        )
     except Exception:
         full_pdf = None
         pdf_conversion_failed = True
 
     preview_pdf_path: Path | None = None
     preview_docx_path: Path | None = None
-    if settings.document_preview_mode == "docx" or pdf_conversion_failed:
+    use_pdf_preview = settings.enable_pdf_preview and settings.document_preview_mode != "docx"
+    if use_pdf_preview and full_pdf is not None:
+        preview_pdf_path = create_preview_pdf(full_pdf, preview_pdf)
+    elif settings.allow_dev_docx_preview and (settings.document_preview_mode == "docx" or pdf_conversion_failed):
         preview_doc = Document()
         _setup_styles(preview_doc)
         _address_block(preview_doc, data, user)
         _add_body(preview_doc, paragraphs, preview=True, restore_term=restore_term)
-        _add_attachments_and_signature(preview_doc, data, debtor, case.received_date, preview=True, restore_term=restore_term)
+        _add_attachments_and_signature(preview_doc, data, debtor, document_date, preview=True, restore_term=restore_term)
         preview_doc.save(preview_docx)
         preview_docx_path = preview_docx
-    elif full_pdf is not None:
-        preview_pdf_path = create_preview_pdf(full_pdf, preview_pdf)
 
     deadline = case.deadline_date.strftime("%d.%m.%Y") if case.deadline_date else "уточняется"
     _build_instruction_doc(instruction_path, deadline=deadline, restore_term=restore_term)
 
-    card_text = extraction_preview(data, case.received_date, [], case.deadline_date)
+    card_text = extraction_preview(data, case.received_date, [], case.deadline_date, include_name_debug=False)
+    require_preview_pdf = settings.require_pdf_preview_for_payment and use_pdf_preview
     _validate_package_texts(
         full_docx,
         full_pdf,
         preview_pdf=preview_pdf_path,
         preview_docx=preview_docx_path,
         card_text=card_text,
+        data=data,
+        received_date=case.received_date,
+        deadline_date=case.deadline_date,
+        instruction_path=instruction_path,
+        restore_reason=restore_reason,
+        require_preview_pdf=require_preview_pdf,
     )
 
     return full_docx, full_pdf, preview_pdf_path, preview_docx_path, instruction_path
 
 
-def extraction_preview(data: dict, received_date: date | None, missing: list[str], deadline_date: date | None = None) -> str:
+def extraction_preview(
+    data: dict,
+    received_date: date | None,
+    missing: list[str],
+    deadline_date: date | None = None,
+    *,
+    include_name_debug: bool = True,
+) -> str:
     data = normalize_order_data(data)
     lines = [
         "🔎 <b>Проверьте данные</b>",
@@ -515,7 +538,12 @@ def extraction_preview(data: dict, received_date: date | None, missing: list[str
         f"<b>Дата получения:</b> {received_date.strftime('%d.%m.%Y') if received_date else 'не указана'}",
     ]
     if deadline_date:
-        lines.append(f"<b>Срок до:</b> {deadline_date.strftime('%d.%m.%Y')}")
+        lines.append(f"<b>Срок до:</b> {deadline_date.strftime('%d.%m.%Y')} включительно")
+    if include_name_debug:
+        raw_name = data.get("debtor_name_raw") or ""
+        if raw_name and raw_name != data.get("debtor_full_name"):
+            lines.append(f"<i>Исходно распознано:</i> {h(raw_name)}")
+            lines.append(f"<i>Нормализовано:</i> {h(data.get('debtor_full_name') or '')}")
     if missing:
         labels = [FIELD_LABELS.get(field, field) for field in missing]
         lines.extend(["", "⚠️ <b>Перед генерацией нужно заполнить:</b>", ", ".join(labels)])

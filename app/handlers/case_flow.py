@@ -15,6 +15,7 @@ from app.config import Settings
 from app.enums import CaseStatus
 from app.keyboards.common import case_menu, confirm_extraction, debtor_name_fix_menu, edit_fields_menu, envelope_choice, main_menu, restore_reason_menu
 from app.models import Case, User
+from app.services.amocrm import get_amocrm_service
 from app.services.cases import create_case, latest_case, latest_open_case, save_photo_path, set_received_date
 from app.services.documents import create_case_documents, extraction_preview
 from app.services.app_settings import payments_enabled
@@ -51,11 +52,13 @@ async def _download_photo(bot: Bot, message: Message, case_id: int, kind: str) -
 
 @router.callback_query(F.data == "case:new")
 @router.message(F.text == "/new")
-async def start_case(event: Message | CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User) -> None:
+async def start_case(event: Message | CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User, settings: Settings) -> None:
     target = event.message if isinstance(event, CallbackQuery) else event
     case = await create_case(session, current_user)
     await state.update_data(case_id=case.id)
     await state.set_state(CaseStates.waiting_order_photo)
+    crm = get_amocrm_service(settings)
+    await crm.sync_case_event(session, case, current_user, "start")
     await target.answer(
         "📝 <b>Новое заявление</b>\n\n"
         "Отправьте фото судебного приказа целиком.\n\n"
@@ -79,11 +82,19 @@ async def my_case(callback: CallbackQuery, session: AsyncSession, current_user: 
 
 
 @router.message(CaseStates.waiting_order_photo, F.photo)
-async def receive_order_photo(message: Message, bot: Bot, state: FSMContext, session: AsyncSession) -> None:
+async def receive_order_photo(message: Message, bot: Bot, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
     data = await state.get_data()
     case = await session.get(Case, data["case_id"])
     path = await _download_photo(bot, message, case.id, "order")
     await save_photo_path(session, case, "order", path)
+    crm = get_amocrm_service(settings)
+    await crm.sync_case_event(
+        session,
+        case,
+        current_user,
+        "order_photo",
+        {"note": "Пользователь отправил фото судебного приказа", "files": [{"path": str(path), "caption": "Фото приказа"}]},
+    )
     await state.set_state(CaseStates.waiting_envelope_choice)
     await message.answer(
         "✅ Фото приказа принято.\n\nТеперь отправьте фото конверта со штампами или сразу напишите дату получения в формате <code>ДД.ММ.ГГГГ</code>.",
@@ -190,12 +201,19 @@ async def _extract_and_confirm(message: Message, state: FSMContext, session: Asy
             reply_markup=confirm_extraction(),
         )
     extracted = normalize_order_data(extracted)
+    extracted, name_result = normalize_debtor_name_fields(extracted)
+    if name_result and name_result.confidence >= 0.85 and name_result.normalized:
+        extracted["debtor_full_name"] = name_result.normalized
     missing = missing_order_fields(extracted, case.received_date)
     case.extracted_json = json.dumps(extracted, ensure_ascii=False)
     case.missing_fields = json.dumps(missing, ensure_ascii=False)
     case.status = CaseStatus.NEEDS_REVIEW.value if missing else CaseStatus.PROCESSING.value
     await session.commit()
+    crm = get_amocrm_service(settings)
+    await crm.sync_case_event(session, case, current_user, "ocr_done", {"note": await crm.build_ocr_note(case)})
     await message.answer(extraction_preview(extracted, case.received_date, missing, case.deadline_date), reply_markup=confirm_extraction())
+    if name_result and name_result.raw != name_result.normalized and name_result.confidence < 0.85:
+        await _prompt_debtor_name_fix(message, extracted.get("debtor_full_name") or name_result.raw)
 
 
 async def _prompt_debtor_name_fix(message: Message, debtor_full_name: str) -> None:
@@ -307,7 +325,23 @@ async def process_manual_fields(message: Message, state: FSMContext, session: As
     await message.answer("Теперь данные исправляются по одному полю через кнопки.", reply_markup=edit_fields_menu())
 
 
-async def _generate_documents_flow(message: Message, session: AsyncSession, settings: Settings, current_user: User, case: Case, restore_reason: str | None = None) -> bool:
+async def _notify_admin_qa_failure(bot: Bot, settings: Settings, case: Case, reason: str) -> None:
+    for admin_id in settings.admin_ids:
+        try:
+            await bot.send_message(admin_id, f"⚠️ QA не пройден по заявке #{case.id}: {reason}")
+        except Exception:
+            logger.exception("Failed to notify admin %s", admin_id)
+
+
+async def _generate_documents_flow(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    current_user: User,
+    case: Case,
+    restore_reason: str | None = None,
+    bot: Bot | None = None,
+) -> bool:
     data = normalize_order_data(json.loads(case.extracted_json or "{}"))
     validation = validate_before_generation(data, case.received_date)
     if not validation.ok:
@@ -341,6 +375,10 @@ async def _generate_documents_flow(message: Message, session: AsyncSession, sett
     except ValueError as exc:
         case.status = CaseStatus.NEEDS_REVIEW.value
         await session.commit()
+        crm = get_amocrm_service(settings)
+        await crm.sync_case_event(session, case, current_user, "qa_failed", {"note": str(exc)})
+        if bot:
+            await _notify_admin_qa_failure(bot, settings, case, str(exc))
         await message.answer(f"⚠️ {exc}", reply_markup=edit_fields_menu())
         return False
     case.full_doc_path = str(full_docx)
@@ -348,12 +386,36 @@ async def _generate_documents_flow(message: Message, session: AsyncSession, sett
     case.preview_pdf_path = str(preview_pdf) if preview_pdf else None
     case.preview_doc_path = str(preview_docx) if preview_docx else None
     case.instruction_path = str(instruction_path)
+    case.status = CaseStatus.PREVIEW_READY.value
     await session.commit()
-    if payments_enabled() and not full_pdf:
-        await message.answer("⚠️ Не удалось собрать полный PDF. Для оплаты нужен LibreOffice/soffice и PyMuPDF.")
-        case.status = CaseStatus.NEEDS_REVIEW.value
-        await session.commit()
-        return False
+    crm = get_amocrm_service(settings)
+    await crm.sync_case_event(
+        session,
+        case,
+        current_user,
+        "preview_ready",
+        {
+            "files": [
+                {"path": case.full_doc_path or "", "caption": "Полный DOCX"},
+                {"path": case.full_pdf_path or "", "caption": "Полный PDF"},
+                {"path": case.preview_pdf_path or case.preview_doc_path or "", "caption": "Preview"},
+                {"path": case.instruction_path or "", "caption": "Инструкция"},
+            ]
+        },
+    )
+    if payments_enabled():
+        if not full_pdf:
+            await message.answer("⚠️ Не удалось собрать полный PDF. Для оплаты нужен LibreOffice/soffice и PyMuPDF.")
+            case.status = CaseStatus.NEEDS_REVIEW.value
+            await session.commit()
+            return False
+        if settings.require_pdf_preview_for_payment and not preview_pdf:
+            await message.answer("⚠️ Не удалось собрать preview PDF. Платеж не создан.")
+            case.status = CaseStatus.NEEDS_REVIEW.value
+            await session.commit()
+            if bot:
+                await _notify_admin_qa_failure(bot, settings, case, "нет preview PDF")
+            return False
     preview_file = preview_pdf or preview_docx
     if not payments_enabled():
         if preview_file:
@@ -362,9 +424,17 @@ async def _generate_documents_flow(message: Message, session: AsyncSession, sett
                 caption="Предпросмотр заявления." if preview_pdf else "Предпросмотр заявления (dev-only DOCX).",
             )
         await message.answer("🧪 Режим оплаты выключен. Сразу отправляю полный комплект для теста.")
-        await deliver_full_documents(message, session, case)
+        await deliver_full_documents(message, session, case, settings, current_user)
         return True
     payment = await ensure_payment(session, case, settings)
+    crm = get_amocrm_service(settings)
+    await crm.sync_case_event(
+        session,
+        case,
+        current_user,
+        "payment_created",
+        {"note": f"Платеж: {case.payment_label}, сумма {payment.amount} руб."},
+    )
     if preview_file:
         await message.answer_document(
             FSInputFile(preview_file),
@@ -375,14 +445,14 @@ async def _generate_documents_flow(message: Message, session: AsyncSession, sett
 
 
 @router.callback_query(F.data == "case:generate")
-async def generate_documents(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User, state: FSMContext) -> None:
+async def generate_documents(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User, state: FSMContext, bot: Bot) -> None:
     case = await latest_open_case(session, current_user.id)
     if not case:
         await callback.message.answer("Не нашел активное заявление.", reply_markup=main_menu())
         await callback.answer()
         return
     await state.clear()
-    await _generate_documents_flow(callback.message, session, settings, current_user, case)
+    await _generate_documents_flow(callback.message, session, settings, current_user, case, bot=bot)
     await callback.answer()
 
 
@@ -436,16 +506,16 @@ async def receive_restore_reason_custom(message: Message, state: FSMContext, ses
 
 
 @router.callback_query(F.data == "payment:check")
-async def payment_check(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+async def payment_check(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User) -> None:
     case = await latest_open_case(session, current_user.id)
     if not case or case.status != CaseStatus.PAID.value:
         await callback.answer("Пока не вижу оплату. Если оплатили недавно, подождите уведомление ЮMoney или напишите менеджеру.", show_alert=True)
         return
-    await deliver_full_documents(callback.message, session, case)
+    await deliver_full_documents(callback.message, session, case, settings, current_user)
     await callback.answer()
 
 
-async def deliver_full_documents(message: Message, session: AsyncSession, case: Case) -> None:
+async def deliver_full_documents(message: Message, session: AsyncSession, case: Case, settings: Settings | None = None, user: User | None = None) -> None:
     if case.full_doc_path:
         await message.answer_document(FSInputFile(case.full_doc_path), caption="Полный DOCX.")
     if case.full_pdf_path:
@@ -455,7 +525,10 @@ async def deliver_full_documents(message: Message, session: AsyncSession, case: 
     case.status = CaseStatus.DELIVERED.value
     case.delivered_at = datetime.utcnow()
     await session.commit()
-    await message.answer("Готово. Документы выданы. Не забудьте поставить дату и подпись перед отправкой.", reply_markup=case_menu())
+    if settings and user:
+        crm = get_amocrm_service(settings)
+        await crm.sync_case_event(session, case, user, "paid", {"note": "Оплата подтверждена. Полный документ выдан клиенту."})
+    await message.answer("Готово. Документы выданы. Не забудьте поставить подпись перед отправкой.", reply_markup=case_menu())
 
 
 

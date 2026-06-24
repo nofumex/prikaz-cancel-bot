@@ -38,6 +38,20 @@ async def _upgrade_sqlite_schema(conn) -> None:
         [
             ("full_pdf_path", "full_pdf_path TEXT"),
             ("preview_pdf_path", "preview_pdf_path TEXT"),
+            ("amocrm_contact_id", "amocrm_contact_id INTEGER"),
+            ("amocrm_lead_id", "amocrm_lead_id INTEGER"),
+            ("amocrm_pipeline_id", "amocrm_pipeline_id INTEGER"),
+            ("amocrm_status_id", "amocrm_status_id INTEGER"),
+            ("amocrm_last_sync_at", "amocrm_last_sync_at DATETIME"),
+            ("amocrm_sync_error", "amocrm_sync_error TEXT"),
+            ("amocrm_synced", "amocrm_synced BOOLEAN DEFAULT 0"),
+        ],
+    )
+    await _sqlite_add_columns(
+        conn,
+        "users",
+        [
+            ("amocrm_contact_id", "amocrm_contact_id INTEGER"),
         ],
     )
     await conn.exec_driver_sql(
@@ -67,6 +81,23 @@ async def _upgrade_sqlite_schema(conn) -> None:
             success BOOLEAN NOT NULL DEFAULT 1,
             error_message TEXT,
             latency_ms INTEGER
+        )
+        """
+    )
+    await conn.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS crm_sync_logs (
+            id INTEGER PRIMARY KEY,
+            case_id INTEGER,
+            user_id INTEGER,
+            event_type VARCHAR(64) NOT NULL,
+            amo_entity_type VARCHAR(32),
+            amo_entity_id INTEGER,
+            request_payload TEXT,
+            response_payload TEXT,
+            success BOOLEAN NOT NULL DEFAULT 0,
+            error_message TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL
         )
         """
     )

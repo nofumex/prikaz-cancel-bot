@@ -81,10 +81,11 @@ def edit_fields_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [btn("⚖️ Суд", "case:field:court_name"), btn("📍 Адрес суда", "case:field:court_address")],
             [btn("👤 Должник", "case:field:debtor_full_name"), btn("🏠 Адрес должника", "case:field:debtor_address")],
-            [btn("🏦 Взыскатель", "case:field:creditor_name"), btn("📄 Номер дела", "case:field:case_number")],
-            [btn("📅 Дата приказа", "case:field:order_date"), btn("🔖 УИД", "case:field:uid")],
-            [btn("🧾 Договор", "case:field:debt_contract"), btn("📆 Период", "case:field:debt_period")],
-            [btn("💰 Сумма долга", "case:field:debt_amount"), btn("⚖️ Госпошлина", "case:field:state_duty")],
+            [btn("🏦 Взыскатель", "case:field:creditor_name"), btn("📍 Адрес взыскателя", "case:field:creditor_address")],
+            [btn("📄 Номер дела", "case:field:case_number"), btn("📅 Дата приказа", "case:field:order_date")],
+            [btn("🔖 УИД", "case:field:uid"), btn("🧾 Договор", "case:field:debt_contract")],
+            [btn("📆 Период", "case:field:debt_period"), btn("💰 Сумма долга", "case:field:debt_amount")],
+            [btn("⚖️ Госпошлина", "case:field:state_duty")],
             [btn("↩️ Назад к проверке", "case:review")],
         ]
     )
@@ -127,6 +128,7 @@ def admin_case_actions(case_id: int, paid: bool = False, back: str = "admin:case
     ]
     if not paid:
         rows.insert(0, [btn("✅ Отметить оплату", f"admin:mark_paid:{case_id}")])
+    rows.insert(1 if not paid else 0, [btn("🔄 Синхронизировать с CRM", f"admin:crm_sync:{case_id}")])
     rows.append([btn("↩️ Назад", back), btn("⚙️ Админка", "admin:panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

@@ -1,0 +1,3 @@
+CRM sync disabled in smoke run (no AMOCRM_ACCESS_TOKEN).
+При AMOCRM_ENABLED=true события пишутся в таблицу crm_sync_logs:
+- start, order_photo, ocr_done, preview_ready, payment_created, paid, qa_failed

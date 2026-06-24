@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
@@ -9,9 +10,12 @@ import math
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import Settings
+
 from app.enums import CaseStatus
 from app.keyboards.common import admin_case_actions, admin_cases_page, admin_panel, manager_panel
-from app.models import Case, OpenAIUsage, User
+from app.models import Case, CrmSyncLog, OpenAIUsage, User
+from app.services.amocrm import get_amocrm_service
 from app.services.app_settings import payments_enabled, toggle_payments
 from app.services.payments import mark_paid_by_label
 from app.texts import case_summary
@@ -179,12 +183,37 @@ async def cb_case_detail(callback: CallbackQuery, session: AsyncSession, current
         await callback.answer("Заявка не найдена", show_alert=True)
         return
     await session.refresh(case, ["user"])
+    crm_lines = [
+        "",
+        "<b>CRM:</b>",
+        f"Контакт: {case.amocrm_contact_id or '—'}",
+        f"Сделка: {case.amocrm_lead_id or case.amo_lead_id or '—'}",
+        f"Этап ID: {case.amocrm_status_id or '—'}",
+        f"Последняя синхронизация: {case.amocrm_last_sync_at.strftime('%d.%m.%Y %H:%M') if case.amocrm_last_sync_at else '—'}",
+    ]
+    if case.amocrm_sync_error:
+        crm_lines.append(f"Ошибка: {h(case.amocrm_sync_error)}")
+    usage_rows = await session.execute(
+        select(OpenAIUsage).where(OpenAIUsage.case_id == case.id).order_by(OpenAIUsage.created_at.asc())
+    )
+    usages = list(usage_rows.scalars().all())
+    usage_lines = ["", "<b>OpenAI по заявке:</b>"]
+    total_usage = 0.0
+    for row in usages:
+        usage_lines.append(
+            f"{row.operation}: input {row.input_tokens}, output {row.output_tokens}, cost {_money_usd(row.total_cost_usd)}"
+        )
+        total_usage += row.total_cost_usd or 0.0
+    if usages:
+        usage_lines.append(f"Итого: {_money_usd(total_usage)}")
     text = (
         case_summary(case)
         + "\n\n"
         + f"<b>Клиент:</b> {full_name(case.user)}\n"
         + f"<b>Username:</b> {username_text(case.user)}\n"
         + f"<b>ID:</b> <code>{h(case.user.platform_user_id)}</code>"
+        + "\n".join(crm_lines)
+        + ("\n".join(usage_lines) if usages else "")
     )
     paid = case.status in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}
     await callback.message.answer(text, reply_markup=admin_case_actions(case.id, paid=paid, back=f"admin:{prefix}:{page}"))
@@ -207,12 +236,22 @@ async def cb_stats(callback: CallbackQuery, session: AsyncSession, current_user:
     manual_gen = int(ten_dollars / manual_cost) if manual_cost else 0
     envelope_gen = int(ten_dollars / envelope_cost) if envelope_cost else 0
     completed_gen = int(ten_dollars / completed_cost) if completed_cost else 0
+    crm_synced = int(await session.scalar(select(func.count(Case.id)).where(Case.amocrm_synced.is_(True))) or 0)
+    crm_errors = int(await session.scalar(select(func.count(CrmSyncLog.id)).where(CrmSyncLog.success.is_(False))) or 0)
+    crm_pending = int(
+        await session.scalar(select(func.count(Case.id)).where(Case.amocrm_sync_error.is_not(None), Case.amocrm_synced.is_(False)))
+        or 0
+    )
     await callback.message.answer(
         "<b>Статистика</b>\n\n"
         f"Пользователей: {users_total}\n"
         f"Заявлений всего: {cases_total}\n"
         f"Ожидают оплату: {pending}\n"
         f"Оплачено/выдано: {paid}\n\n"
+        "<b>CRM</b>\n"
+        f"Синхронизировано сделок: {crm_synced}\n"
+        f"Ошибки синхронизации: {crm_errors}\n"
+        f"Ожидают повторной синхронизации: {crm_pending}\n\n"
         "<b>OpenAI API</b>\n"
         f"Всего потрачено: {_money_usd(total_cost)}\n"
         f"Всего токенов: {total_tokens}\n"
@@ -245,8 +284,23 @@ async def cb_toggle_payments(callback: CallbackQuery, current_user: User) -> Non
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("admin:crm_sync:"))
+async def cb_crm_sync(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    case = await session.get(Case, int(callback.data.split(":")[-1]))
+    if not case:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    await session.refresh(case, ["user"])
+    crm = get_amocrm_service(settings)
+    await crm.sync_case_event(session, case, case.user, "start")
+    await callback.message.answer(f"CRM-синхронизация для заявки #{case.id} выполнена.")
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("admin:mark_paid:"))
-async def cb_mark_paid(callback: CallbackQuery, bot: Bot, session: AsyncSession, current_user: User) -> None:
+async def cb_mark_paid(callback: CallbackQuery, bot: Bot, session: AsyncSession, settings: Settings, current_user: User) -> None:
     if not await _ensure_admin_callback(callback, current_user):
         return
     case = await session.get(Case, int(callback.data.split(":")[-1]))
@@ -272,6 +326,8 @@ async def cb_mark_paid(callback: CallbackQuery, bot: Bot, session: AsyncSession,
             await bot.send_document(paid_case.user.telegram_id, FSInputFile(paid_case.instruction_path), caption="Инструкция по отправке в суд.")
         paid_case.status = CaseStatus.DELIVERED.value
         paid_case.delivered_at = datetime.utcnow()
+        crm = get_amocrm_service(settings)
+        await crm.sync_case_event(session, paid_case, paid_case.user, "paid", {"note": "Оплата подтверждена вручную админом."})
         await session.commit()
     await callback.answer()
 

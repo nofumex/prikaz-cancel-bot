@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.models import OpenAIUsage
-from app.services.legal_data import missing_order_fields, normalize_order_data
+from app.services.legal_data import missing_order_fields, normalize_debtor_name_fields, normalize_order_data
 from app.utils import parse_russian_date
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,10 @@ ORDER_SCHEMA_HINT = {
     "court_name": "",
     "court_address": "",
     "judge": "",
+    "debtor_name_raw": "",
+    "debtor_name_context": "",
     "debtor_full_name": "",
+    "debtor_name_source_fragment": "",
     "debtor_birth_date": "",
     "debtor_passport": "",
     "debtor_address": "",
@@ -64,7 +67,10 @@ ORDER_SCHEMA_HINT = {
 ORDER_JSON_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "properties": {key: {"type": "string"} for key in ORDER_SCHEMA_HINT},
+    "properties": {
+        **{key: {"type": "string"} for key in ORDER_SCHEMA_HINT},
+        "debtor_full_name_confidence": {"type": "number"},
+    },
     "required": list(ORDER_SCHEMA_HINT),
 }
 
@@ -108,6 +114,7 @@ def _parse_usage(payload: dict[str, Any]) -> dict[str, Any]:
     input_details = usage.get("input_tokens_details") or {}
     output_details = usage.get("output_tokens_details") or {}
     cached_input_tokens = int(input_details.get("cached_tokens") or 0)
+    non_cached_input_tokens = max(0, input_tokens - cached_input_tokens)
     reasoning_tokens = int(output_details.get("reasoning_tokens") or 0)
     image_tokens = input_details.get("image_tokens")
     if image_tokens is not None:
@@ -117,6 +124,7 @@ def _parse_usage(payload: dict[str, Any]) -> dict[str, Any]:
             image_tokens = None
     return {
         "input_tokens": input_tokens,
+        "non_cached_input_tokens": non_cached_input_tokens,
         "cached_input_tokens": cached_input_tokens,
         "output_tokens": output_tokens,
         "reasoning_tokens": reasoning_tokens,
@@ -163,7 +171,8 @@ async def record_openai_usage(
     usage = result.usage if result else {}
     parsed = _parse_usage({"usage": usage})
     prices = _pricing_for_model(settings, model)
-    input_cost = _money_cost(parsed["input_tokens"], prices["input"])
+    non_cached = parsed.get("non_cached_input_tokens", parsed["input_tokens"])
+    input_cost = _money_cost(non_cached, prices["input"])
     cached_cost = _money_cost(parsed["cached_input_tokens"], prices["cached_input"])
     output_cost = _money_cost(parsed["output_tokens"], prices["output"])
     usage_row = OpenAIUsage(
@@ -262,8 +271,14 @@ async def extract_order_data(
             settings,
             instructions=(
                 "Ты аккуратно извлекаешь данные из фото судебного приказа РФ. "
-                "Верни только факты, которые видны на изображении. Не исправляй и не придумывай паспорт, адрес, суммы, ИНН, ОГРН, даты и номера. "
-                "Если поле не видно или не уверено, оставь пустую строку. Даты сохраняй так, как они написаны в документе."
+                "Верни только факты, которые видны на изображении. Не придумывай паспорт, адрес, суммы, ИНН, ОГРН, даты и номера. "
+                "Если поле не видно или не уверено, оставь пустую строку. Даты сохраняй так, как они написаны в документе. "
+                "Найди ФИО должника в судебном приказе. Если ФИО стоит в родительном/дательном/винительном падеже, "
+                "восстанови именительный падеж. Например: 'Бельского Владимира Геннадьевича' → 'Бельский Владимир Геннадьевич', "
+                "'Бельскому Владимиру Геннадьевичу' → 'Бельский Владимир Геннадьевич'. "
+                "В поле debtor_full_name верни только именительный падеж. "
+                "В debtor_name_raw сохрани ФИО как в приказе. В debtor_name_context — фразу вокруг ФИО. "
+                "В debtor_name_source_fragment — точный фрагмент текста приказа."
             ),
             text="Извлеки реквизиты для заявления об отмене судебного приказа.",
             image_path=order_photo_path,
@@ -274,7 +289,108 @@ async def extract_order_data(
         await record_openai_usage(settings, session, case_id=case_id, user_id=user_id, operation="order_ocr", model=settings.vision_model, success=False, error_message=str(exc))
         raise
     await record_openai_usage(settings, session, case_id=case_id, user_id=user_id, operation="order_ocr", model=result.model, result=result, success=True)
-    return normalize_order_data({key: str(result.data.get(key) or "").strip() for key in ORDER_SCHEMA_HINT})
+    raw_data = {key: str(result.data.get(key) or "").strip() for key in ORDER_SCHEMA_HINT}
+    if result.data.get("debtor_full_name_confidence") is not None:
+        raw_data["debtor_full_name_confidence"] = str(result.data.get("debtor_full_name_confidence"))
+    normalized = normalize_order_data(raw_data)
+    normalized, name_result = normalize_debtor_name_fields(normalized)
+    if name_result and name_result.confidence < 0.85 and looks_like_dative(normalized.get("debtor_full_name", "")):
+        try:
+            normalized = await normalize_debtor_name_llm(settings, session, case_id=case_id, user_id=user_id, data=normalized)
+        except Exception:
+            logger.warning("LLM name normalization failed", exc_info=True)
+    return normalized
+
+
+def looks_like_dative(value: str) -> bool:
+    from app.services.name_normalizer import is_probably_not_nominative
+
+    return is_probably_not_nominative(value)
+
+
+NAME_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "debtor_full_name": {"type": "string"},
+        "confidence": {"type": "number"},
+    },
+    "required": ["debtor_full_name", "confidence"],
+}
+
+
+async def normalize_debtor_name_llm(
+    settings: Settings,
+    session: AsyncSession | None,
+    *,
+    case_id: int | None,
+    user_id: int | None,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    if not settings.openai_api_key:
+        return data
+    raw = data.get("debtor_name_raw") or data.get("debtor_full_name") or ""
+    context = data.get("debtor_name_context") or data.get("debtor_name_source_fragment") or ""
+    start = time.perf_counter()
+    body = {
+        "model": settings.text_model,
+        "instructions": (
+            "Восстанови ФИО должника в именительном падеже по русским правилам. "
+            "Верни только нормализованное ФИО и confidence 0..1."
+        ),
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": f"ФИО: {raw}\nКонтекст: {context}",
+                    }
+                ],
+            }
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "debtor_name_normalization",
+                "schema": NAME_JSON_SCHEMA,
+                "strict": True,
+            }
+        },
+        "max_output_tokens": 300,
+    }
+    headers = {"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"}
+    timeout = aiohttp.ClientTimeout(total=settings.llm_timeout_seconds)
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as http:
+        async with http.post(f"{settings.openai_base_url}/responses", json=body) as response:
+            raw_response = await response.text()
+            if response.status >= 400:
+                raise RuntimeError(f"OpenAI API error {response.status}: {raw_response[:800]}")
+            payload = json.loads(raw_response)
+    answer = json.loads(_response_text(payload))
+    llm_result = LLMResult(
+        data=answer,
+        usage=_parse_usage(payload),
+        model=str(payload.get("model") or settings.text_model),
+        request_id=str(payload.get("id") or ""),
+        latency_ms=int((time.perf_counter() - start) * 1000),
+    )
+    await record_openai_usage(
+        settings,
+        session,
+        case_id=case_id,
+        user_id=user_id,
+        operation="name_normalization",
+        model=llm_result.model,
+        result=llm_result,
+        success=True,
+    )
+    updated = dict(data)
+    if answer.get("debtor_full_name"):
+        updated["debtor_full_name"] = str(answer["debtor_full_name"]).strip()
+        updated["debtor_full_name_confidence"] = str(answer.get("confidence") or 0)
+        updated, _ = normalize_debtor_name_fields(updated)
+    return updated
 
 
 async def extract_envelope_date(

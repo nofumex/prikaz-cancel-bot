@@ -1,0 +1,14 @@
+OpenAI API (smoke case #15)
+
+order_ocr: input 4200, output 850, cost $0.0070
+Итого: $0.0070
+
+Статистика (пример формата админки):
+Всего потрачено: $0.0070
+Всего токенов: 5050
+Input: 4200
+Cached input: 0
+Output: 850
+
+CRM (без AMOCRM_ACCESS_TOKEN в .env):
+Синхронизация реализована, логи пишутся в crm_sync_logs при AMOCRM_ENABLED=true.

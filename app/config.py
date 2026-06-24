@@ -55,6 +55,10 @@ class Settings:
 
     document_price_rub: int
     document_preview_mode: str
+    enable_pdf_preview: bool
+    require_pdf_preview_for_payment: bool
+    allow_dev_docx_preview: bool
+    document_template_version: str
     yoomoney_receiver: str | None
     yoomoney_success_url: str | None
     yoomoney_notification_secret: str | None
@@ -69,6 +73,12 @@ class Settings:
 
     amocrm_base_url: str | None
     amocrm_access_token: str | None
+    amocrm_enabled: bool
+    amocrm_pipeline_name: str
+    amocrm_auto_create_pipeline: bool
+    amocrm_auto_create_statuses: bool
+    amocrm_attach_files: bool
+    amocrm_debug: bool
     amocrm_pipeline_id: int | None
     amocrm_status_id_new: int | None
     amocrm_status_id_in_progress: int | None
@@ -104,6 +114,10 @@ def get_settings() -> Settings:
         llm_timeout_seconds=_parse_int(getenv("LLM_TIMEOUT_SECONDS"), 90),
         document_price_rub=_parse_int(getenv("DOCUMENT_PRICE_RUB"), 990),
         document_preview_mode=(getenv("DOCUMENT_PREVIEW_MODE") or "pdf").strip().lower(),
+        enable_pdf_preview=_parse_bool(getenv("ENABLE_PDF_PREVIEW"), True),
+        require_pdf_preview_for_payment=_parse_bool(getenv("REQUIRE_PDF_PREVIEW_FOR_PAYMENT"), True),
+        allow_dev_docx_preview=_parse_bool(getenv("ALLOW_DEV_DOCX_PREVIEW"), False),
+        document_template_version=(getenv("DOCUMENT_TEMPLATE_VERSION") or "2026-06-legal-v1").strip(),
         yoomoney_receiver=(getenv("YOOMONEY_RECEIVER") or "").strip() or None,
         yoomoney_success_url=(getenv("YOOMONEY_SUCCESS_URL") or "").strip() or None,
         yoomoney_notification_secret=(getenv("YOOMONEY_NOTIFICATION_SECRET") or "").strip() or None,
@@ -116,7 +130,13 @@ def get_settings() -> Settings:
         openai_model_pricing_json=(getenv("OPENAI_MODEL_PRICING_JSON") or "").strip(),
         amocrm_base_url=(getenv("AMOCRM_BASE_URL") or "").strip().rstrip("/") or None,
         amocrm_access_token=(getenv("AMOCRM_ACCESS_TOKEN") or "").strip() or None,
-        amocrm_pipeline_id=_parse_int(getenv("AMOCRM_PIPELINE_ID"), 10915210) or None,
+        amocrm_enabled=_parse_bool(getenv("AMOCRM_ENABLED"), False),
+        amocrm_pipeline_name=(getenv("AMOCRM_PIPELINE_NAME") or "Судебный приказ").strip(),
+        amocrm_auto_create_pipeline=_parse_bool(getenv("AMOCRM_AUTO_CREATE_PIPELINE"), False),
+        amocrm_auto_create_statuses=_parse_bool(getenv("AMOCRM_AUTO_CREATE_STATUSES"), True),
+        amocrm_attach_files=_parse_bool(getenv("AMOCRM_ATTACH_FILES"), True),
+        amocrm_debug=_parse_bool(getenv("AMOCRM_DEBUG"), False),
+        amocrm_pipeline_id=_parse_int(getenv("AMOCRM_PIPELINE_ID"), 0) or None,
         amocrm_status_id_new=_parse_int(getenv("AMOCRM_STATUS_ID_NEW"), 85847178) or None,
         amocrm_status_id_in_progress=_parse_int(getenv("AMOCRM_STATUS_ID_IN_PROGRESS"), 85847182) or None,
         amocrm_status_id_consultation=_parse_int(getenv("AMOCRM_STATUS_ID_CONSULTATION"), 85847186) or None,

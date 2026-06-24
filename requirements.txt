@@ -7,3 +7,5 @@ python-docx==1.1.2
 requests==2.32.3
 PyMuPDF==1.24.10
 holidays==0.59
+pytest==8.3.4
+pytest-asyncio==0.24.0

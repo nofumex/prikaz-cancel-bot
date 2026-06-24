@@ -22,6 +22,7 @@ class User(Base):
     first_name: Mapped[str | None] = mapped_column(String(255))
     last_name: Mapped[str | None] = mapped_column(String(255))
     phone: Mapped[str | None] = mapped_column(String(64))
+    amocrm_contact_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     is_manager: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     admin_notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -52,6 +53,13 @@ class Case(Base):
     reminders_sent: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_reminder_at: Mapped[datetime | None] = mapped_column(DateTime)
     amo_lead_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    amocrm_contact_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    amocrm_lead_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    amocrm_pipeline_id: Mapped[int | None] = mapped_column(BigInteger)
+    amocrm_status_id: Mapped[int | None] = mapped_column(BigInteger)
+    amocrm_last_sync_at: Mapped[datetime | None] = mapped_column(DateTime)
+    amocrm_sync_error: Mapped[str | None] = mapped_column(Text)
+    amocrm_synced: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     amo_sync_status: Mapped[str | None] = mapped_column(String(32))
     amo_sync_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
@@ -89,6 +97,22 @@ class OpenAIUsage(Base):
     success: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text)
     latency_ms: Mapped[int | None] = mapped_column(Integer)
+
+
+class CrmSyncLog(Base):
+    __tablename__ = "crm_sync_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    case_id: Mapped[int | None] = mapped_column(ForeignKey("cases.id"), index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    amo_entity_type: Mapped[str | None] = mapped_column(String(32))
+    amo_entity_id: Mapped[int | None] = mapped_column(BigInteger)
+    request_payload: Mapped[str | None] = mapped_column(Text)
+    response_payload: Mapped[str | None] = mapped_column(Text)
+    success: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 
 class Payment(Base):
