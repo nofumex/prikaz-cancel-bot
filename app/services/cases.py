@@ -12,8 +12,14 @@ from app.models import Case, User
 from app.services.legal_data import legal_deadline_from_received
 
 
-async def create_case(session: AsyncSession, user: User) -> Case:
-    case = Case(user_id=user.id, platform=user.platform, status=CaseStatus.WAITING_ORDER_PHOTO.value)
+async def create_case(session: AsyncSession, user: User, *, chat_id: str | None = None) -> Case:
+    case = Case(
+        user_id=user.id,
+        platform=user.platform,
+        platform_user_id=user.platform_user_id,
+        platform_chat_id=chat_id or user.platform_user_id,
+        status=CaseStatus.WAITING_ORDER_PHOTO.value,
+    )
     session.add(case)
     await session.commit()
     await session.refresh(case)

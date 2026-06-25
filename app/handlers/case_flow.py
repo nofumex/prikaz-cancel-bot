@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -13,9 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.enums import CaseStatus
-from app.keyboards.common import case_menu, confirm_extraction, debtor_name_fix_menu, edit_fields_menu, envelope_choice, main_menu, restore_reason_menu
+from app.keyboards.common import case_menu, confirm_extraction, debtor_name_fix_menu, edit_fields_menu, envelope_choice, main_menu, order_rephoto_menu, restore_reason_menu
 from app.models import Case, User
 from app.services.amocrm import get_amocrm_service
+from app.services.crm_background import schedule_crm_sync
 from app.services.cases import create_case, latest_case, latest_open_case, save_photo_path, set_received_date
 from app.services.documents import create_case_documents, extraction_preview
 from app.services.app_settings import payments_enabled
@@ -47,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 class CaseStates(StatesGroup):
     waiting_order_photo = State()
+    waiting_order_rephoto = State()
     waiting_envelope_choice = State()
     waiting_envelope_photo = State()
     waiting_manual_date = State()
@@ -78,21 +81,61 @@ async def _download_document_image(bot: Bot, message: Message, case_id: int, kin
     return path
 
 
+def _missing_order_labels(missing: list[str]) -> list[str]:
+    labels: list[str] = []
+    for field in missing:
+        if field == "case_number_or_uid":
+            labels.append("номер дела или УИД")
+        elif field == "state_duty_or_total_amount":
+            labels.append("госпошлина или итоговая сумма")
+        elif field == "received_date":
+            labels.append("дата получения")
+        elif field == "amount_mismatch":
+            labels.append("суммы задолженности не совпали")
+        else:
+            labels.append(FIELD_LABELS.get(field, field))
+    return labels
+
+
+async def _send_order_rephoto_prompt(message: Message, missing: list[str], *, attempts: int = 0, max_attempts: int = 3) -> None:
+    labels = "\n".join(f"— {label}" for label in _missing_order_labels(missing))
+    text = (
+        "Не удалось надежно прочитать судебный приказ.\n\n"
+        f"Не распознаны поля:\n{labels}\n\n"
+        "Пожалуйста, сфотографируйте судебный приказ целиком ещё раз:\n"
+        "— весь лист должен быть в кадре;\n"
+        "— без бликов;\n"
+        "— текст должен быть резким;\n"
+        "— лучше отправить как файл без сжатия.\n\n"
+        "После нового фото я снова подготовлю заявление."
+    )
+    if attempts >= max_attempts:
+        text = (
+            "Не удалось надежно прочитать приказ автоматически. Я передал заявку специалисту. "
+            "Мы поможем подготовить заявление вручную."
+        )
+        await message.answer(text, reply_markup=order_rephoto_menu())
+        return
+    await message.answer(text, reply_markup=order_rephoto_menu())
+
+
 @router.callback_query(F.data == "case:new")
 @router.message(F.text == "/new")
 async def start_case(event: Message | CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User, settings: Settings) -> None:
+    start = time.monotonic()
     target = event.message if isinstance(event, CallbackQuery) else event
-    case = await create_case(session, current_user)
+    chat_id = str(target.chat.id) if getattr(target, "chat", None) else current_user.platform_user_id
+    case = await create_case(session, current_user, chat_id=chat_id)
     await state.update_data(case_id=case.id)
     await state.set_state(CaseStates.waiting_order_photo)
-    crm = get_amocrm_service(settings)
-    await crm.sync_case_event(session, case, current_user, "user_started_bot", {"note": "Пользователь запустил бот"})
     await target.answer(
         "📝 <b>Новое заявление</b>\n\n"
         "Отправьте фото судебного приказа целиком.\n\n"
         "Лучше сфотографировать ровно сверху, без обрезанных краев, чтобы были видны суд, номер дела, должник и взыскатель.\n\n"
-        "💡 Лучше отправьте фото как файл, если текст мелкий или размытый."
+        "После даты я сразу подготовлю preview PDF и ссылку на оплату."
     )
+    logger.info("handler case:new answered_to_user duration_ms=%s", int((time.monotonic() - start) * 1000))
+    schedule_crm_sync(settings, case.id, current_user.id, "user_started_bot", {"note": "Пользователь запустил бот"})
     if isinstance(event, CallbackQuery):
         await event.answer()
 
@@ -111,19 +154,13 @@ async def my_case(callback: CallbackQuery, session: AsyncSession, current_user: 
 
 
 @router.message(CaseStates.waiting_order_photo, F.photo)
+@router.message(CaseStates.waiting_order_rephoto, F.photo)
 async def receive_order_photo(message: Message, bot: Bot, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    start = time.monotonic()
     data = await state.get_data()
     case = await session.get(Case, data["case_id"])
     path = await _download_photo(bot, message, case.id, "order")
     await save_photo_path(session, case, "order", path)
-    crm = get_amocrm_service(settings)
-    await crm.sync_case_event(
-        session,
-        case,
-        current_user,
-        "order_photo_uploaded",
-        {"note": "Пользователь отправил фото судебного приказа", "files": [{"path": str(path), "caption": "Фото приказа"}]},
-    )
     await state.set_state(CaseStates.waiting_envelope_choice)
     await message.answer(
         "✅ Фото приказа принято.\n\n"
@@ -131,38 +168,50 @@ async def receive_order_photo(message: Message, bot: Bot, state: FSMContext, ses
         "💡 Если текст на приказе мелкий, в следующий раз отправьте фото как файл без сжатия.",
         reply_markup=envelope_choice(),
     )
+    logger.info("handler order_photo_received answered_to_user duration_ms=%s", int((time.monotonic() - start) * 1000))
+    schedule_crm_sync(
+        settings,
+        case.id,
+        current_user.id,
+        "order_photo_uploaded",
+        {"note": "Пользователь отправил фото судебного приказа", "files": [{"path": str(path), "caption": "Фото приказа"}]},
+    )
 
 
 @router.message(CaseStates.waiting_order_photo, F.document)
+@router.message(CaseStates.waiting_order_rephoto, F.document)
 async def receive_order_document(message: Message, bot: Bot, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
     if not message.document or not (message.document.mime_type or "").startswith("image/"):
         await message.answer("Нужно изображение судебного приказа. Отправьте фото или файл-картинку (JPEG/PNG).")
         return
+    start = time.monotonic()
     data = await state.get_data()
     case = await session.get(Case, data["case_id"])
     path = await _download_document_image(bot, message, case.id, "order")
     await save_photo_path(session, case, "order", path)
-    crm = get_amocrm_service(settings)
-    await crm.sync_case_event(
-        session,
-        case,
-        current_user,
-        "order_photo_uploaded",
-        {"note": "Пользователь отправил приказ как файл без сжатия", "files": [{"path": str(path), "caption": "Фото приказа (файл)"}]},
-    )
     await state.set_state(CaseStates.waiting_envelope_choice)
     await message.answer(
         "✅ Файл приказа принят без сжатия.\n\n"
         "Теперь отправьте фото конверта со штампами или сразу напишите дату получения в формате <code>ДД.ММ.ГГГГ</code>.",
         reply_markup=envelope_choice(),
     )
+    logger.info("handler order_photo_received answered_to_user duration_ms=%s", int((time.monotonic() - start) * 1000))
+    schedule_crm_sync(
+        settings,
+        case.id,
+        current_user.id,
+        "order_photo_uploaded",
+        {"note": "Пользователь отправил приказ как файл без сжатия", "files": [{"path": str(path), "caption": "Фото приказа (файл)"}]},
+    )
 
 
 @router.message(CaseStates.waiting_order_photo)
+@router.message(CaseStates.waiting_order_rephoto)
 async def receive_order_photo_wrong(message: Message) -> None:
     await message.answer(
         "Нужно именно фото судебного приказа. Отправьте изображение одним сообщением "
-        "или прикрепите файл-картинку без сжатия."
+        "или прикрепите файл-картинку без сжатия.",
+        reply_markup=order_rephoto_menu(),
     )
 
 
@@ -180,18 +229,19 @@ async def receive_date_direct(message: Message, state: FSMContext, session: Asyn
             reply_markup=envelope_choice(),
         )
         return
+    start = time.monotonic()
     data = await state.get_data()
     case = await session.get(Case, data["case_id"])
     await set_received_date(session, case, received)
-    crm = get_amocrm_service(settings)
-    await crm.sync_case_event(
-        session,
-        case,
-        current_user,
+    logger.info("handler received_date_entered answered_to_user duration_ms=%s", int((time.monotonic() - start) * 1000))
+    schedule_crm_sync(
+        settings,
+        case.id,
+        current_user.id,
         "received_date_entered",
         {"received_date": received.strftime("%d.%m.%Y"), "deadline": case.deadline_date.strftime("%d.%m.%Y") if case.deadline_date else ""},
     )
-    await _extract_and_confirm(message, state, session, settings, case, current_user)
+    await _extract_and_process_order(message, state, session, settings, case, current_user)
 
 
 @router.callback_query(F.data == "case:envelope_photo")
@@ -229,7 +279,14 @@ async def receive_manual_date(message: Message, state: FSMContext, session: Asyn
     data = await state.get_data()
     case = await session.get(Case, data["case_id"])
     await set_received_date(session, case, received)
-    await _extract_and_confirm(message, state, session, settings, case, current_user)
+    schedule_crm_sync(
+        settings,
+        case.id,
+        current_user.id,
+        "received_date_entered",
+        {"received_date": received.strftime("%d.%m.%Y"), "deadline": case.deadline_date.strftime("%d.%m.%Y") if case.deadline_date else ""},
+    )
+    await _extract_and_process_order(message, state, session, settings, case, current_user)
 
 
 @router.message(CaseStates.waiting_envelope_photo, F.photo)
@@ -244,14 +301,18 @@ async def receive_envelope_photo(message: Message, bot: Bot, state: FSMContext, 
         received = parse_russian_date(envelope.get("latest_date_normalized") or envelope.get("latest_date"))
         if not received:
             await state.set_state(CaseStates.waiting_manual_date)
-            await message.answer("Не смог уверенно прочитать дату на конверте. Напишите дату вручную в формате <code>ДД.ММ.ГГГГ</code>.")
+            await message.answer(
+                "Не удалось надежно прочитать дату на конверте.\n\n"
+                "Пожалуйста, сфотографируйте конверт крупнее: должны быть видны все почтовые штампы с датами.\n\n"
+                "Или нажмите «Ввести дату вручную».",
+                reply_markup=envelope_choice(),
+            )
             return
         await set_received_date(session, case, received)
-        crm = get_amocrm_service(settings)
-        await crm.sync_case_event(
-            session,
-            case,
-            current_user,
+        schedule_crm_sync(
+            settings,
+            case.id,
+            current_user.id,
             "envelope_photo_uploaded",
             {
                 "received_date": received.strftime("%d.%m.%Y"),
@@ -263,12 +324,24 @@ async def receive_envelope_photo(message: Message, bot: Bot, state: FSMContext, 
     except Exception:
         logger.exception("Envelope extraction failed")
         await state.set_state(CaseStates.waiting_manual_date)
-        await message.answer("Не получилось автоматически прочитать конверт. Напишите дату вручную в формате <code>ДД.ММ.ГГГГ</code>.")
+        await message.answer(
+            "Не удалось надежно прочитать дату на конверте.\n\n"
+            "Пожалуйста, сфотографируйте конверт крупнее: должны быть видны все почтовые штампы с датами.\n\n"
+            "Или нажмите «Ввести дату вручную».",
+            reply_markup=envelope_choice(),
+        )
         return
-    await _extract_and_confirm(message, state, session, settings, case, current_user)
+    await _extract_and_process_order(message, state, session, settings, case, current_user)
 
 
-async def _extract_and_confirm(message: Message, state: FSMContext, session: AsyncSession, settings: Settings, case: Case, current_user: User) -> None:
+async def _extract_and_process_order(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    settings: Settings,
+    case: Case,
+    current_user: User,
+) -> None:
     await state.clear()
     await message.answer("🔎 Считываю судебный приказ и собираю данные для заявления.")
     try:
@@ -276,24 +349,65 @@ async def _extract_and_confirm(message: Message, state: FSMContext, session: Asy
     except Exception:
         logger.exception("Order extraction failed")
         extracted = {}
-        await message.answer(
-            "Нейросеть не смогла прочитать приказ. Можно ввести ключевые данные вручную или связаться с менеджером.",
-            reply_markup=confirm_extraction(),
-        )
     extracted = normalize_order_data(extracted)
     extracted, name_result = normalize_debtor_name_fields(extracted)
     if name_result and name_result.confidence >= 0.85 and name_result.normalized:
         extracted["debtor_full_name"] = name_result.normalized
+
     missing = missing_order_fields(extracted, case.received_date)
     case.extracted_json = json.dumps(extracted, ensure_ascii=False)
     case.missing_fields = json.dumps(missing, ensure_ascii=False)
-    case.status = CaseStatus.NEEDS_REVIEW.value if missing else CaseStatus.PROCESSING.value
+    if missing:
+        case.order_rephoto_attempts = (case.order_rephoto_attempts or 0) + 1
+        case.status = CaseStatus.WAITING_ORDER_REPHOTO.value
+    else:
+        case.order_rephoto_attempts = 0
+        case.status = CaseStatus.PROCESSING.value
     await session.commit()
     crm = get_amocrm_service(settings)
-    await crm.sync_case_event(session, case, current_user, "ocr_completed", {"note": await crm.build_ocr_note(case)})
-    await message.answer(extraction_preview(extracted, case.received_date, missing, case.deadline_date), reply_markup=confirm_extraction())
-    if name_result and name_result.raw != name_result.normalized and name_result.confidence < 0.85:
-        await _prompt_debtor_name_fix(message, extracted.get("debtor_full_name") or name_result.raw)
+    schedule_crm_sync(settings, case.id, current_user.id, "ocr_completed", {"note": await crm.build_ocr_note(case)})
+
+    if missing:
+        await state.update_data(case_id=case.id)
+        await state.set_state(CaseStates.waiting_order_rephoto)
+        await _send_order_rephoto_prompt(message, missing, attempts=case.order_rephoto_attempts)
+        schedule_crm_sync(settings, case.id, current_user.id, "document_qa_failed", {"note": "Не удалось прочитать обязательные поля приказа"})
+        if case.order_rephoto_attempts >= 3:
+            case.status = CaseStatus.NEEDS_REVIEW.value
+            await session.commit()
+            for admin_id in settings.admin_ids:
+                try:
+                    await message.bot.send_message(
+                        admin_id,
+                        f"⚠️ Заявка #{case.id}: приказ не распознан после 3 попыток. Нужна ручная обработка.",
+                    )
+                except Exception:
+                    logger.exception("Failed to notify admin %s about repeated rephoto", admin_id)
+        return
+
+    if settings.show_user_confirmation_step:
+        await message.answer(extraction_preview(extracted, case.received_date, missing, case.deadline_date), reply_markup=confirm_extraction())
+        if name_result and name_result.raw != name_result.normalized and name_result.confidence < 0.85:
+            await _prompt_debtor_name_fix(message, extracted.get("debtor_full_name") or name_result.raw)
+        return
+
+    await _generate_documents_flow(message, session, settings, current_user, case, state=state, bot=message.bot)
+
+
+@router.callback_query(F.data == "case:rephoto_order")
+async def choose_rephoto_order(callback: CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User) -> None:
+    case = await latest_open_case(session, current_user.id)
+    if not case:
+        await callback.message.answer("Не нашел активное заявление. Начните заново.", reply_markup=main_menu())
+        await callback.answer()
+        return
+    await state.update_data(case_id=case.id)
+    await state.set_state(CaseStates.waiting_order_rephoto)
+    await callback.message.answer(
+        "Пожалуйста, отправьте фото судебного приказа ещё раз. Весь лист должен быть в кадре, без бликов.",
+        reply_markup=order_rephoto_menu(),
+    )
+    await callback.answer()
 
 
 async def _prompt_debtor_name_fix(message: Message, debtor_full_name: str) -> None:
@@ -311,6 +425,9 @@ async def _prompt_debtor_name_fix(message: Message, debtor_full_name: str) -> No
 @router.callback_query(F.data == "case:manual_fields")
 @router.callback_query(F.data == "case:edit_fields")
 async def edit_fields(callback: CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User) -> None:
+    if not current_user.is_admin:
+        await callback.answer("Эта функция доступна только админу.", show_alert=True)
+        return
     case = await latest_open_case(session, current_user.id)
     if not case:
         await callback.message.answer("Не нашел активное заявление.", reply_markup=main_menu())
@@ -325,6 +442,9 @@ async def edit_fields(callback: CallbackQuery, state: FSMContext, session: Async
 
 @router.callback_query(F.data == "case:review")
 async def review_case(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+    if not current_user.is_admin:
+        await callback.answer("Эта функция доступна только админу.", show_alert=True)
+        return
     case = await latest_open_case(session, current_user.id)
     if not case:
         await callback.message.answer("Не нашел активное заявление.", reply_markup=main_menu())
@@ -341,6 +461,9 @@ async def review_case(callback: CallbackQuery, session: AsyncSession, current_us
 
 @router.callback_query(F.data == "case:fix_debtor_name")
 async def fix_debtor_name(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+    if not current_user.is_admin:
+        await callback.answer("Эта функция доступна только админу.", show_alert=True)
+        return
     case = await latest_open_case(session, current_user.id)
     if not case:
         await callback.answer("Не нашел активное заявление", show_alert=True)
@@ -362,6 +485,9 @@ async def fix_debtor_name(callback: CallbackQuery, session: AsyncSession, curren
 
 @router.callback_query(F.data.startswith("case:field:"))
 async def choose_field(callback: CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User) -> None:
+    if not current_user.is_admin:
+        await callback.answer("Эта функция доступна только админу.", show_alert=True)
+        return
     case = await latest_open_case(session, current_user.id)
     if not case:
         await callback.message.answer("Не нашел активное заявление.", reply_markup=main_menu())
@@ -378,7 +504,11 @@ async def choose_field(callback: CallbackQuery, state: FSMContext, session: Asyn
 
 
 @router.message(CaseStates.waiting_field_value)
-async def process_field_value(message: Message, state: FSMContext, session: AsyncSession) -> None:
+async def process_field_value(message: Message, state: FSMContext, session: AsyncSession, current_user: User) -> None:
+    if not current_user.is_admin:
+        await state.clear()
+        await message.answer("Эта функция доступна только администратору.")
+        return
     state_data = await state.get_data()
     case = await session.get(Case, state_data["case_id"])
     field = state_data["edit_field"]
@@ -400,9 +530,13 @@ async def process_field_value(message: Message, state: FSMContext, session: Asyn
 
 
 @router.message(CaseStates.waiting_manual_fields)
-async def process_manual_fields(message: Message, state: FSMContext, session: AsyncSession) -> None:
+async def process_manual_fields(message: Message, state: FSMContext, session: AsyncSession, current_user: User) -> None:
+    if not current_user.is_admin:
+        await state.clear()
+        await message.answer("Эта функция доступна только администратору.")
+        return
     await state.clear()
-    await message.answer("Теперь данные исправляются по одному полю через кнопки.", reply_markup=edit_fields_menu())
+    await message.answer("Эта функция доступна только администратору.")
 
 
 async def _notify_admin_qa_failure(bot: Bot, settings: Settings, case: Case, reason: str) -> None:
@@ -495,6 +629,8 @@ async def _generate_documents_flow(
     settings: Settings,
     current_user: User,
     case: Case,
+    *,
+    state: FSMContext | None = None,
     restore_reason: str | None = None,
     bot: Bot | None = None,
 ) -> bool:
@@ -502,16 +638,13 @@ async def _generate_documents_flow(
     validation = validate_before_generation(data, case.received_date)
     if not validation.ok:
         issues = list(validation.missing) + list(validation.bad_tokens)
-        if "debtor_full_name:dative" in issues:
-            await _prompt_debtor_name_fix(message, data.get("debtor_full_name") or "")
         case.missing_fields = json.dumps(issues, ensure_ascii=False)
         case.status = CaseStatus.NEEDS_REVIEW.value
         await session.commit()
-        await message.answer(
-            "⚠️ Документ пока нельзя готовить: есть пустые или технические поля.\n\n"
-            + extraction_preview(data, case.received_date, issues, case.deadline_date),
-            reply_markup=confirm_extraction(),
-        )
+        if state is not None:
+            await state.update_data(case_id=case.id)
+            await state.set_state(CaseStates.waiting_order_rephoto)
+        await _send_order_rephoto_prompt(message, issues, attempts=case.order_rephoto_attempts)
         return False
     stored_reason = restore_reason or data.get("restore_reason") or ""
     if is_deadline_missed(case.deadline_date) and not stored_reason:
@@ -534,13 +667,16 @@ async def _generate_documents_flow(
         )
         case.status = CaseStatus.NEEDS_REVIEW.value
         await session.commit()
-        crm = get_amocrm_service(settings)
-        await crm.sync_case_event(session, case, current_user, "document_qa_failed", {"note": admin_report[:65000]})
+        schedule_crm_sync(settings, case.id, current_user.id, "document_qa_failed", {"note": admin_report[:65000]})
         if bot:
             await _notify_admin_qa_failure(bot, settings, case, admin_report)
+        if state is not None:
+            await state.update_data(case_id=case.id)
+            await state.set_state(CaseStates.waiting_order_rephoto)
         await message.answer(
-            "⚠️ Не удалось автоматически согласовать суммы по приказу. Менеджер проверит заявку вручную.",
-            reply_markup=edit_fields_menu(),
+            "Не удалось автоматически согласовать суммы по приказу.\n\n"
+            "Пожалуйста, сфотографируйте судебный приказ целиком ещё раз.",
+            reply_markup=order_rephoto_menu(),
         )
         return False
 
@@ -555,11 +691,16 @@ async def _generate_documents_flow(
     except ValueError as exc:
         case.status = CaseStatus.NEEDS_REVIEW.value
         await session.commit()
-        crm = get_amocrm_service(settings)
-        await crm.sync_case_event(session, case, current_user, "document_qa_failed", {"note": str(exc)})
+        schedule_crm_sync(settings, case.id, current_user.id, "document_qa_failed", {"note": str(exc)})
         if bot:
             await _notify_admin_qa_failure(bot, settings, case, f"⚠️ QA не пройден по заявке #{case.id}: {exc}")
-        await message.answer(f"⚠️ {exc}", reply_markup=edit_fields_menu())
+        if state is not None:
+            await state.update_data(case_id=case.id)
+            await state.set_state(CaseStates.waiting_order_rephoto)
+        await message.answer(
+            f"⚠️ {exc}\n\nПожалуйста, сфотографируйте судебный приказ целиком ещё раз.",
+            reply_markup=order_rephoto_menu(),
+        )
         return False
     case.full_doc_path = str(full_docx)
     case.full_pdf_path = str(full_pdf) if full_pdf else None
@@ -568,11 +709,10 @@ async def _generate_documents_flow(
     case.instruction_path = str(instruction_path)
     case.status = CaseStatus.PREVIEW_READY.value
     await session.commit()
-    crm = get_amocrm_service(settings)
-    await crm.sync_case_event(
-        session,
-        case,
-        current_user,
+    schedule_crm_sync(
+        settings,
+        case.id,
+        current_user.id,
         "preview_generated",
         {
             "note": "Preview сформирован. Document QA: passed",
@@ -581,7 +721,7 @@ async def _generate_documents_flow(
                 {"path": case.full_pdf_path or "", "caption": "Полный PDF"},
                 {"path": case.preview_pdf_path or case.preview_doc_path or "", "caption": "Preview"},
                 {"path": case.instruction_path or "", "caption": "Инструкция"},
-            ]
+            ],
         },
     )
     if payments_enabled():
@@ -608,11 +748,10 @@ async def _generate_documents_flow(
         await deliver_full_documents(message, session, case, settings, current_user)
         return True
     payment = await ensure_payment(session, case, settings)
-    crm = get_amocrm_service(settings)
-    await crm.sync_case_event(
-        session,
-        case,
-        current_user,
+    schedule_crm_sync(
+        settings,
+        case.id,
+        current_user.id,
         "payment_created",
         {"note": f"Платеж: {case.payment_label}, сумма {payment.amount} руб."},
     )
@@ -627,15 +766,17 @@ async def _generate_documents_flow(
 
 @router.callback_query(F.data == "case:generate")
 async def generate_documents(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User, state: FSMContext, bot: Bot) -> None:
+    if not (current_user.is_admin or settings.show_user_confirmation_step):
+        await callback.answer("Эта функция недоступна.", show_alert=True)
+        return
     case = await latest_open_case(session, current_user.id)
     if not case:
         await callback.message.answer("Не нашел активное заявление.", reply_markup=main_menu())
         await callback.answer()
         return
     await state.clear()
-    crm = get_amocrm_service(settings)
-    await crm.sync_case_event(session, case, current_user, "case_data_confirmed", {"note": "Пользователь подтвердил распознанные данные"})
-    await _generate_documents_flow(callback.message, session, settings, current_user, case, bot=bot)
+    schedule_crm_sync(settings, case.id, current_user.id, "case_data_confirmed", {"note": "Пользователь подтвердил распознанные данные"})
+    await _generate_documents_flow(callback.message, session, settings, current_user, case, state=state, bot=bot)
     await callback.answer()
 
 
@@ -668,7 +809,7 @@ async def choose_restore_reason(callback: CallbackQuery, state: FSMContext, sess
     case.extracted_json = json.dumps(extracted, ensure_ascii=False)
     await session.commit()
     await state.clear()
-    await _generate_documents_flow(callback.message, session, settings, current_user, case, restore_reason=reason_text)
+    await _generate_documents_flow(callback.message, session, settings, current_user, case, state=state, restore_reason=reason_text)
     await callback.answer()
 
 
@@ -685,7 +826,7 @@ async def receive_restore_reason_custom(message: Message, state: FSMContext, ses
     case.extracted_json = json.dumps(extracted, ensure_ascii=False)
     await session.commit()
     await state.clear()
-    await _generate_documents_flow(message, session, settings, current_user, case, restore_reason=extracted["restore_reason"])
+    await _generate_documents_flow(message, session, settings, current_user, case, state=state, restore_reason=extracted["restore_reason"])
 
 
 @router.callback_query(F.data == "payment:check")
@@ -709,12 +850,11 @@ async def deliver_full_documents(message: Message, session: AsyncSession, case: 
     case.delivered_at = datetime.utcnow()
     await session.commit()
     if settings and user:
-        crm = get_amocrm_service(settings)
-        await crm.sync_case_event(session, case, user, "payment_paid", {"note": "Оплата подтверждена"})
-        await crm.sync_case_event(
-            session,
-            case,
-            user,
+        schedule_crm_sync(settings, case.id, user.id, "payment_paid", {"note": "Оплата подтверждена"})
+        schedule_crm_sync(
+            settings,
+            case.id,
+            user.id,
             "documents_delivered",
             {"note": "Клиенту выданы полный DOCX, полный PDF и инструкция"},
         )

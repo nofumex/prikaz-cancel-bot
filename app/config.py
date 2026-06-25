@@ -40,6 +40,17 @@ def _parse_int(raw: str | None, default: int = 0) -> int:
 class Settings:
     telegram_bot_token: str
     max_bot_token: str
+    max_api_base_url: str
+    max_use_webhook: bool
+    max_webhook_url: str | None
+    max_webhook_secret: str | None
+    max_webhook_host: str
+    max_webhook_port: int
+    max_longpoll_timeout_seconds: int
+    max_download_dir: str
+    max_upload_retry_attempts: int
+    max_upload_retry_base_seconds: int
+    max_admin_ids: set[int]
     run_telegram: bool
     run_max: bool
     admin_ids: set[int]
@@ -59,6 +70,7 @@ class Settings:
     require_pdf_preview_for_payment: bool
     allow_dev_docx_preview: bool
     document_template_version: str
+    show_user_confirmation_step: bool
     yoomoney_receiver: str | None
     yoomoney_success_url: str | None
     yoomoney_notification_secret: str | None
@@ -81,10 +93,12 @@ class Settings:
     amocrm_debug: bool
     amocrm_rps_limit: int
     amocrm_pipeline_id: int | None
-    amocrm_status_id_new: int | None
-    amocrm_status_id_in_progress: int | None
-    amocrm_status_id_consultation: int | None
-    amocrm_write_enabled: bool
+
+    crm_sync_background: bool
+    crm_sync_timeout_seconds: int
+    crm_sync_max_attempts: int
+    crm_sync_retry_base_seconds: int
+    crm_sync_debug: bool
 
     amount_retry_on_mismatch: bool
     auto_recover_amount_mismatch: bool
@@ -106,6 +120,17 @@ def get_settings() -> Settings:
     return Settings(
         telegram_bot_token=(getenv("TG_BOT_TOKEN") or getenv("TELEGRAM_BOT_TOKEN") or getenv("BOT_TOKEN") or "").strip(),
         max_bot_token=(getenv("MAX_BOT_TOKEN") or "").strip(),
+        max_api_base_url=(getenv("MAX_API_BASE_URL") or "https://platform-api2.max.ru").strip().rstrip("/"),
+        max_use_webhook=_parse_bool(getenv("MAX_USE_WEBHOOK"), False),
+        max_webhook_url=(getenv("MAX_WEBHOOK_URL") or "").strip() or None,
+        max_webhook_secret=(getenv("MAX_WEBHOOK_SECRET") or "").strip() or None,
+        max_webhook_host=(getenv("MAX_WEBHOOK_HOST") or "0.0.0.0").strip(),
+        max_webhook_port=_parse_int(getenv("MAX_WEBHOOK_PORT"), 8081),
+        max_longpoll_timeout_seconds=_parse_int(getenv("MAX_LONGPOLL_TIMEOUT_SECONDS"), 30),
+        max_download_dir=(getenv("MAX_DOWNLOAD_DIR") or "storage/max").strip(),
+        max_upload_retry_attempts=_parse_int(getenv("MAX_UPLOAD_RETRY_ATTEMPTS"), 5),
+        max_upload_retry_base_seconds=_parse_int(getenv("MAX_UPLOAD_RETRY_BASE_SECONDS"), 1),
+        max_admin_ids=_parse_int_set(getenv("MAX_ADMIN_IDS")),
         run_telegram=_parse_bool(getenv("RUN_TELEGRAM"), True),
         run_max=_parse_bool(getenv("RUN_MAX"), False),
         admin_ids=admin_ids,
@@ -123,6 +148,7 @@ def get_settings() -> Settings:
         require_pdf_preview_for_payment=_parse_bool(getenv("REQUIRE_PDF_PREVIEW_FOR_PAYMENT"), True),
         allow_dev_docx_preview=_parse_bool(getenv("ALLOW_DEV_DOCX_PREVIEW"), False),
         document_template_version=(getenv("DOCUMENT_TEMPLATE_VERSION") or "2026-06-legal-v1").strip(),
+        show_user_confirmation_step=_parse_bool(getenv("SHOW_USER_CONFIRMATION_STEP"), False),
         yoomoney_receiver=(getenv("YOOMONEY_RECEIVER") or "").strip() or None,
         yoomoney_success_url=(getenv("YOOMONEY_SUCCESS_URL") or "").strip() or None,
         yoomoney_notification_secret=(getenv("YOOMONEY_NOTIFICATION_SECRET") or "").strip() or None,
@@ -146,10 +172,11 @@ def get_settings() -> Settings:
         amocrm_debug=_parse_bool(getenv("AMOCRM_DEBUG"), False),
         amocrm_rps_limit=_parse_int(getenv("AMOCRM_RPS_LIMIT"), 5),
         amocrm_pipeline_id=_parse_int(getenv("AMOCRM_PIPELINE_ID"), 0) or None,
-        amocrm_status_id_new=_parse_int(getenv("AMOCRM_STATUS_ID_NEW"), 85847178) or None,
-        amocrm_status_id_in_progress=_parse_int(getenv("AMOCRM_STATUS_ID_IN_PROGRESS"), 85847182) or None,
-        amocrm_status_id_consultation=_parse_int(getenv("AMOCRM_STATUS_ID_CONSULTATION"), 85847186) or None,
-        amocrm_write_enabled=_parse_bool(getenv("AMOCRM_WRITE_ENABLED"), False),
+        crm_sync_background=_parse_bool(getenv("CRM_SYNC_BACKGROUND"), True),
+        crm_sync_timeout_seconds=_parse_int(getenv("CRM_SYNC_TIMEOUT_SECONDS"), 5),
+        crm_sync_max_attempts=_parse_int(getenv("CRM_SYNC_MAX_ATTEMPTS"), 3),
+        crm_sync_retry_base_seconds=_parse_int(getenv("CRM_SYNC_RETRY_BASE_SECONDS"), 2),
+        crm_sync_debug=_parse_bool(getenv("CRM_SYNC_DEBUG"), False),
         amount_retry_on_mismatch=_parse_bool(getenv("AMOUNT_RETRY_ON_MISMATCH"), True),
         auto_recover_amount_mismatch=_parse_bool(getenv("AUTO_RECOVER_AMOUNT_MISMATCH"), True),
         auto_recover_amount_min_confidence=float(getenv("AUTO_RECOVER_AMOUNT_MIN_CONFIDENCE") or 0.75),

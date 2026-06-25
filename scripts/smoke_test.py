@@ -17,7 +17,7 @@ from sqlalchemy import select
 from app.database import SessionLocal, init_db
 from app.models import Case, User
 from app.services.document_templates import create_case_documents
-from app.services.legal_data import legal_deadline_from_received, normalize_order_data, validate_amounts
+from app.services.legal_data import docx_text, legal_deadline_from_received, normalize_order_data, validate_amounts
 from app.services.pdf_tools import check_pdf_dependencies, pdf_page_count, pdf_text
 
 
@@ -110,15 +110,17 @@ async def main(allow_dev_fallback: bool) -> None:
         if full_pdf.read_bytes() == preview_pdf.read_bytes():
             raise RuntimeError("preview PDF equals full PDF")
         full_text = pdf_text(full_pdf)
+        docx_full_text = docx_text(str(full_docx))
         preview_text = pdf_text(preview_pdf)
         if full_text and full_text.strip() and full_text.strip() == preview_text.strip():
             raise RuntimeError("preview PDF contains full readable text")
         page_count = pdf_page_count(full_pdf)
         if page_count != 1:
             raise RuntimeError(f"Belsky in-time document must fit 1 page, got {page_count}")
-        if "ВОЗРАЖЕНИЯ" not in full_text:
+        readable_text = full_text if "ВОЗРАЖЕНИЯ" in full_text else docx_full_text
+        if "ВОЗРАЖЕНИЯ" not in readable_text:
             raise RuntimeError("missing title ВОЗРАЖЕНИЯ")
-        if "/Бельский В.Г./" not in full_text and "Бельский В.Г." not in full_text:
+        if "/Бельский В.Г./" not in readable_text and "Бельский В.Г." not in readable_text:
             raise RuntimeError("signature not filled")
         amounts = validate_amounts(data)
         if not amounts.ok:

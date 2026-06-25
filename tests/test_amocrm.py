@@ -9,6 +9,17 @@ def _settings(**kwargs):
     base = dict(
         telegram_bot_token="",
         max_bot_token="",
+            max_api_base_url="https://platform-api2.max.ru",
+            max_use_webhook=False,
+            max_webhook_url=None,
+            max_webhook_secret=None,
+            max_webhook_host="0.0.0.0",
+            max_webhook_port=8081,
+            max_longpoll_timeout_seconds=30,
+            max_download_dir="storage/max",
+            max_upload_retry_attempts=5,
+            max_upload_retry_base_seconds=1,
+            max_admin_ids=set(),
         run_telegram=True,
         run_max=False,
         admin_ids=set(),
@@ -26,6 +37,7 @@ def _settings(**kwargs):
         require_pdf_preview_for_payment=True,
         allow_dev_docx_preview=False,
         document_template_version="test",
+        show_user_confirmation_step=False,
         yoomoney_receiver=None,
         yoomoney_success_url=None,
         yoomoney_notification_secret=None,
@@ -46,10 +58,11 @@ def _settings(**kwargs):
         amocrm_debug=False,
         amocrm_rps_limit=5,
         amocrm_pipeline_id=None,
-        amocrm_status_id_new=None,
-        amocrm_status_id_in_progress=None,
-        amocrm_status_id_consultation=None,
-        amocrm_write_enabled=False,
+        crm_sync_background=True,
+        crm_sync_timeout_seconds=5,
+        crm_sync_max_attempts=3,
+        crm_sync_retry_base_seconds=2,
+        crm_sync_debug=False,
         amount_retry_on_mismatch=True,
         auto_recover_amount_mismatch=True,
         auto_recover_amount_min_confidence=0.75,
@@ -71,7 +84,7 @@ async def test_crm_disabled_does_not_crash():
 def test_event_status_map_contains_required_stages():
     assert EVENT_STATUS_MAP["user_started_bot"] == "Подписался на бота"
     assert EVENT_STATUS_MAP["order_photo_uploaded"] == "Отправил приказ"
-    assert EVENT_STATUS_MAP["received_date_entered"] == "Ввел дату"
+    assert EVENT_STATUS_MAP["received_date_entered"] == "Указал дату"
     assert EVENT_STATUS_MAP["payment_paid"] == "Оплатил"
-    assert EVENT_STATUS_MAP["documents_delivered"] == "Получил заявление"
-    assert EVENT_STATUS_MAP["document_qa_failed"] == "Нужна проверка"
+    assert EVENT_STATUS_MAP["documents_delivered"] == "Оплатил"
+    assert EVENT_STATUS_MAP["document_qa_failed"] == "Указал дату"

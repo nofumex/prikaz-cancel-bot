@@ -44,6 +44,13 @@ async def get_or_create_platform_user(
     user.telegram_username = username
     user.first_name = first_name
     user.last_name = last_name
+    if platform == "max":
+        try:
+            max_id = int(platform_user_id)
+        except (TypeError, ValueError):
+            max_id = None
+        user.is_admin = bool(max_id is not None and max_id in settings.max_admin_ids)
+        user.is_manager = user.is_admin
     await session.commit()
     await session.refresh(user)
     return user

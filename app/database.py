@@ -36,6 +36,8 @@ async def _upgrade_sqlite_schema(conn) -> None:
         conn,
         "cases",
         [
+            ("platform_chat_id", "platform_chat_id TEXT"),
+            ("platform_user_id", "platform_user_id TEXT"),
             ("full_pdf_path", "full_pdf_path TEXT"),
             ("preview_pdf_path", "preview_pdf_path TEXT"),
             ("amocrm_contact_id", "amocrm_contact_id INTEGER"),
@@ -46,6 +48,7 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("amocrm_last_sync_at", "amocrm_last_sync_at DATETIME"),
             ("amocrm_sync_error", "amocrm_sync_error TEXT"),
             ("amocrm_synced", "amocrm_synced BOOLEAN DEFAULT 0"),
+            ("order_rephoto_attempts", "order_rephoto_attempts INTEGER NOT NULL DEFAULT 0"),
         ],
     )
     await _sqlite_add_columns(

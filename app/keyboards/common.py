@@ -46,8 +46,17 @@ def case_menu(can_pay: bool = False, payment_url: str | None = None) -> InlineKe
 def envelope_choice() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [btn("📸 Отправить фото конверта", "case:envelope_photo")],
-            [btn("✍️ Указать дату вручную", "case:manual_date")],
+            [btn("📷 Перефотографировать конверт", "case:envelope_photo")],
+            [btn("✍️ Ввести дату вручную", "case:manual_date")],
+            [btn("💬 Связаться с менеджером", "chat:start")],
+        ]
+    )
+
+
+def order_rephoto_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn("📷 Перефотографировать приказ", "case:rephoto_order")],
             [btn("💬 Связаться с менеджером", "chat:start")],
         ]
     )

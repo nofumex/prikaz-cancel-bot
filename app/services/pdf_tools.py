@@ -59,7 +59,8 @@ def convert_docx_to_pdf(docx_path: str | Path, outdir: str | Path | None = None,
     if result.returncode != 0:
         if allow_dev_fallback and fitz is not None:
             return _convert_docx_to_pdf_fitz_fallback(docx_path, pdf_path)
-        raise RuntimeError(f"Failed to convert DOCX to PDF: {result.stderr.strip() or result.stdout.strip()}")
+        details = result.stderr.strip() or result.stdout.strip() or f"LibreOffice exited with code {result.returncode} ({soffice})"
+        raise RuntimeError(f"Failed to convert DOCX to PDF: {details}")
     if not pdf_path.exists():
         if allow_dev_fallback and fitz is not None:
             return _convert_docx_to_pdf_fitz_fallback(docx_path, pdf_path)

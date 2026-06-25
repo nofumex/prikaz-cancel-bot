@@ -21,26 +21,26 @@ logger = logging.getLogger(__name__)
 PIPELINE_STATUSES = [
     "Подписался на бота",
     "Отправил приказ",
-    "Ввел дату",
+    "Указал дату",
     "Оплатил",
-    "Получил заявление",
-    "Нужна проверка",
+    "Получил напоминание (не оплатил)",
 ]
 
 EVENT_STATUS_MAP = {
     "user_started_bot": "Подписался на бота",
     "order_photo_uploaded": "Отправил приказ",
-    "envelope_photo_uploaded": "Ввел дату",
-    "received_date_entered": "Ввел дату",
-    "ocr_completed": "Ввел дату",
-    "case_data_confirmed": "Ввел дату",
-    "preview_generated": "Ввел дату",
-    "payment_created": "Ввел дату",
+    "received_date_entered": "Указал дату",
+    "envelope_photo_uploaded": "Указал дату",
+    "ocr_completed": "Указал дату",
+    "case_data_confirmed": "Указал дату",
+    "preview_generated": "Указал дату",
+    "payment_created": "Указал дату",
+    "document_qa_failed": "Указал дату",
+    "manager_requested": "Указал дату",
     "payment_paid": "Оплатил",
-    "documents_delivered": "Получил заявление",
-    "document_qa_failed": "Нужна проверка",
-    "manager_requested": "Нужна проверка",
-    "payment_abandoned": "Ввел дату",
+    "documents_delivered": "Оплатил",
+    "reminder_sent": "Получил напоминание (не оплатил)",
+    "payment_abandoned": "Получил напоминание (не оплатил)",
 }
 
 
@@ -243,17 +243,17 @@ class AmoCrmService:
         statuses = await self.ensure_statuses(int(pipeline["id"]))
         return statuses.get(status_name)
 
-    async def find_contact_by_telegram_id(self, telegram_id: int) -> dict | None:
-        data, error = await self.request("GET", "/contacts", params={"query": str(telegram_id), "limit": 50})
+    async def find_contact_by_platform_id(self, platform: str, platform_user_id: str) -> dict | None:
+        data, error = await self.request("GET", "/contacts", params={"query": str(platform_user_id), "limit": 50})
         if error or not isinstance(data, dict):
             return None
         contacts = data.get("_embedded", {}).get("contacts", [])
-        tg = str(telegram_id)
+        platform_id = str(platform_user_id)
         for contact in contacts:
             custom_values = contact.get("custom_fields_values") or []
             for field in custom_values:
                 for value in field.get("values", []):
-                    if str(value.get("value")) == tg:
+                    if str(value.get("value")) == platform_id:
                         return contact
         # Fallback if no custom field exists in account.
         return contacts[0] if contacts else None
@@ -263,11 +263,14 @@ class AmoCrmService:
             " ".join(part for part in [user.first_name or "", user.last_name or ""] if part).strip()
             or (user.telegram_username and f"@{user.telegram_username}")
             or (user.username and f"@{user.username}")
-            or f"Telegram {user.telegram_id or user.platform_user_id}"
+            or f"{user.platform.upper()} {user.platform_user_id}"
         )
+        source = "Telegram бот" if user.platform == "telegram" else "MAX бот"
         note_text = (
-            "Источник: Telegram бот — отмена судебного приказа\n"
-            f"Telegram ID: {user.telegram_id or user.platform_user_id}\n"
+            f"Источник: {source} — отмена судебного приказа\n"
+            f"Platform: {user.platform}\n"
+            f"Platform user ID: {user.platform_user_id}\n"
+            f"Telegram ID: {user.telegram_id or ''}\n"
             f"Username: @{(user.telegram_username or user.username or '').lstrip('@')}"
         )
         contact_payload: dict[str, Any] = {"name": name}
@@ -275,8 +278,8 @@ class AmoCrmService:
             contact_payload["custom_fields_values"] = [{"field_code": "PHONE", "values": [{"value": user.phone, "enum_code": "WORK"}]}]
 
         contact_id = user.amocrm_contact_id
-        if not contact_id and user.telegram_id:
-            found = await self.find_contact_by_telegram_id(user.telegram_id)
+        if not contact_id:
+            found = await self.find_contact_by_platform_id(user.platform, user.platform_user_id)
             if found:
                 contact_id = int(found["id"])
 
@@ -307,7 +310,7 @@ class AmoCrmService:
         username = user.telegram_username or user.username
         if username:
             return f"Судебный приказ #{case.id} — @{username.lstrip('@')}"
-        return f"Судебный приказ #{case.id} — Telegram ID {user.telegram_id or user.platform_user_id}"
+        return f"Судебный приказ #{case.id} — {user.platform} ID {user.platform_user_id}"
 
     async def create_lead(self, case: Case, user: User, status_name: str) -> int | None:
         pipeline = await self.ensure_pipeline()
@@ -342,6 +345,8 @@ class AmoCrmService:
         lead_id = case.amocrm_lead_id or case.amo_lead_id
         if not lead_id:
             return False
+        if case.amocrm_status_name == "Оплатил" and status_name == "Получил напоминание (не оплатил)":
+            return True
         pipeline = await self.ensure_pipeline()
         if not pipeline:
             return False
@@ -479,7 +484,9 @@ class AmoCrmService:
         status_event = {
             "draft": "user_started_bot",
             "waiting_order_photo": "user_started_bot",
+            "waiting_order_rephoto": "order_photo_uploaded",
             "waiting_envelope": "order_photo_uploaded",
+            "waiting_received_date": "order_photo_uploaded",
             "processing": "ocr_completed",
             "needs_review": "document_qa_failed",
             "preview_ready": "preview_generated",

@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.keyboards.common import chat_end_menu, connect_chat_keyboard, main_menu, manager_panel
 from app.models import User
-from app.services.amocrm import get_amocrm_service
+from app.services.crm_background import schedule_crm_sync
 from app.services.cases import latest_open_case
 from app.services.chat import (
     close_session,
@@ -40,8 +40,7 @@ async def _start_chat(message: Message, bot: Bot, session: AsyncSession, current
     await _notify_staff(bot, session, manager_request_text(current_user), reply_markup=connect_chat_keyboard(chat.id))
     case = await latest_open_case(session, current_user.id)
     if case:
-        crm = get_amocrm_service(settings)
-        await crm.sync_case_event(session, case, current_user, "manager_requested", {"note": "Пользователь запросил менеджера"})
+        schedule_crm_sync(settings, case.id, current_user.id, "manager_requested", {"note": "Пользователь запросил менеджера"})
 
 
 @router.message(Command("tutor"))

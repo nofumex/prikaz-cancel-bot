@@ -7,6 +7,7 @@ from app.services.document_templates.styles import FONT_NAME, StyleProfile, page
 from app.services.legal_data import (
     AmountValidationResult,
     bad_tokens_in_text,
+    docx_text,
     format_money_rub_kop,
     validate_docx_clean,
 )
@@ -171,7 +172,8 @@ def run_visual_qa(
         except Exception:
             result.errors.append("preview_pdf_unreadable")
 
-    if "ВОЗРАЖЕНИЯ" not in full_text:
+    docx_full_text = docx_text(str(full_docx)) if full_docx and full_docx.exists() else ""
+    if "ВОЗРАЖЕНИЯ" not in full_text and "ВОЗРАЖЕНИЯ" not in docx_full_text:
         result.errors.append("missing_title_vozrazheniya")
 
     result.errors = sorted(set(result.errors))

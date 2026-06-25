@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from datetime import date
 
-from app.services.legal_data import clean_case_number, clean_uid, is_deadline_missed
+from app.services.legal_data import clean_case_number, clean_uid, is_deadline_missed, normalize_address_text
 from app.services.name_normalizer import make_short_name
 from app.utils import parse_russian_date
 
@@ -58,17 +58,7 @@ def signature_date_text(document_date: date) -> str:
 
 
 def normalize_address_line(text: str) -> str:
-    text = re.sub(r"\s+", " ", text).strip(" ,.;")
-    text = re.sub(r"№(\d+)", r"№ \1", text)
-    text = re.sub(r"\bгород\s+", "г. ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bулица\s+", "ул. ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bдом\s+№?\s*", "д. ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bдом\s+", "д. ", text, flags=re.IGNORECASE)
-    text = re.sub(r",\s*д\.\s*", ", д. ", text)
-    text = re.sub(r"(\S+)\s+д\.\s*(\d+)", r"\1, д. \2", text)
-    text = re.sub(r",\s*,", ",", text)
-    text = re.sub(r",\s*\.", ".", text)
-    return text
+    return normalize_address_text(text)
 
 
 def normalize_court_addressee(court: str) -> str:
@@ -115,30 +105,42 @@ def build_header_lines(ctx: StatementContext) -> list[str]:
     court_addressee = data.get("court_addressee") or normalize_court_addressee(_required(data, "court_name"))
     lines = [
         court_addressee,
-        normalize_address_line(_required(data, "court_address")),
         "",
         "Должник:",
         debtor_full_name,
-        f"адрес: {normalize_address_line(_required(data, 'debtor_address'))}",
         "",
         "Взыскатель:",
         _required(data, "creditor_name"),
-        normalize_creditor_address(_required(data, "creditor_address")),
     ]
-    case_number = clean_case_number(_required(data, "case_number"))
+    court_address = _optional(data, "court_address")
+    if court_address:
+        lines.insert(1, normalize_address_line(court_address))
+    debtor_address = _optional(data, "debtor_address")
+    if debtor_address:
+        lines.insert(5, f"адрес: {normalize_address_line(debtor_address)}")
+    creditor_address = _optional(data, "creditor_address")
+    if creditor_address:
+        lines.append(normalize_creditor_address(creditor_address))
+    case_number = clean_case_number(_optional(data, "case_number"))
     uid = clean_uid(_optional(data, "uid"))
-    lines.extend(["", f"Дело/производство № {case_number}"])
+    lines.append("")
+    if case_number:
+        lines.append(f"Дело/производство № {case_number}")
     if uid:
         lines.append(f"УИД: {uid}")
     return lines
 
 
 def _case_identifier_short(data: dict) -> str:
-    case_number = clean_case_number(_required(data, "case_number"))
+    case_number = clean_case_number(_optional(data, "case_number"))
     uid = clean_uid(_optional(data, "uid"))
-    if uid:
+    if case_number and uid:
         return f"№ {case_number}, УИД {uid}"
-    return f"№ {case_number}"
+    if case_number:
+        return f"№ {case_number}"
+    if uid:
+        return f"УИД {uid}"
+    raise ValueError("Missing required document field: case_number or uid")
 
 
 def _contract_inline(value: str) -> str:
@@ -146,10 +148,12 @@ def _contract_inline(value: str) -> str:
     lower = value.lower()
     if lower.startswith("по "):
         return value[3:].strip()
-    if lower.startswith("договор"):
+    if lower.startswith("договору"):
         return value
+    if lower.startswith("договор"):
+        return re.sub(r"^договор", "договору", value, flags=re.IGNORECASE)
     if value.startswith("№"):
-        return f"договор {value}"
+        return f"договору {value}"
     return value
 
 
@@ -162,13 +166,24 @@ def _period_inline(value: str) -> str:
 
 
 def _money_body_phrase(data: dict) -> str:
-    debt = _required(data, "debt_amount")
-    state_duty = _optional(data, "state_duty")
-    contract = _contract_inline(_required(data, "debt_contract"))
-    period = _period_inline(_required(data, "debt_period"))
-    base = f"задолженности по {contract} за период {period} в размере {debt}"
+    debt = _required(data, "debt_amount").rstrip(".") + "."
+    state_duty_raw = _optional(data, "state_duty")
+    state_duty = state_duty_raw.rstrip(".") if state_duty_raw else ""
+    total = _optional(data, "total_amount").rstrip(".")
+    contract = _optional(data, "debt_contract")
+    period = _optional(data, "debt_period")
+    fragments = []
+    if contract:
+        fragments.append(f"по { _contract_inline(contract) }")
+    if period:
+        fragments.append(f"за период {_period_inline(period)}")
+    base = "задолженности"
+    if fragments:
+        base = f"{base} {' '.join(fragments)}"
+    base = f"{base} в размере {debt}"
+    base = re.sub(r"по договор №", "по договору №", base)
     if state_duty:
-        return f"{base}, а также расходов по оплате государственной пошлины в размере {state_duty}"
+        base = f"{base}, а также расходов по оплате государственной пошлины в размере {state_duty}"
     return base
 
 

@@ -21,6 +21,7 @@ from app.keyboards.common import admin_case_actions, admin_cases_page, admin_pan
 from app.models import Case, CrmSyncLog, OpenAIUsage, User
 from app.services.amocrm import get_amocrm_service
 from app.services.app_settings import payments_enabled, toggle_payments
+from app.services.document_delivery import schedule_document_delivery
 from app.services.payments import mark_paid_by_label
 from app.texts import case_summary
 from app.services.legal_data import FIELD_LABELS, normalize_order_data
@@ -445,10 +446,9 @@ async def cb_check_crm(callback: CallbackQuery, session: AsyncSession, settings:
     for status_name in [
         "Подписался на бота",
         "Отправил приказ",
-        "Ввел дату",
+        "Указал дату",
         "Оплатил",
-        "Получил заявление",
-        "Нужна проверка",
+        "Получил напоминание (не оплатил)",
     ]:
         sid = report.get("statuses", {}).get(status_name)
         mark = "✅" if sid else "❌"
@@ -492,32 +492,7 @@ async def cb_mark_paid(callback: CallbackQuery, bot: Bot, session: AsyncSession,
     paid_case = await mark_paid_by_label(session, case.payment_label, {"manual_admin_id": current_user.id})
     await session.refresh(paid_case, ["user"])
     await callback.message.answer(f"Оплата по заявлению #{paid_case.id} отмечена.")
-    if paid_case.user.telegram_id:
-        from app.handlers.case_flow import deliver_full_documents
-
-        await bot.send_message(paid_case.user.telegram_id, "Оплата подтверждена. Отправляю полный комплект документов.")
-        # Use a lightweight stand-in object with answer_document methods unavailable is not safe here;
-        # send directly to keep admin confirmation deterministic.
-        from aiogram.types import FSInputFile
-
-        if paid_case.full_doc_path:
-            await bot.send_document(paid_case.user.telegram_id, FSInputFile(paid_case.full_doc_path), caption="Полный вариант заявления.")
-        if paid_case.full_pdf_path:
-            await bot.send_document(paid_case.user.telegram_id, FSInputFile(paid_case.full_pdf_path), caption="Полный PDF.")
-        if paid_case.instruction_path:
-            await bot.send_document(paid_case.user.telegram_id, FSInputFile(paid_case.instruction_path), caption="Инструкция по отправке в суд.")
-        paid_case.status = CaseStatus.DELIVERED.value
-        paid_case.delivered_at = datetime.utcnow()
-        crm = get_amocrm_service(settings)
-        await crm.sync_case_event(session, paid_case, paid_case.user, "payment_paid", {"note": "Оплата подтверждена вручную админом."})
-        await crm.sync_case_event(
-            session,
-            paid_case,
-            paid_case.user,
-            "documents_delivered",
-            {"note": "Документы выданы клиенту после ручного подтверждения оплаты"},
-        )
-        await session.commit()
+    schedule_document_delivery(paid_case.id, settings, telegram_bot=bot)
     await callback.answer()
 
 

@@ -34,6 +34,11 @@ BAD_DOCUMENT_TOKENS = [
     "Бельского Владимира Геннадьевича",
     "Бельскому В.Г.",
     "Бельского В.Г.",
+    "№5",
+    "в городе Москва",
+    "по договор №",
+    "коп..",
+    "руб..",
 ]
 
 PREVIEW_IGNORED_TOKENS = {"▒"}
@@ -54,19 +59,15 @@ FIELD_LABELS = {
     "total_amount": "Итого ко взысканию",
     "received_date": "Дата получения",
     "debtor_full_name:dative": "ФИО должника в именительном падеже",
+    "case_number_or_uid": "Номер дела или УИД",
+    "state_duty_or_total_amount": "Госпошлина или итоговая сумма",
 }
 
 REQUIRED_FIELDS = [
     "court_name",
-    "court_address",
     "debtor_full_name",
-    "debtor_address",
     "creditor_name",
-    "creditor_address",
-    "case_number",
     "order_date",
-    "debt_contract",
-    "debt_period",
     "debt_amount",
 ]
 
@@ -75,7 +76,21 @@ def clean_text(value: object | None) -> str:
     text = "" if value is None else str(value)
     text = text.replace("\xa0", " ")
     text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"№\s*(\d+)", r"№ \1", text)
     return text.strip(" \t\r\n,;")
+
+
+def normalize_address_text(value: object | None) -> str:
+    text = clean_text(value)
+    text = re.sub(r"\bв\s+городе\s+Москва\b", "г. Москва", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bгород\s+Москва\b", "г. Москва", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bгород\s+", "г. ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bулица\s+", "ул. ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bул\.\s*([^,]+),\s*(?=\d)", r"ул. \1, д. ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bдом\s+№?\s*", "д. ", text, flags=re.IGNORECASE)
+    text = re.sub(r",\s*д\.\s*", ", д. ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" ,.;")
 
 
 def clean_uid(value: object | None) -> str:
@@ -239,6 +254,9 @@ def normalize_order_data(data: dict) -> dict:
     if normalized.get("case_number"):
         normalized["case_number"] = clean_case_number(normalized["case_number"])
     normalized, _ = normalize_debtor_name_fields(normalized)
+    for key in ("court_address", "creditor_address", "debtor_address"):
+        if normalized.get(key):
+            normalized[key] = normalize_address_text(normalized[key])
     if normalized.get("court_name"):
         court_forms = normalize_court_forms(normalized["court_name"])
         normalized["court_name"] = court_forms["court_name"]
@@ -247,11 +265,16 @@ def normalize_order_data(data: dict) -> dict:
     for key in ("debt_amount", "state_duty", "total_amount"):
         if normalized.get(key):
             normalized[key] = clean_money_text(normalized[key])
-    if normalized.get("debt_amount") and normalized.get("state_duty") and not normalized.get("total_amount"):
-        debt = money_to_decimal(normalized["debt_amount"])
-        state_duty = money_to_decimal(normalized["state_duty"])
-        if debt is not None and state_duty is not None:
-            normalized["total_amount"] = format_money_rub_kop(debt + state_duty)
+    debt = money_to_decimal(normalized.get("debt_amount"))
+    state_duty = money_to_decimal(normalized.get("state_duty"))
+    total = money_to_decimal(normalized.get("total_amount"))
+    if debt is not None and state_duty is not None and not normalized.get("total_amount"):
+        normalized["total_amount"] = format_money_rub_kop(debt + state_duty)
+        total = money_to_decimal(normalized.get("total_amount"))
+    if debt is not None and total is not None and not normalized.get("state_duty"):
+        inferred_state = (total - debt).quantize(Decimal("0.01"))
+        if inferred_state > 0:
+            normalized["state_duty"] = format_money_rub_kop(inferred_state)
     for key in ("order_date",):
         parsed = parse_russian_date(normalized.get(key))
         if parsed:
@@ -306,6 +329,10 @@ def is_deadline_missed(deadline: date | None, today: date | None = None) -> bool
 def missing_order_fields(data: dict, received_date: date | None = None) -> list[str]:
     normalized = normalize_order_data(data)
     missing = [key for key in REQUIRED_FIELDS if not normalized.get(key)]
+    if not (normalized.get("case_number") or normalized.get("uid")):
+        missing.append("case_number_or_uid")
+    if not (normalized.get("state_duty") or normalized.get("total_amount")):
+        missing.append("state_duty_or_total_amount")
     if not received_date:
         missing.append("received_date")
     return missing

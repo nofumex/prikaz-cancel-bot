@@ -30,6 +30,34 @@ def test_total_amount_calculation():
     assert data["total_amount"] == "79 749 руб. 87 коп."
 
 
+def test_state_duty_can_be_inferred_from_total_amount():
+    data = normalize_order_data(
+        {
+            "debt_amount": "78472 руб. 87 коп.",
+            "total_amount": "79 749 руб. 87 коп.",
+        }
+    )
+    assert data["state_duty"] == "1 277 руб. 00 коп."
+
+
+def test_missing_order_fields_allow_optional_blank_fields():
+    from app.services.legal_data import missing_order_fields
+
+    missing = missing_order_fields(
+        {
+            "court_name": "судебный участок № 5",
+            "debtor_full_name": "Иванов Иван Иванович",
+            "creditor_name": "АО «Почта Банк»",
+            "order_date": "18.01.2021",
+            "debt_amount": "78 472 руб. 87 коп.",
+            "uid": "26MS0031-01-2021-000169-72",
+        },
+        date(2026, 6, 19),
+    )
+    assert "case_number_or_uid" not in missing
+    assert "state_duty_or_total_amount" in missing
+
+
 def test_deadline_received_19_06_2026():
     received = date(2026, 6, 19)
     deadline = legal_deadline_from_received(received)

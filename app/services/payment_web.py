@@ -5,28 +5,16 @@ import logging
 
 from aiohttp import web
 from aiogram import Bot
-from aiogram.types import FSInputFile
-
 from app.config import Settings
 from app.database import SessionLocal
-from app.enums import CaseStatus
-from app.services.amocrm import get_amocrm_service
+from app.services.crm_background import schedule_crm_sync
+from app.services.document_delivery import schedule_document_delivery
 from app.services.payments import mark_paid_by_label, verify_yoomoney_sign
 
 logger = logging.getLogger(__name__)
 
 
-async def _deliver(bot: Bot, case) -> None:
-    await bot.send_message(case.user.telegram_id, "Оплата подтверждена. Отправляю полный комплект документов.")
-    if case.full_doc_path:
-        await bot.send_document(case.user.telegram_id, FSInputFile(case.full_doc_path), caption="Полный вариант заявления.")
-    if case.full_pdf_path:
-        await bot.send_document(case.user.telegram_id, FSInputFile(case.full_pdf_path), caption="Полный PDF.")
-    if case.instruction_path:
-        await bot.send_document(case.user.telegram_id, FSInputFile(case.instruction_path), caption="Инструкция по отправке в суд.")
-
-
-async def run_payment_webhook(bot: Bot, settings: Settings) -> None:
+async def run_payment_webhook(bot: Bot | None, settings: Settings) -> None:
     async def yoomoney(request: web.Request) -> web.Response:
         form = {key: value for key, value in (await request.post()).items()}
         if not verify_yoomoney_sign(form, settings.yoomoney_notification_secret):
@@ -38,13 +26,8 @@ async def run_payment_webhook(bot: Bot, settings: Settings) -> None:
             case = await mark_paid_by_label(session, label, form)
             if case:
                 await session.refresh(case, ["user"])
-                if case.user.platform == "telegram" and case.user.telegram_id:
-                    await _deliver(bot, case)
-                    case.status = CaseStatus.DELIVERED.value
-                    crm = get_amocrm_service(settings)
-                    await crm.sync_case_event(session, case, case.user, "payment_paid", {"payment": label, "note": "Оплата подтверждена webhook"})
-                    await crm.sync_case_event(session, case, case.user, "documents_delivered", {"note": "Полный комплект выдан после webhook оплаты"})
-                    await session.commit()
+                schedule_crm_sync(settings, case.id, case.user.id, "payment_paid", {"payment": label, "note": "Оплата подтверждена webhook"})
+                schedule_document_delivery(case.id, settings, telegram_bot=bot)
         return web.Response(text="OK")
 
     app = web.Application()
@@ -59,3 +42,4 @@ async def run_payment_webhook(bot: Bot, settings: Settings) -> None:
             await asyncio.sleep(3600)
     finally:
         await runner.cleanup()
+

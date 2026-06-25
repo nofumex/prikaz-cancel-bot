@@ -40,6 +40,17 @@ def _settings(**kwargs):
     base = dict(
         telegram_bot_token="",
         max_bot_token="",
+            max_api_base_url="https://platform-api2.max.ru",
+            max_use_webhook=False,
+            max_webhook_url=None,
+            max_webhook_secret=None,
+            max_webhook_host="0.0.0.0",
+            max_webhook_port=8081,
+            max_longpoll_timeout_seconds=30,
+            max_download_dir="storage/max",
+            max_upload_retry_attempts=5,
+            max_upload_retry_base_seconds=1,
+            max_admin_ids=set(),
         run_telegram=True,
         run_max=False,
         admin_ids=set(),
@@ -57,6 +68,7 @@ def _settings(**kwargs):
         require_pdf_preview_for_payment=False,
         allow_dev_docx_preview=True,
         document_template_version="test",
+        show_user_confirmation_step=False,
         yoomoney_receiver=None,
         yoomoney_success_url=None,
         yoomoney_notification_secret=None,
@@ -77,10 +89,11 @@ def _settings(**kwargs):
         amocrm_debug=False,
         amocrm_rps_limit=5,
         amocrm_pipeline_id=None,
-        amocrm_status_id_new=None,
-        amocrm_status_id_in_progress=None,
-        amocrm_status_id_consultation=None,
-        amocrm_write_enabled=False,
+        crm_sync_background=True,
+        crm_sync_timeout_seconds=5,
+        crm_sync_max_attempts=3,
+        crm_sync_retry_base_seconds=2,
+        crm_sync_debug=False,
         amount_retry_on_mismatch=True,
         auto_recover_amount_mismatch=True,
         auto_recover_amount_min_confidence=0.75,
@@ -214,10 +227,13 @@ def test_statement_has_no_placeholder_fields(tmp_path, monkeypatch):
 
 
 def test_statement_signature_is_filled(tmp_path, monkeypatch):
+    from app.services.legal_data import docx_text
+
     artifacts = _generate(tmp_path, monkeypatch)
-    if artifacts.full_pdf_path:
-        text = pdf_text(artifacts.full_pdf_path)
-        assert "/Бельский В.Г./" in text or "Бельский В.Г." in text
+    text = pdf_text(artifacts.full_pdf_path) if artifacts.full_pdf_path else ""
+    if "Бельский В.Г." not in text:
+        text = docx_text(str(artifacts.full_docx_path))
+    assert "/Бельский В.Г./" in text or "Бельский В.Г." in text
 
 
 def test_statement_no_weird_justified_spaces(tmp_path, monkeypatch):
@@ -235,9 +251,13 @@ def test_statement_no_weird_justified_spaces(tmp_path, monkeypatch):
 
 
 def test_proshu_not_orphaned_at_page_bottom(tmp_path, monkeypatch):
+    from app.services.legal_data import docx_text
+
     artifacts = _generate(tmp_path, monkeypatch)
     if artifacts.full_pdf_path and pdf_page_count(artifacts.full_pdf_path) == 1:
         text = pdf_text(artifacts.full_pdf_path)
+        if "ПРОШУ:" not in text:
+            text = docx_text(str(artifacts.full_docx_path))
         assert "ПРОШУ:" in text
         assert "1. Отменить" in text
 

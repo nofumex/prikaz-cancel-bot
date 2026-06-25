@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -12,9 +14,18 @@ logger = logging.getLogger(__name__)
 
 
 class MaxBotClient:
-    def __init__(self, token: str, base_url: str = "https://botapi.max.ru") -> None:
+    def __init__(
+        self,
+        token: str,
+        base_url: str = "https://platform-api2.max.ru",
+        *,
+        upload_retry_attempts: int = 5,
+        upload_retry_base_seconds: int = 1,
+    ) -> None:
         self.token = token
         self.base_url = base_url.rstrip("/")
+        self.upload_retry_attempts = max(1, upload_retry_attempts)
+        self.upload_retry_base_seconds = max(0, upload_retry_base_seconds)
         self._session: aiohttp.ClientSession | None = None
 
     async def __aenter__(self) -> "MaxBotClient":
@@ -35,38 +46,130 @@ class MaxBotClient:
             await self._session.close()
 
     async def request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        async with self.session.request(method, self.base_url + path, **kwargs) as response:
-            payload = await response.json(content_type=None)
-            if response.status >= 400:
-                raise RuntimeError(f"MAX API error {response.status}: {payload}")
-            return payload
+        url = path if path.startswith("http") else self.base_url + path
+        retries = 3
+        last_payload: Any = None
+        for attempt in range(retries):
+            async with self.session.request(method, url, **kwargs) as response:
+                payload = await response.json(content_type=None)
+                last_payload = payload
+                if response.status in {429, 503} and attempt + 1 < retries:
+                    await asyncio.sleep(1.5 ** attempt)
+                    continue
+                if response.status >= 400:
+                    raise RuntimeError(f"MAX API error {response.status}: {payload}")
+                return payload
+        raise RuntimeError(f"MAX API error: {last_payload}")
 
-    async def get_updates(self, marker: int | None = None, timeout: int = 30, limit: int = 100) -> dict[str, Any]:
-        params = {"timeout": timeout, "limit": limit, "types": "message_created,message_callback,bot_started"}
+    async def get_me(self) -> dict[str, Any]:
+        return await self.request("GET", "/me")
+
+    async def get_updates(
+        self,
+        marker: int | None = None,
+        timeout: int = 30,
+        limit: int = 100,
+        types: list[str] | None = None,
+    ) -> dict[str, Any]:
+        update_types = types or ["message_created", "message_callback", "bot_started"]
+        params: dict[str, Any] = {"timeout": timeout, "limit": limit, "types": ",".join(update_types)}
         if marker is not None:
             params["marker"] = marker
         return await self.request("GET", "/updates", params=params, timeout=timeout + 10)
 
-    async def send_message(self, chat_id: str | int, text: str, keyboard: MaxKeyboard | None = None, attachments: list[dict] | None = None) -> None:
+    async def get_message(self, message_id: str) -> dict[str, Any]:
+        return await self.request("GET", f"/messages/{message_id}")
+
+    async def send_message(
+        self,
+        chat_id: str | int | None = None,
+        user_id: str | int | None = None,
+        text: str = "",
+        keyboard: MaxKeyboard | None = None,
+        attachments: list[dict] | None = None,
+    ) -> dict[str, Any]:
+        if chat_id is None and user_id is None:
+            raise ValueError("chat_id or user_id is required")
         body: dict[str, Any] = {"text": text, "format": "html"}
         all_attachments = (attachments or []) + (to_attachments(keyboard) or [])
         if all_attachments:
             body["attachments"] = all_attachments
-        await self.request("POST", "/messages", params={"chat_id": chat_id}, json=body)
+        params: dict[str, Any] = {"chat_id": chat_id} if chat_id is not None else {"user_id": user_id}
+        return await self.request("POST", "/messages", params=params, json=body)
 
-    async def answer_callback(self, callback_id: str | None) -> None:
+    async def answer_callback(self, callback_id: str | None, text: str | None = None) -> None:
         if not callback_id:
             return
+        body = {"notification": text or " "}
         try:
-            await self.request("POST", f"/messages/callback/{callback_id}", json={"callback_id": callback_id})
+            await self.request("POST", "/answers", params={"callback_id": callback_id}, json=body)
         except Exception:
-            logger.debug("MAX callback answer failed", exc_info=True)
+            logger.exception("Failed to answer MAX callback")
 
-    async def safe_send_message(self, *args, **kwargs) -> bool:
-        try:
-            await self.send_message(*args, **kwargs)
-            return True
-        except Exception:
-            logger.exception("MAX send failed")
-            await asyncio.sleep(0.2)
-            return False
+    async def get_upload_url(self, upload_type: str) -> dict[str, Any]:
+        if upload_type == "photo":
+            upload_type = "image"
+        return await self.request("POST", "/uploads", params={"type": upload_type})
+
+    async def upload_file(self, path: str | Path, upload_type: str) -> dict[str, Any]:
+        path = Path(path)
+        upload = await self.get_upload_url(upload_type)
+        upload_url = upload.get("url")
+        if not upload_url:
+            raise RuntimeError("MAX upload URL is empty")
+        form = aiohttp.FormData()
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        form.add_field("data", path.read_bytes(), filename=path.name, content_type=content_type)
+        async with self.session.post(upload_url, data=form) as response:
+            payload = await response.json(content_type=None)
+            if response.status >= 400:
+                raise RuntimeError(f"MAX upload error {response.status}: {payload}")
+        if upload.get("token") and "token" not in payload:
+            payload["token"] = upload["token"]
+        return payload
+
+    async def _send_uploaded(self, chat_id: str | int, path: str | Path, upload_type: str, caption: str | None = None) -> dict[str, Any]:
+        uploaded = await self.upload_file(path, upload_type)
+        attachment = {"type": upload_type, "payload": uploaded}
+        last_error: Exception | None = None
+        for attempt in range(self.upload_retry_attempts):
+            try:
+                return await self.send_message(chat_id=chat_id, text=caption or "", attachments=[attachment])
+            except RuntimeError as exc:
+                last_error = exc
+                if "attachment.not.ready" not in str(exc):
+                    raise
+                await asyncio.sleep(self.upload_retry_base_seconds * (attempt + 1))
+        if last_error:
+            raise last_error
+        raise RuntimeError("MAX send uploaded file failed")
+
+    async def send_file(self, chat_id: str | int, path: str | Path, caption: str | None = None) -> dict[str, Any]:
+        return await self._send_uploaded(chat_id, path, "file", caption)
+
+    async def send_image(self, chat_id: str | int, path: str | Path, caption: str | None = None) -> dict[str, Any]:
+        return await self._send_uploaded(chat_id, path, "image", caption)
+
+    async def send_document(self, chat_id: str | int, file_path: str, caption: str | None = None) -> dict[str, Any]:
+        suffix = Path(file_path).suffix.lower()
+        if suffix in {".jpg", ".jpeg", ".png", ".gif", ".tiff", ".bmp", ".heic", ".webp"}:
+            return await self.send_image(chat_id, file_path, caption)
+        return await self.send_file(chat_id, file_path, caption)
+
+    async def download_attachment(self, attachment: dict, destination: Path) -> Path:
+        payload = attachment.get("payload") or {}
+        url = payload.get("url") or payload.get("download_url")
+        if not url:
+            raise RuntimeError("MAX attachment has no downloadable URL")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        async with self.session.get(url) as response:
+            if response.status >= 400:
+                raise RuntimeError(f"MAX download error {response.status}")
+            destination.write_bytes(await response.read())
+        return destination
+
+    async def download_file(self, url: str) -> bytes:
+        async with self.session.get(url) as response:
+            if response.status >= 400:
+                raise RuntimeError(f"MAX download error {response.status}")
+            return await response.read()
