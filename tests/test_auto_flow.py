@@ -303,3 +303,129 @@ async def test_max_case_new_reuses_empty_waiting_case(monkeypatch):
 
     assert create.await_count == 0
     assert client.send_message.await_count == 1
+
+def test_max_parse_update_accepts_photo_attachment_variants():
+    from app.adapters.max.mapper import parse_update
+
+    event = parse_update(
+        {
+            "update_type": "message_created",
+            "message": {
+                "sender": {"user_id": "42", "username": "client"},
+                "recipient": {"chat_id": "chat-1"},
+                "body": {
+                    "attachments": [
+                        {
+                            "type": "photo",
+                            "payload": {
+                                "photos": [
+                                    {"url": "https://example.test/small.jpg"},
+                                    {"url": "https://example.test/large.jpg"},
+                                ],
+                                "token": "photo-token",
+                            },
+                        }
+                    ]
+                },
+            },
+        }
+    )
+
+    assert event is not None
+    assert event.photo_url == "https://example.test/large.jpg"
+    assert event.photo_token == "photo-token"
+
+
+@pytest.mark.asyncio
+async def test_max_photo_token_counts_as_attachment(monkeypatch):
+    from app.adapters.max import bot as max_bot
+    from app.adapters.max.mapper import IncomingEvent
+
+    settings = _make_settings(amocrm_enabled=False)
+    session = object()
+
+    class SessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    client = SimpleNamespace(answer_callback=AsyncMock(), send_message=AsyncMock())
+    user = User(id=1, platform="max", platform_user_id="42")
+    event = IncomingEvent(platform_user_id="42", chat_id="chat-1", photo_token="token-only")
+    handle_order = AsyncMock()
+
+    monkeypatch.setattr(max_bot, "SessionLocal", lambda: SessionContext())
+    monkeypatch.setattr(max_bot, "get_or_create_platform_user", AsyncMock(return_value=user))
+    monkeypatch.setattr(max_bot, "_state", AsyncMock(return_value=max_bot.STATE_ORDER_PHOTO))
+    monkeypatch.setattr(max_bot, "_handle_order_image", handle_order)
+
+    await max_bot.handle_update(client, event, settings)
+
+    assert handle_order.await_count == 1
+    assert client.send_message.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_max_active_order_state_does_not_fall_back_to_main_menu(monkeypatch):
+    from app.adapters.max import bot as max_bot
+    from app.adapters.max.mapper import IncomingEvent
+
+    settings = _make_settings(amocrm_enabled=False)
+    session = object()
+
+    class SessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    client = SimpleNamespace(answer_callback=AsyncMock(), send_message=AsyncMock())
+    user = User(id=1, platform="max", platform_user_id="42")
+    event = IncomingEvent(platform_user_id="42", chat_id="chat-1")
+
+    monkeypatch.setattr(max_bot, "SessionLocal", lambda: SessionContext())
+    monkeypatch.setattr(max_bot, "get_or_create_platform_user", AsyncMock(return_value=user))
+    monkeypatch.setattr(max_bot, "_state", AsyncMock(return_value=max_bot.STATE_ORDER_PHOTO))
+
+    await max_bot.handle_update(client, event, settings)
+
+    assert client.send_message.await_count == 1
+    text = client.send_message.await_args.kwargs["text"]
+    assert "Нужно фото судебного приказа" in text
+    assert settings.company_name not in text
+
+@pytest.mark.asyncio
+async def test_max_open_waiting_case_blocks_unknown_command_main_menu(monkeypatch):
+    from app.adapters.max import bot as max_bot
+    from app.adapters.max.mapper import IncomingEvent
+
+    settings = _make_settings(amocrm_enabled=False)
+    session = object()
+
+    class SessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    client = SimpleNamespace(answer_callback=AsyncMock(), send_message=AsyncMock())
+    user = User(id=1, platform="max", platform_user_id="42")
+    case = _case(id=80, platform="max", platform_user_id="42", status=CaseStatus.WAITING_ORDER_PHOTO.value, order_photo_path=None)
+    event = IncomingEvent(platform_user_id="42", chat_id="chat-1", text="/unknown")
+
+    monkeypatch.setattr(max_bot, "SessionLocal", lambda: SessionContext())
+    monkeypatch.setattr(max_bot, "get_or_create_platform_user", AsyncMock(return_value=user))
+    monkeypatch.setattr(max_bot, "_state", AsyncMock(return_value=None))
+    monkeypatch.setattr(max_bot, "latest_open_case", AsyncMock(return_value=case))
+    monkeypatch.setattr(max_bot, "_set_state", AsyncMock())
+
+    await max_bot.handle_update(client, event, settings)
+
+    assert client.send_message.await_count == 1
+    text = client.send_message.await_args.kwargs["text"]
+    assert "Нужно фото судебного приказа" in text
+    assert settings.company_name not in text

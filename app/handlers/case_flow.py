@@ -681,7 +681,6 @@ async def _generate_documents_flow(
         )
         return False
 
-    await message.answer("📄 Готовлю полный и скрытый варианты заявления.")
     try:
         full_docx, full_pdf, preview_pdf, preview_docx, instruction_path = create_case_documents(
             case,

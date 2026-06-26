@@ -141,7 +141,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             await client.answer_callback(event.callback_id)
         data = event.callback_data
         current_state = await _state(session, event)
-        has_attachment = bool(event.photo_url or event.document_url)
+        has_attachment = bool(event.photo_url or event.document_url or event.photo_token or event.document_token)
         is_date_text = bool(event.text and parse_russian_date(event.text))
         if not current_state and (has_attachment or is_date_text):
             current_state = await _recover_state_for_input(session, event, user, has_attachment=has_attachment, is_date_text=is_date_text)
@@ -256,7 +256,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             await _send(client, event, "Документы отправлены.", keyboards.case_menu())
             return
 
-        if current_state in {STATE_ORDER_PHOTO, STATE_ORDER_REPHOTO} and (event.photo_url or event.document_url):
+        if current_state in {STATE_ORDER_PHOTO, STATE_ORDER_REPHOTO} and has_attachment:
             await _handle_order_image(client, event, session, settings, user)
             return
         if current_state in {STATE_ORDER_PHOTO, STATE_ORDER_REPHOTO} and event.text:
@@ -267,7 +267,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 keyboards.order_rephoto_menu(),
             )
             return
-        if current_state == STATE_ENVELOPE and (event.photo_url or event.document_url):
+        if current_state == STATE_ENVELOPE and has_attachment:
             await _handle_envelope_image(client, event, session, settings, user)
             return
         if current_state in {STATE_ENVELOPE, STATE_MANUAL_DATE} and event.text:
@@ -276,6 +276,28 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
         if current_state == STATE_FIELD_VALUE and event.text:
             await _handle_field_value(client, event, session, user, event.text)
             return
+        if current_state in {STATE_ORDER_PHOTO, STATE_ORDER_REPHOTO}:
+            await _send(client, event, "Нужно фото судебного приказа. Отправьте изображение целиком или файл-картинку без сжатия.", keyboards.order_rephoto_menu())
+            return
+        if current_state == STATE_ENVELOPE:
+            await _send(client, event, "Отправьте фото конверта со штампами или напишите дату получения в формате <code>ДД.ММ.ГГГГ</code>.", keyboards.envelope_choice())
+            return
+        if current_state == STATE_MANUAL_DATE:
+            await _send(client, event, "Напишите дату получения копии приказа в формате <code>ДД.ММ.ГГГГ</code>.", keyboards.envelope_choice())
+            return
+        if current_state == STATE_FIELD_VALUE:
+            await _send(client, event, "Введите новое значение текстом.")
+            return
+
+        case = await latest_open_case(session, user.id)
+        if case and case.status in {CaseStatus.WAITING_ORDER_PHOTO.value, CaseStatus.WAITING_ORDER_REPHOTO.value}:
+            await _set_state(session, event, STATE_ORDER_REPHOTO if case.status == CaseStatus.WAITING_ORDER_REPHOTO.value else STATE_ORDER_PHOTO, {"case_id": case.id})
+            await _send(client, event, "Нужно фото судебного приказа. Отправьте изображение целиком или файл-картинку без сжатия.", keyboards.order_rephoto_menu())
+            return
+        if case and case.status == CaseStatus.WAITING_ENVELOPE.value:
+            await _set_state(session, event, STATE_ENVELOPE, {"case_id": case.id})
+            await _send(client, event, "Отправьте фото конверта со штампами или напишите дату получения в формате <code>ДД.ММ.ГГГГ</code>.", keyboards.envelope_choice())
+            return
 
         await _send(client, event, welcome_text(settings.company_name), keyboards.main_menu())
 
@@ -283,7 +305,12 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
 async def _handle_order_image(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User) -> None:
     data = await _state_data(session, event)
     case = await session.get(Case, data["case_id"])
-    path = await _download_event_image(client, event, case.id, "order", settings)
+    try:
+        path = await _download_event_image(client, event, case.id, "order", settings)
+    except RuntimeError:
+        logger.exception("MAX order image has no downloadable URL")
+        await _send(client, event, "MAX не передал файл для скачивания. Отправьте фото приказа ещё раз как изображение или файл без сжатия.", keyboards.order_rephoto_menu())
+        return
     await save_photo_path(session, case, "order", path)
     await _set_state(session, event, STATE_ENVELOPE, {"case_id": case.id})
     await _send(client, event, "✅ Приказ принят. Теперь отправьте конверт со штампами или напишите дату получения.", keyboards.envelope_choice())
@@ -293,7 +320,12 @@ async def _handle_order_image(client: MaxBotClient, event: IncomingEvent, sessio
 async def _handle_envelope_image(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User) -> None:
     data = await _state_data(session, event)
     case = await session.get(Case, data["case_id"])
-    path = await _download_event_image(client, event, case.id, "envelope", settings)
+    try:
+        path = await _download_event_image(client, event, case.id, "envelope", settings)
+    except RuntimeError:
+        logger.exception("MAX envelope image has no downloadable URL")
+        await _send(client, event, "MAX не передал файл для скачивания. Отправьте фото конверта ещё раз как изображение или файл без сжатия.", keyboards.envelope_choice())
+        return
     await save_photo_path(session, case, "envelope", path)
     await _send(client, event, "✅ Конверт принят. Считываю дату и приказ, это может занять минуту.")
     try:
@@ -407,7 +439,6 @@ async def _generate_documents(client: MaxBotClient, event: IncomingEvent, sessio
         await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})
         await _send_order_rephoto_prompt(client, event, validation.missing, attempts=case.order_rephoto_attempts)
         return
-    await _send(client, event, "📄 Готовлю документы и preview PDF.")
     try:
         full_docx, full_pdf, preview_pdf, preview_docx, instruction = create_case_documents(case, user, settings)
     except Exception as exc:
