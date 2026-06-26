@@ -435,7 +435,7 @@ async def _generate_documents(client: MaxBotClient, event: IncomingEvent, sessio
     if not payments_enabled():
         if preview_file:
             await client.send_file(event.chat_id, preview_file, caption="Предпросмотр заявления.")
-        await _send(client, event, "🧪 Оплата выключена. Отправляю полный комплект.")
+        await _send(client, event, "🧪 Оплата выключена. Отправляю полный DOCX.")
         await deliver_documents_to_case_platform(case.id, settings)
         return
     if settings.require_pdf_preview_for_payment and not preview_pdf:
@@ -469,7 +469,8 @@ async def run_max_bot(settings: Settings) -> None:
                         await handle_update(client, event, settings)
             except asyncio.CancelledError:
                 raise
+            except TimeoutError:
+                logger.info("MAX polling timeout, retrying")
             except Exception:
                 logger.exception("MAX polling error")
                 await asyncio.sleep(3)
-

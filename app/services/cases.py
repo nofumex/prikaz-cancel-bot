@@ -4,11 +4,11 @@ import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.enums import CaseStatus
-from app.models import Case, User
+from app.enums import CaseStatus, PaymentStatus
+from app.models import Case, Payment, User
 from app.services.legal_data import legal_deadline_from_received
 
 
@@ -74,15 +74,26 @@ def new_payment_label(case_id: int) -> str:
 
 
 async def due_unpaid_cases(session: AsyncSession) -> list[Case]:
-    cutoff = datetime.utcnow() - timedelta(hours=23)
+    now = datetime.utcnow()
+    reminder_gap_cutoff = now - timedelta(hours=23)
+    due_24h = now - timedelta(hours=24)
+    due_48h = now - timedelta(hours=48)
+    due_72h = now - timedelta(hours=72)
+    reminder_gap_ok = or_(Case.last_reminder_at.is_(None), Case.last_reminder_at <= reminder_gap_cutoff)
     result = await session.execute(
         select(Case)
+        .join(Payment, Payment.case_id == Case.id)
         .where(
             Case.status == CaseStatus.PAYMENT_PENDING.value,
+            Payment.status == PaymentStatus.PENDING.value,
             Case.reminders_sent < 3,
-            (Case.last_reminder_at.is_(None)) | (Case.last_reminder_at <= cutoff),
+            or_(
+                and_(Case.reminders_sent == 0, Payment.created_at <= due_24h),
+                and_(Case.reminders_sent == 1, Payment.created_at <= due_48h, reminder_gap_ok),
+                and_(Case.reminders_sent == 2, Payment.created_at <= due_72h, reminder_gap_ok),
+            ),
         )
         .order_by(Case.created_at.asc())
         .limit(50)
     )
-    return list(result.scalars().all())
+    return list(result.scalars().unique().all())

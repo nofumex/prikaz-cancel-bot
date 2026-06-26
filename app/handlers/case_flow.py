@@ -18,6 +18,7 @@ from app.keyboards.common import case_menu, confirm_extraction, debtor_name_fix_
 from app.models import Case, User
 from app.services.amocrm import get_amocrm_service
 from app.services.crm_background import schedule_crm_sync
+from app.services.document_delivery import delivery_instruction_text
 from app.services.cases import create_case, latest_case, latest_open_case, save_photo_path, set_received_date
 from app.services.documents import create_case_documents, extraction_preview
 from app.services.app_settings import payments_enabled
@@ -718,15 +719,13 @@ async def _generate_documents_flow(
             "note": "Preview сформирован. Document QA: passed",
             "files": [
                 {"path": case.full_doc_path or "", "caption": "Полный DOCX"},
-                {"path": case.full_pdf_path or "", "caption": "Полный PDF"},
-                {"path": case.preview_pdf_path or case.preview_doc_path or "", "caption": "Preview"},
-                {"path": case.instruction_path or "", "caption": "Инструкция"},
+                {"path": case.preview_pdf_path or case.preview_doc_path or "", "caption": "Preview PDF"},
             ],
         },
     )
     if payments_enabled():
         if not full_pdf:
-            await message.answer("⚠️ Не удалось собрать полный PDF. Для оплаты нужен LibreOffice/soffice и PyMuPDF.")
+            await message.answer("⚠️ Не удалось собрать preview PDF. Для оплаты нужен LibreOffice/soffice и PyMuPDF.")
             case.status = CaseStatus.NEEDS_REVIEW.value
             await session.commit()
             return False
@@ -744,7 +743,7 @@ async def _generate_documents_flow(
                 FSInputFile(preview_file),
                 caption="Предпросмотр заявления." if preview_pdf else "Предпросмотр заявления (dev-only DOCX).",
             )
-        await message.answer("🧪 Режим оплаты выключен. Сразу отправляю полный комплект для теста.")
+        await message.answer("🧪 Режим оплаты выключен. Сразу отправляю полный DOCX для теста.")
         await deliver_full_documents(message, session, case, settings, current_user)
         return True
     payment = await ensure_payment(session, case, settings)
@@ -840,12 +839,9 @@ async def payment_check(callback: CallbackQuery, session: AsyncSession, settings
 
 
 async def deliver_full_documents(message: Message, session: AsyncSession, case: Case, settings: Settings | None = None, user: User | None = None) -> None:
-    if case.full_doc_path:
-        await message.answer_document(FSInputFile(case.full_doc_path), caption="Полный DOCX.")
-    if case.full_pdf_path:
-        await message.answer_document(FSInputFile(case.full_pdf_path), caption="Полный PDF.")
-    if case.instruction_path:
-        await message.answer_document(FSInputFile(case.instruction_path), caption="Инструкция по отправке в суд.")
+    if not case.full_doc_path or not Path(case.full_doc_path).exists():
+        raise RuntimeError("Full DOCX file not found")
+    await message.answer_document(FSInputFile(case.full_doc_path), caption=delivery_instruction_text(case))
     case.status = CaseStatus.DELIVERED.value
     case.delivered_at = datetime.utcnow()
     await session.commit()
@@ -856,9 +852,5 @@ async def deliver_full_documents(message: Message, session: AsyncSession, case: 
             case.id,
             user.id,
             "documents_delivered",
-            {"note": "Клиенту выданы полный DOCX, полный PDF и инструкция"},
+            {"note": "Клиенту выдан полный DOCX и инструкция текстом"},
         )
-    await message.answer("Готово. Документы выданы. Не забудьте поставить подпись перед отправкой.", reply_markup=case_menu())
-
-
-

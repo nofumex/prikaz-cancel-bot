@@ -48,16 +48,30 @@ async def deliver_documents_to_case_platform(case_id: int, settings: Settings, t
         case.delivered_at = datetime.utcnow()
         await session.commit()
         schedule_crm_sync(settings, case.id, case.user.id, "payment_paid", {"note": "Оплата подтверждена"})
-        schedule_crm_sync(settings, case.id, case.user.id, "documents_delivered", {"note": "Клиенту выдан полный комплект документов"})
+        schedule_crm_sync(settings, case.id, case.user.id, "documents_delivered", {"note": "Клиенту выдан полный DOCX и инструкция текстом"})
+
+
+def delivery_instruction_text(case: Case) -> str:
+    deadline = case.deadline_date.strftime("%d.%m.%Y") if case.deadline_date else None
+    lines = [
+        "Оплата подтверждена. Полный вариант заявления DOCX во вложении.",
+        "",
+        "Инструкция по подаче:",
+        "1. Откройте DOCX и проверьте свои данные.",
+        "2. Распечатайте заявление.",
+        "3. Поставьте дату и подпись от руки.",
+        "4. Подайте заявление мировому судье, который вынес приказ, или отправьте заказным письмом.",
+    ]
+    if deadline:
+        lines.append(f"Срок подачи: до {deadline}.")
+    return "\n".join(lines)
 
 
 async def _deliver_to_telegram(case: Case, bot: Bot) -> None:
     if not case.user.telegram_id:
         raise RuntimeError("Telegram user id is empty")
-    await bot.send_message(case.user.telegram_id, "Оплата подтверждена. Отправляю полный комплект документов.")
-    for path, caption in _delivery_files(case):
-        await bot.send_document(case.user.telegram_id, FSInputFile(path), caption=caption)
-    await bot.send_message(case.user.telegram_id, "Готово. Не забудьте поставить подпись перед отправкой.")
+    path = _full_docx_file(case)
+    await bot.send_document(case.user.telegram_id, FSInputFile(path), caption=delivery_instruction_text(case))
 
 
 async def _deliver_to_max(case: Case, settings: Settings) -> None:
@@ -68,20 +82,10 @@ async def _deliver_to_max(case: Case, settings: Settings) -> None:
         upload_retry_attempts=settings.max_upload_retry_attempts,
         upload_retry_base_seconds=settings.max_upload_retry_base_seconds,
     ) as client:
-        await client.send_message(chat_id=chat_id, text="Оплата подтверждена. Отправляю полный комплект документов.")
-        for path, caption in _delivery_files(case):
-            await client.send_file(chat_id, path, caption=caption)
-        await client.send_message(chat_id=chat_id, text="Готово. Не забудьте поставить подпись перед отправкой.")
+        await client.send_file(chat_id, _full_docx_file(case), caption=delivery_instruction_text(case))
 
 
-def _delivery_files(case: Case) -> list[tuple[str, str]]:
-    files: list[tuple[str, str]] = []
+def _full_docx_file(case: Case) -> str:
     if case.full_doc_path and Path(case.full_doc_path).exists():
-        files.append((case.full_doc_path, "Полный DOCX."))
-    if case.full_pdf_path and Path(case.full_pdf_path).exists():
-        files.append((case.full_pdf_path, "Полный PDF."))
-    if case.instruction_path and Path(case.instruction_path).exists():
-        files.append((case.instruction_path, "Инструкция по отправке в суд."))
-    if not files:
-        raise RuntimeError("No delivery files found")
-    return files
+        return case.full_doc_path
+    raise RuntimeError("Full DOCX file not found")

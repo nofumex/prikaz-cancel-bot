@@ -18,6 +18,12 @@ from app.texts import deadline_warning
 
 logger = logging.getLogger(__name__)
 
+REMINDER_CRM_NOTES = {
+    1: "Повторная отправка оплаты через 24 часа",
+    2: "Повторная отправка оплаты через двое суток",
+    3: "Повторная отправка оплаты через трое суток",
+}
+
 
 async def run_payment_reminders(bot: Bot | None = None) -> None:
     settings = get_settings()
@@ -42,9 +48,9 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
                         continue
                     case.reminders_sent = reminder_no
                     case.last_reminder_at = datetime.utcnow()
-                    schedule_crm_sync(settings, case.id, case.user.id, "reminder_sent", {"note": f"Напоминание {reminder_no}/3"})
+                    schedule_crm_sync(settings, case.id, case.user.id, "reminder_sent", {"note": REMINDER_CRM_NOTES.get(reminder_no, "Повторная отправка оплаты")})
                     if reminder_no >= 3:
-                        schedule_crm_sync(settings, case.id, case.user.id, "payment_abandoned", {"note": "Пользователь не оплатил после 3 напоминаний"})
+                        schedule_crm_sync(settings, case.id, case.user.id, "payment_abandoned", {"note": "Пользователь не оплатил через трое суток после preview"})
                 await session.commit()
         except asyncio.CancelledError:
             raise
@@ -62,4 +68,3 @@ async def _send_max_reminder(settings, case, text: str) -> None:
         upload_retry_base_seconds=settings.max_upload_retry_base_seconds,
     ) as client:
         await client.send_message(chat_id=chat_id, text=text, keyboard=max_keyboards.case_menu(can_pay=True, payment_url=case.payment_url))
-
