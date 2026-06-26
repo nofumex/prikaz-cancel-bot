@@ -312,6 +312,16 @@ class AmoCrmService:
             return f"Судебный приказ #{case.id} — @{username.lstrip('@')}"
         return f"Судебный приказ #{case.id} — {user.platform} ID {user.platform_user_id}"
 
+
+    async def find_lead_by_name(self, name: str, pipeline_id: int) -> dict | None:
+        data, error = await self.request("GET", "/leads", params={"query": name, "limit": 50})
+        if error or not isinstance(data, dict):
+            return None
+        for lead in data.get("_embedded", {}).get("leads", []):
+            if lead.get("name") == name and int(lead.get("pipeline_id") or 0) == int(pipeline_id):
+                return lead
+        return None
+
     async def create_lead(self, case: Case, user: User, status_name: str) -> int | None:
         pipeline = await self.ensure_pipeline()
         if not pipeline:
@@ -319,10 +329,19 @@ class AmoCrmService:
         pipeline_id = int(pipeline["id"])
         statuses = await self.ensure_statuses(pipeline_id)
         status_id = statuses.get(status_name) or statuses.get("Подписался на бота")
+        lead_name = self._lead_name(case, user)
+        existing = await self.find_lead_by_name(lead_name, pipeline_id)
+        if existing:
+            lead_id = int(existing["id"])
+            case.amocrm_lead_id = lead_id
+            case.amo_lead_id = lead_id
+            case.amocrm_pipeline_id = pipeline_id
+            await self.update_lead_status(case, status_name)
+            return lead_id
         contact_id = await self.create_or_update_contact(user)
         payload = [
             {
-                "name": self._lead_name(case, user),
+                "name": lead_name,
                 "pipeline_id": pipeline_id,
                 "status_id": status_id,
                 "_embedded": {"contacts": [{"id": contact_id}]} if contact_id else {},

@@ -1,8 +1,8 @@
-case_id=49
-full_docx_path=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_49\statement_in_time_49.docx
-full_pdf_path=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_49\statement_in_time_49.pdf
-preview_pdf_path=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_49\preview_statement_in_time_49.pdf
-instruction_docx_path=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_49\instruction_49.docx
+case_id=53
+full_docx_path=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_53\statement_in_time_53.docx
+full_pdf_path=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_53\statement_in_time_53.pdf
+preview_pdf_path=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_53\preview_statement_in_time_53.pdf
+instruction_docx_path=C:\Users\egori\prikaz-cancel-bot\storage\documents\case_53\instruction_53.docx
 page_count=1
 font_name=Times New Roman
 body_font_size=13.0

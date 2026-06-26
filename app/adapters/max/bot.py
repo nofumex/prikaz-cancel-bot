@@ -109,6 +109,23 @@ async def _download_event_image(client: MaxBotClient, event: IncomingEvent, case
     return path
 
 
+
+async def _recover_state_for_input(session, event: IncomingEvent, user: User, *, has_attachment: bool, is_date_text: bool) -> str | None:
+    case = await latest_open_case(session, user.id)
+    if not case:
+        return None
+    if has_attachment and (case.status in {CaseStatus.WAITING_ORDER_PHOTO.value, CaseStatus.WAITING_ORDER_REPHOTO.value} or not case.order_photo_path):
+        state = STATE_ORDER_REPHOTO if case.status == CaseStatus.WAITING_ORDER_REPHOTO.value else STATE_ORDER_PHOTO
+        await _set_state(session, event, state, {"case_id": case.id})
+        logger.info("MAX state recovered as order image case_id=%s user_id=%s", case.id, user.id)
+        return state
+    if case.order_photo_path and not case.received_date and (has_attachment or is_date_text):
+        state = STATE_ENVELOPE if has_attachment else STATE_MANUAL_DATE
+        await _set_state(session, event, state, {"case_id": case.id})
+        logger.info("MAX state recovered as %s case_id=%s user_id=%s", state, case.id, user.id)
+        return state
+    return None
+
 async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Settings) -> None:
     async with SessionLocal() as session:
         user = await get_or_create_platform_user(
@@ -124,6 +141,10 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             await client.answer_callback(event.callback_id)
         data = event.callback_data
         current_state = await _state(session, event)
+        has_attachment = bool(event.photo_url or event.document_url)
+        is_date_text = bool(event.text and parse_russian_date(event.text))
+        if not current_state and (has_attachment or is_date_text):
+            current_state = await _recover_state_for_input(session, event, user, has_attachment=has_attachment, is_date_text=is_date_text)
 
         if data == "menu:main" or (data is None and event.text == "/start"):
             await _clear_state(session, event)
@@ -140,14 +161,21 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 await _send(client, event, case_summary(case), keyboards.case_menu(can_pay=case.status == CaseStatus.PAYMENT_PENDING.value, payment_url=case.payment_url))
             return
         if data == "case:new":
-            case = await create_case(session, user, chat_id=event.chat_id)
+            case = await latest_open_case(session, user.id)
+            is_empty_waiting_case = bool(
+                case
+                and case.status == CaseStatus.WAITING_ORDER_PHOTO.value
+                and not case.order_photo_path
+            )
+            if not is_empty_waiting_case:
+                case = await create_case(session, user, chat_id=event.chat_id)
+                schedule_crm_sync(settings, case.id, user.id, "user_started_bot", {"note": "MAX: пользователь начал оформление"})
             await _set_state(session, event, STATE_ORDER_PHOTO, {"case_id": case.id})
             await _send(
                 client,
                 event,
                 "📝 <b>Новое заявление</b>\n\nОтправьте фото судебного приказа целиком.\n\nПосле даты я сразу подготовлю preview PDF и ссылку на оплату.",
             )
-            schedule_crm_sync(settings, case.id, user.id, "user_started_bot", {"note": "MAX: пользователь начал оформление"})
             return
         if data == "case:rephoto_order":
             case = await latest_open_case(session, user.id)

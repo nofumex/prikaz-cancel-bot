@@ -193,3 +193,113 @@ async def test_max_manual_date_starts_order_processing(monkeypatch):
 
     assert case.received_date == date(2026, 6, 19)
     assert extract.await_count == 1
+
+@pytest.mark.asyncio
+async def test_max_lost_state_photo_recovers_latest_waiting_case(monkeypatch):
+    from app.adapters.max import bot as max_bot
+    from app.adapters.max.mapper import IncomingEvent
+
+    settings = _make_settings(amocrm_enabled=False)
+    session = object()
+
+    class SessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    client = SimpleNamespace(answer_callback=AsyncMock(), send_message=AsyncMock())
+    user = User(id=1, platform="max", platform_user_id="42")
+    case = _case(id=77, platform="max", platform_user_id="42", status=CaseStatus.WAITING_ORDER_PHOTO.value, order_photo_path=None)
+    event = IncomingEvent(platform_user_id="42", chat_id="chat-1", photo_url="https://example.test/order.jpg")
+    handle_order = AsyncMock()
+
+    monkeypatch.setattr(max_bot, "SessionLocal", lambda: SessionContext())
+    monkeypatch.setattr(max_bot, "get_or_create_platform_user", AsyncMock(return_value=user))
+    monkeypatch.setattr(max_bot, "_state", AsyncMock(return_value=None))
+    monkeypatch.setattr(max_bot, "latest_open_case", AsyncMock(return_value=case))
+    monkeypatch.setattr(max_bot, "_set_state", AsyncMock())
+    monkeypatch.setattr(max_bot, "_handle_order_image", handle_order)
+
+    await max_bot.handle_update(client, event, settings)
+
+    assert handle_order.await_count == 1
+    assert client.send_message.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_max_lost_state_manual_date_recovers_after_order_photo(monkeypatch):
+    from app.adapters.max import bot as max_bot
+    from app.adapters.max.mapper import IncomingEvent
+
+    settings = _make_settings(amocrm_enabled=False)
+    session = object()
+
+    class SessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    client = SimpleNamespace(answer_callback=AsyncMock(), send_message=AsyncMock())
+    user = User(id=1, platform="max", platform_user_id="42")
+    case = _case(
+        id=78,
+        platform="max",
+        platform_user_id="42",
+        status=CaseStatus.WAITING_ENVELOPE.value,
+        order_photo_path="storage/max/order.jpg",
+        received_date=None,
+        deadline_date=None,
+    )
+    event = IncomingEvent(platform_user_id="42", chat_id="chat-1", text="19.06.2026")
+    handle_date = AsyncMock()
+
+    monkeypatch.setattr(max_bot, "SessionLocal", lambda: SessionContext())
+    monkeypatch.setattr(max_bot, "get_or_create_platform_user", AsyncMock(return_value=user))
+    monkeypatch.setattr(max_bot, "_state", AsyncMock(return_value=None))
+    monkeypatch.setattr(max_bot, "latest_open_case", AsyncMock(return_value=case))
+    monkeypatch.setattr(max_bot, "_set_state", AsyncMock())
+    monkeypatch.setattr(max_bot, "_handle_manual_date", handle_date)
+
+    await max_bot.handle_update(client, event, settings)
+
+    assert handle_date.await_count == 1
+    assert client.send_message.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_max_case_new_reuses_empty_waiting_case(monkeypatch):
+    from app.adapters.max import bot as max_bot
+    from app.adapters.max.mapper import IncomingEvent
+
+    settings = _make_settings(amocrm_enabled=False)
+    session = object()
+
+    class SessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    client = SimpleNamespace(answer_callback=AsyncMock(), send_message=AsyncMock())
+    user = User(id=1, platform="max", platform_user_id="42")
+    case = _case(id=79, platform="max", platform_user_id="42", status=CaseStatus.WAITING_ORDER_PHOTO.value, order_photo_path=None)
+    event = IncomingEvent(platform_user_id="42", chat_id="chat-1", callback_data="case:new", callback_id="cb-1")
+    create = AsyncMock()
+
+    monkeypatch.setattr(max_bot, "SessionLocal", lambda: SessionContext())
+    monkeypatch.setattr(max_bot, "get_or_create_platform_user", AsyncMock(return_value=user))
+    monkeypatch.setattr(max_bot, "_state", AsyncMock(return_value=None))
+    monkeypatch.setattr(max_bot, "latest_open_case", AsyncMock(return_value=case))
+    monkeypatch.setattr(max_bot, "create_case", create)
+    monkeypatch.setattr(max_bot, "_set_state", AsyncMock())
+    monkeypatch.setattr(max_bot, "schedule_crm_sync", lambda *args, **kwargs: None)
+
+    await max_bot.handle_update(client, event, settings)
+
+    assert create.await_count == 0
+    assert client.send_message.await_count == 1

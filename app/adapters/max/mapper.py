@@ -25,6 +25,21 @@ def _dig(data: dict[str, Any], *keys: str) -> Any:
     return current
 
 
+
+def _payload_url(payload: dict[str, Any]) -> str | None:
+    for key in ("url", "download_url", "file_url", "photo_url"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    photos = payload.get("photos") or payload.get("sizes") or []
+    if isinstance(photos, list):
+        for item in reversed(photos):
+            if isinstance(item, dict):
+                value = item.get("url") or item.get("download_url")
+                if value:
+                    return str(value)
+    return None
+
 @dataclass(slots=True)
 class IncomingEvent:
     platform_user_id: str
@@ -67,7 +82,7 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
         if att.get("type") == "image":
             payload = att.get("payload") or {}
             if not photo_url:
-                photo_url = payload.get("url")
+                photo_url = _payload_url(payload)
             if not photo_token:
                 photo_token = payload.get("token")
         elif att.get("type") == "file":
@@ -76,7 +91,7 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
             document_mime = _dig(att, "payload", "mime_type")
             document_name = _dig(att, "payload", "file_name") or _dig(att, "payload", "name")
             if not document_url:
-                document_url = payload.get("url")
+                document_url = _payload_url(payload)
     
     return IncomingEvent(
         platform_user_id=str(platform_user_id),
