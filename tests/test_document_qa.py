@@ -43,3 +43,28 @@ def test_document_qa_rejects_dative_name(tmp_path):
         require_preview_pdf=False,
     )
     assert not qa.ok
+
+
+def test_document_qa_rejects_debtor_header_ocr_noise(tmp_path):
+    docx = tmp_path / "header_noise.docx"
+    _write_docx(
+        docx,
+        "\u0430\u0434\u0440\u0435\u0441: \u0433. \u0410\u0447\u0438\u043d\u0441\u043a \u041a\u0440\u0430\u0441\u043d\u043e\u044f\u0440\u0441\u043a\u043e\u0433\u043e \u043a\u0440\u0430\u044f, "
+        "\u0443\u0440\u043e\u0436\u0435\u043d\u0435\u0446, \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u043e\u043c\u0443, \u043f\u0430\u0441\u043f\u043e\u0440\u0442"
+    )
+    qa = run_document_qa(
+        data={"court_name": "x", "court_address": "x", "debtor_full_name": "\u0418\u0432\u0430\u043d\u043e\u0432 \u0418\u0432\u0430\u043d \u0418\u0432\u0430\u043d\u043e\u0432\u0438\u0447", "debtor_address": "x", "creditor_name": "x", "creditor_address": "x", "case_number": "1", "order_date": "01.01.2020", "debt_contract": "x", "debt_period": "x", "debt_amount": "1 \u0440\u0443\u0431. 00 \u043a\u043e\u043f."},
+        received_date=date(2026, 6, 19),
+        deadline_date=date(2026, 6, 29),
+        full_docx=docx,
+        full_pdf=None,
+        preview_pdf=None,
+        instruction_docx=None,
+        require_preview_pdf=False,
+    )
+
+    assert not qa.ok
+    assert "\u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u043e\u043c\u0443" in qa.bad_tokens
+    assert "\u0443\u0440\u043e\u0436\u0435\u043d" in qa.bad_tokens
+    assert "\u043f\u0430\u0441\u043f\u043e\u0440\u0442" in qa.bad_tokens
+    assert "\u0433. \u0410\u0447\u0438\u043d\u0441\u043a \u041a\u0440\u0430\u0441\u043d\u043e\u044f\u0440\u0441\u043a\u043e\u0433\u043e \u043a\u0440\u0430\u044f" in qa.bad_tokens

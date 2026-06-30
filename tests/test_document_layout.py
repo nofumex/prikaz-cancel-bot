@@ -379,3 +379,26 @@ def test_signature_has_one_line_gap_after_attachments(tmp_path):
     assert spacer.runs[0].font.size.pt == pytest.approx(profile.body_font_size, abs=0.1)
     assert signature.paragraph_format.space_before.pt == pytest.approx(0, abs=0.1)
     assert signature.paragraph_format.space_after.pt == pytest.approx(0, abs=0.1)
+
+def test_header_uses_clean_registration_address_and_protects_house_number():
+    raw_address = (
+        "\u0443\u0440\u043e\u0436\u0435\u043d\u0435\u0446 \u0433. \u0410\u0447\u0438\u043d\u0441\u043a \u041a\u0440\u0430\u0441\u043d\u043e\u044f\u0440\u0441\u043a\u043e\u0433\u043e \u043a\u0440\u0430\u044f, "
+        "\u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u043e\u043c\u0443 \u0432 \u0433\u043e\u0440\u043e\u0434\u0435 \u0415\u0441\u0441\u0435\u043d\u0442\u0443\u043a\u0438, "
+        "\u0443\u043b. \u0412\u043e\u043b\u043e\u0434\u0430\u0440\u0441\u043a\u043e\u0433\u043e \u0434. 14, \u043a\u0432. 9"
+    )
+    data = normalize_order_data({**BELSKY_DATA, "debtor_address": raw_address})
+    ctx = StatementContext(
+        data=data,
+        received_date=date(2026, 6, 19),
+        deadline_date=date(2026, 7, 10),
+        document_date=date(2026, 6, 30),
+    )
+
+    header = "\n".join(build_header_lines(ctx))
+
+    assert "\u0430\u0434\u0440\u0435\u0441: \u0433. \u0415\u0441\u0441\u0435\u043d\u0442\u0443\u043a\u0438, \u0443\u043b. \u0412\u043e\u043b\u043e\u0434\u0430\u0440\u0441\u043a\u043e\u0433\u043e, \u0434. 14, \u043a\u0432. 9" in header
+    assert "\u0410\u0447\u0438\u043d\u0441\u043a" not in header
+    assert "\u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440" not in header.lower()
+    assert "\u0443\u0440\u043e\u0436\u0435\u043d" not in header.lower()
+    assert "\u043f\u0430\u0441\u043f\u043e\u0440\u0442" not in header.lower()
+    assert "\u0443\u043b. \u0428\u043c\u0438\u0434\u0442\u0430, \u0434.\xa072" in header

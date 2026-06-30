@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from datetime import date
 
-from app.services.legal_data import clean_case_number, clean_uid, is_deadline_missed, normalize_address_text
+from app.services.legal_data import clean_case_number, clean_uid, is_deadline_missed, keep_house_number_together, normalize_address_text
 from app.services.name_normalizer import make_short_name
 from app.utils import parse_russian_date
 
@@ -61,6 +61,10 @@ def normalize_address_line(text: str) -> str:
     return normalize_address_text(text)
 
 
+def normalize_court_address_line(text: str) -> str:
+    return keep_house_number_together(normalize_address_text(text))
+
+
 def normalize_court_addressee(court: str) -> str:
     court = court.strip().rstrip(".")
     court = re.sub(r"№(\d+)", r"№ \1", court)
@@ -115,7 +119,7 @@ def build_header_lines(ctx: StatementContext) -> list[str]:
     ]
     court_address = _optional(data, "court_address")
     if court_address:
-        lines.insert(1, normalize_address_line(court_address))
+        lines.insert(1, normalize_court_address_line(court_address))
     debtor_address = _optional(data, "debtor_address")
     if debtor_address:
         lines.insert(5, f"адрес: {normalize_address_line(debtor_address)}")

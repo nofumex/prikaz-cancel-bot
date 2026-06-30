@@ -2,7 +2,9 @@ from datetime import date
 from decimal import Decimal
 
 from app.services.legal_data import (
+    bad_tokens_in_text,
     clean_case_number,
+    clean_debtor_address,
     format_money_rub_kop,
     legal_deadline_from_received,
     money_to_decimal,
@@ -68,3 +70,30 @@ def test_money_decimal_sum():
     debt = money_to_decimal("78472 руб. 87 коп.")
     duty = money_to_decimal("1277 руб. 00 коп.")
     assert debt + duty == Decimal("79749.87")
+
+
+def test_debtor_address_registration_extracted_from_birthplace_ocr():
+    raw = (
+        "\u0443\u0440\u043e\u0436\u0435\u043d\u0435\u0446 \u0433. \u0410\u0447\u0438\u043d\u0441\u043a \u041a\u0440\u0430\u0441\u043d\u043e\u044f\u0440\u0441\u043a\u043e\u0433\u043e \u043a\u0440\u0430\u044f, "
+        "\u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u043e\u043c\u0443 \u0432 \u0433\u043e\u0440\u043e\u0434\u0435 \u0415\u0441\u0441\u0435\u043d\u0442\u0443\u043a\u0438, "
+        "\u0443\u043b. \u0412\u043e\u043b\u043e\u0434\u0430\u0440\u0441\u043a\u043e\u0433\u043e \u0434. 14, \u043a\u0432. 9"
+    )
+
+    assert clean_debtor_address(raw) == "\u0433. \u0415\u0441\u0441\u0435\u043d\u0442\u0443\u043a\u0438, \u0443\u043b. \u0412\u043e\u043b\u043e\u0434\u0430\u0440\u0441\u043a\u043e\u0433\u043e, \u0434. 14, \u043a\u0432. 9"
+
+    normalized = normalize_order_data({"debtor_address": raw})
+    assert normalized["debtor_address"] == "\u0433. \u0415\u0441\u0441\u0435\u043d\u0442\u0443\u043a\u0438, \u0443\u043b. \u0412\u043e\u043b\u043e\u0434\u0430\u0440\u0441\u043a\u043e\u0433\u043e, \u0434. 14, \u043a\u0432. 9"
+    assert "\u0410\u0447\u0438\u043d\u0441\u043a" not in normalized["debtor_address"]
+    assert "\u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440" not in normalized["debtor_address"].lower()
+
+
+def test_bad_tokens_reject_debtor_header_ocr_noise():
+    bad = bad_tokens_in_text(
+        "\u0430\u0434\u0440\u0435\u0441: \u0433. \u0410\u0447\u0438\u043d\u0441\u043a \u041a\u0440\u0430\u0441\u043d\u043e\u044f\u0440\u0441\u043a\u043e\u0433\u043e \u043a\u0440\u0430\u044f, "
+        "\u0443\u0440\u043e\u0436\u0435\u043d\u0435\u0446, \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u043e\u043c\u0443, \u043f\u0430\u0441\u043f\u043e\u0440\u0442"
+    )
+
+    assert "\u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u043e\u043c\u0443" in bad
+    assert "\u0443\u0440\u043e\u0436\u0435\u043d" in bad
+    assert "\u043f\u0430\u0441\u043f\u043e\u0440\u0442" in bad
+    assert "\u0433. \u0410\u0447\u0438\u043d\u0441\u043a \u041a\u0440\u0430\u0441\u043d\u043e\u044f\u0440\u0441\u043a\u043e\u0433\u043e \u043a\u0440\u0430\u044f" in bad

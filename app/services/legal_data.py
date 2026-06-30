@@ -39,6 +39,10 @@ BAD_DOCUMENT_TOKENS = [
     "по договор №",
     "коп..",
     "руб..",
+    "зарегистрированному",
+    "урожен",
+    "паспорт",
+    "г. Ачинск Красноярского края",
 ]
 
 PREVIEW_IGNORED_TOKENS = {"▒"}
@@ -83,10 +87,12 @@ def clean_text(value: object | None) -> str:
 def normalize_address_text(value: object | None) -> str:
     text = clean_text(value)
     text = re.sub(r"\bв\s+городе\s+Москва\b", "г. Москва", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bв\s+городе\s+", "г. ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bгород\s+Москва\b", "г. Москва", text, flags=re.IGNORECASE)
     text = re.sub(r"\bгород\s+", "г. ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bпо\s+улице\s+", "ул. ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bулица\s+", "ул. ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bул\.\s*([^,]+?)\s+д\.\s*", r"ул. \1, д. ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bул\.\s*([^,]+),\s*(?=\d)", r"ул. \1, д. ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bдом\s+№?\s*", "д. ", text, flags=re.IGNORECASE)
     text = re.sub(r",\s*д\.\s*", ", д. ", text)
@@ -94,6 +100,24 @@ def normalize_address_text(value: object | None) -> str:
     return text.strip(" ,.;")
 
 
+def clean_debtor_address(value: object | None) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    registration = re.search(
+        r"\bзарегистрирован\w*\s*(?:по\s+адресу)?\s*[:,-]?\s*(.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if registration:
+        text = registration.group(1)
+    text = re.split(r"\bпаспорт\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    text = re.sub(r"^\s*(?:адрес\s*)?[:,-]\s*", "", text, flags=re.IGNORECASE)
+    return normalize_address_text(text)
+
+
+def keep_house_number_together(value: str) -> str:
+    return re.sub(r"\bд\.\s+(?=\d)", "д.\xa0", value)
 def clean_uid(value: object | None) -> str:
     text = clean_text(value)
     text = re.sub(r"^(уид|uid)\s*[:№-]?\s*", "", text, flags=re.IGNORECASE)
@@ -255,9 +279,11 @@ def normalize_order_data(data: dict) -> dict:
     if normalized.get("case_number"):
         normalized["case_number"] = clean_case_number(normalized["case_number"])
     normalized, _ = normalize_debtor_name_fields(normalized)
-    for key in ("court_address", "creditor_address", "debtor_address"):
+    for key in ("court_address", "creditor_address"):
         if normalized.get(key):
             normalized[key] = normalize_address_text(normalized[key])
+    if normalized.get("debtor_address"):
+        normalized["debtor_address"] = clean_debtor_address(normalized["debtor_address"])
     if normalized.get("court_name"):
         court_forms = normalize_court_forms(normalized["court_name"])
         normalized["court_name"] = court_forms["court_name"]
@@ -352,9 +378,7 @@ def bad_tokens_in_text(text: str) -> list[str]:
     if has_old_statement_title(text):
         found.append("old_statement_title")
     for token in BAD_DOCUMENT_TOKENS:
-        needle = token if token != token.lower() else token.lower()
-        haystack = text if token != token.lower() else lower
-        if needle in haystack:
+        if token.lower() in lower:
             found.append(token)
     return found
 
