@@ -562,7 +562,7 @@ async def test_payment_check_sends_normal_message_when_yookassa_canceled(monkeyp
 
         await payment_check(callback, session, settings(yookassa_enabled=True, yookassa_shop_id="shop", yookassa_secret_key="secret"), user)
 
-        callback.answer.assert_awaited_once_with("Проверяю оплату…")
+        callback.answer.assert_awaited_once_with()
         assert callback.answer.await_args.kwargs == {}
         callback.message.answer.assert_awaited_once_with("Платеж отменен или не завершен. Попробуйте оплатить снова.")
 
@@ -587,9 +587,33 @@ async def test_payment_check_sends_normal_message_on_yookassa_api_error(monkeypa
 
         await payment_check(callback, session, settings(yookassa_enabled=True, yookassa_shop_id="shop", yookassa_secret_key="secret"), user)
 
-        callback.answer.assert_awaited_once_with("Проверяю оплату…")
+        callback.answer.assert_awaited_once_with()
         assert callback.answer.await_args.kwargs == {}
         callback.message.answer.assert_awaited_once_with("Не удалось проверить оплату. Попробуйте ещё раз через минуту или напишите менеджеру.")
+
+
+@pytest.mark.asyncio
+async def test_payment_check_pending_uses_callback_notice_without_chat_message(monkeypatch, session_factory):
+    async def fake_request(self, method, path, *, json_body=None, headers=None):
+        return {"id": "pay-pending", "status": "pending"}
+
+    monkeypatch.setattr(YooKassaClient, "request", fake_request)
+    async with session_factory() as session:
+        user = User(platform="telegram", platform_user_id="1", email="user@example.com")
+        session.add(user)
+        await session.flush()
+        case = Case(user_id=user.id, platform="telegram", platform_user_id="1", status=CaseStatus.PAYMENT_PENDING.value)
+        session.add(case)
+        await session.flush()
+        session.add(Payment(case_id=case.id, label="lbl-pending", amount=990, provider="yookassa", external_payment_id="pay-pending"))
+        await session.commit()
+
+        callback = SimpleNamespace(answer=AsyncMock(), message=SimpleNamespace(answer=AsyncMock(), answer_document=AsyncMock()))
+
+        await payment_check(callback, session, settings(yookassa_enabled=True, yookassa_shop_id="shop", yookassa_secret_key="secret"), user)
+
+        callback.answer.assert_awaited_once_with("Платеж пока не найден. Попробуйте через 10–20 секунд.", show_alert=False)
+        callback.message.answer.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -614,7 +638,7 @@ async def test_payment_check_announces_success_before_delivery(monkeypatch, sess
 
         await payment_check(callback, session, settings(yookassa_enabled=True, yookassa_shop_id="shop", yookassa_secret_key="secret"), user)
 
-        callback.answer.assert_awaited_once_with("Проверяю оплату…")
+        callback.answer.assert_awaited_once_with()
         assert callback.answer.await_args.kwargs == {}
         callback.message.answer.assert_awaited_once_with("Оплата найдена. Отправляю документы.")
         deliver.assert_awaited_once()

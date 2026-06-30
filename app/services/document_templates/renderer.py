@@ -198,9 +198,19 @@ def _add_attachments_and_signature(doc: Document, ctx: StatementContext, profile
             after=profile.list_space_after,
             keep_together=True,
         )
+    spacer = doc.add_paragraph()
+    spacer_fmt = spacer.paragraph_format
+    spacer_fmt.space_before = Pt(0)
+    spacer_fmt.space_after = Pt(0)
+    spacer_fmt.line_spacing = 1.0
+    spacer_run = spacer.add_run(" ")
+    spacer_run.font.name = FONT_NAME
+    spacer_run._element.rPr.rFonts.set(qn("w:eastAsia"), FONT_NAME)
+    spacer_run.font.size = Pt(profile.body_font_size)
+
     p = doc.add_paragraph()
     fmt = p.paragraph_format
-    fmt.space_before = Pt(0 if profile.compact else 2)
+    fmt.space_before = Pt(0)
     fmt.space_after = Pt(0)
     fmt.line_spacing = 1.0
     fmt.tab_stops.add_tab_stop(Cm(8.3), WD_TAB_ALIGNMENT.CENTER)

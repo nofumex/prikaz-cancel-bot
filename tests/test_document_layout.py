@@ -9,9 +9,9 @@ import pytest
 from app.config import Settings
 from app.models import Case, User
 from app.services.document_qa import run_document_qa
-from app.services.document_templates.renderer import create_case_documents
+from app.services.document_templates.renderer import _render_statement_docx, create_case_documents
 from app.services.document_templates.statement_templates import StatementContext, build_attachments, build_header_lines, build_statement_paragraphs
-from app.services.document_templates.styles import A4_HEIGHT, A4_WIDTH, MARGIN_LEFT
+from app.services.document_templates.styles import A4_HEIGHT, A4_WIDTH, MARGIN_LEFT, StyleProfile
 from app.services.document_visual_qa import run_visual_qa
 from app.services.legal_data import legal_deadline_from_received, normalize_order_data, validate_amounts
 from app.services.pdf_tools import pdf_page_count, pdf_text
@@ -350,3 +350,32 @@ def test_visual_qa_rejects_signature_only_page2(tmp_path):
     )
 
     assert "signature_orphaned_on_page2" in visual.errors
+
+
+def test_signature_has_one_line_gap_after_attachments(tmp_path):
+    profile = StyleProfile.normal()
+    ctx = StatementContext(
+        data=normalize_order_data(BELSKY_DATA),
+        received_date=date(2026, 6, 19),
+        deadline_date=date(2026, 7, 10),
+        document_date=date(2026, 6, 30),
+    )
+    docx_path = tmp_path / "signature_gap.docx"
+
+    _render_statement_docx(docx_path, ctx, profile)
+
+    doc = Document(str(docx_path))
+    paragraphs = doc.paragraphs
+    signature_index = next(index for index, p in enumerate(paragraphs) if "_____________" in p.text)
+    signature = paragraphs[signature_index]
+    spacer = paragraphs[signature_index - 1]
+    previous_text = next(p.text for p in reversed(paragraphs[: signature_index - 1]) if p.text.strip())
+
+    assert previous_text.startswith("3. ")
+    assert spacer.text == " "
+    assert spacer.paragraph_format.space_before.pt == pytest.approx(0, abs=0.1)
+    assert spacer.paragraph_format.space_after.pt == pytest.approx(0, abs=0.1)
+    assert spacer.paragraph_format.line_spacing == 1.0
+    assert spacer.runs[0].font.size.pt == pytest.approx(profile.body_font_size, abs=0.1)
+    assert signature.paragraph_format.space_before.pt == pytest.approx(0, abs=0.1)
+    assert signature.paragraph_format.space_after.pt == pytest.approx(0, abs=0.1)

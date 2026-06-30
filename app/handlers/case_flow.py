@@ -876,7 +876,6 @@ async def receive_restore_reason_custom(message: Message, state: FSMContext, ses
 
 @router.callback_query(F.data == "payment:check")
 async def payment_check(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User) -> None:
-    await callback.answer("Проверяю оплату…")
     case = await latest_open_case(session, current_user.id)
     if not case:
         case = await latest_case(session, current_user.id)
@@ -895,6 +894,7 @@ async def payment_check(callback: CallbackQuery, session: AsyncSession, settings
         try:
             refreshed = await refresh_yookassa_payment_for_case(session, case, settings)
         except YooKassaError:
+            await callback.answer()
             await callback.message.answer("Не удалось проверить оплату. Попробуйте ещё раз через минуту или напишите менеджеру.")
             return
         if refreshed:
@@ -908,15 +908,17 @@ async def payment_check(callback: CallbackQuery, session: AsyncSession, settings
             payment = result.scalar_one_or_none()
 
     if case and (case.status == CaseStatus.CANCELED.value or (payment and payment.status == PaymentStatus.CANCELED.value)):
+        await callback.answer()
         await callback.message.answer("Платеж отменен или не завершен. Попробуйте оплатить снова.")
         return
 
     if not case or case.status != CaseStatus.PAID.value:
-        await callback.message.answer("Платеж пока не найден. Если вы только что оплатили, подождите 10–20 секунд и нажмите «Я оплатил» ещё раз.")
+        await callback.answer("Платеж пока не найден. Попробуйте через 10–20 секунд.", show_alert=False)
         return
     if case.delivered_at:
-        await callback.message.answer("Документы уже отправлены.")
+        await callback.answer("Документы уже отправлены.")
         return
+    await callback.answer()
     await callback.message.answer("Оплата найдена. Отправляю документы.")
     await deliver_full_documents(callback.message, session, case, settings, current_user)
 
