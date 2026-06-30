@@ -480,7 +480,7 @@ async def _prompt_debtor_name_fix(message: Message, debtor_full_name: str) -> No
 @router.callback_query(F.data == "case:edit_fields")
 async def edit_fields(callback: CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User) -> None:
     if not current_user.is_admin:
-        await callback.answer("Эта функция доступна только админу.", show_alert=True)
+        await callback.answer("Эта функция доступна только админу.")
         return
     case = await latest_open_case(session, current_user.id)
     if not case:
@@ -497,7 +497,7 @@ async def edit_fields(callback: CallbackQuery, state: FSMContext, session: Async
 @router.callback_query(F.data == "case:review")
 async def review_case(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
     if not current_user.is_admin:
-        await callback.answer("Эта функция доступна только админу.", show_alert=True)
+        await callback.answer("Эта функция доступна только админу.")
         return
     case = await latest_open_case(session, current_user.id)
     if not case:
@@ -516,16 +516,16 @@ async def review_case(callback: CallbackQuery, session: AsyncSession, current_us
 @router.callback_query(F.data == "case:fix_debtor_name")
 async def fix_debtor_name(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
     if not current_user.is_admin:
-        await callback.answer("Эта функция доступна только админу.", show_alert=True)
+        await callback.answer("Эта функция доступна только админу.")
         return
     case = await latest_open_case(session, current_user.id)
     if not case:
-        await callback.answer("Не нашел активное заявление", show_alert=True)
+        await callback.answer("Не нашел активное заявление")
         return
     data = normalize_order_data(json.loads(case.extracted_json or "{}"))
     suggested = suggest_nominative_full_name(data.get("debtor_full_name"))
     if not suggested:
-        await callback.answer("Не смог предложить исправление", show_alert=True)
+        await callback.answer("Не смог предложить исправление")
         return
     data["debtor_full_name"] = suggested
     case.extracted_json = json.dumps(data, ensure_ascii=False)
@@ -540,7 +540,7 @@ async def fix_debtor_name(callback: CallbackQuery, session: AsyncSession, curren
 @router.callback_query(F.data.startswith("case:field:"))
 async def choose_field(callback: CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User) -> None:
     if not current_user.is_admin:
-        await callback.answer("Эта функция доступна только админу.", show_alert=True)
+        await callback.answer("Эта функция доступна только админу.")
         return
     case = await latest_open_case(session, current_user.id)
     if not case:
@@ -812,7 +812,7 @@ async def _generate_documents_flow(
 @router.callback_query(F.data == "case:generate")
 async def generate_documents(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User, state: FSMContext, bot: Bot) -> None:
     if not (current_user.is_admin or settings.show_user_confirmation_step):
-        await callback.answer("Эта функция недоступна.", show_alert=True)
+        await callback.answer("Эта функция недоступна.")
         return
     case = await latest_open_case(session, current_user.id)
     if not case:
@@ -847,7 +847,7 @@ async def choose_restore_reason(callback: CallbackQuery, state: FSMContext, sess
     }
     reason_text = reasons.get(code)
     if not reason_text:
-        await callback.answer("Причина не распознана", show_alert=True)
+        await callback.answer("Причина не распознана")
         return
     extracted = normalize_order_data(json.loads(case.extracted_json or "{}"))
     extracted["restore_reason"] = reason_text
