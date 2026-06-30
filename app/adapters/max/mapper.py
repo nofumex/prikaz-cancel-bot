@@ -170,6 +170,11 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
     user = _dig(message, "sender") or _dig(callback, "user") or update.get("user") or {}
     platform_user_id = user.get("user_id") or user.get("id")
     chat_id = _dig(message, "recipient", "chat_id") or message.get("chat_id") or update.get("chat_id") or platform_user_id
+    raw_attachments = _attachment_candidates(update, message)
+    if not platform_user_id and raw_attachments:
+        platform_user_id = str(message.get("message_id") or update.get("message_id") or "unknown")
+    if not chat_id and raw_attachments:
+        chat_id = str(update.get("chat_id") or platform_user_id or message.get("message_id") or "unknown")
     if not platform_user_id or not chat_id:
         return None
 
@@ -179,8 +184,6 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
     document_token = None
     document_name = None
     document_mime = None
-
-    raw_attachments = _attachment_candidates(update, message)
 
     for att in _normalized_attachments(update, message):
         att_type = str(att.get("type") or att.get("attachment_type") or "").lower()

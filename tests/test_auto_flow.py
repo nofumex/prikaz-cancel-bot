@@ -415,6 +415,33 @@ def test_max_debug_raw_update_redacts_tokens():
     assert payload["file_id"] == "file-123"
 
 
+def test_max_exact_image_raw_update_fixture_is_parsed():
+    event = parse_update(
+        {
+            "message": {
+                "body": {
+                    "attachments": [
+                        {
+                            "type": "image",
+                            "payload": {
+                                "photo_id": 24276560405,
+                                "token": "redacted",
+                                "url": "https://i.oneme.ru/i?r=test",
+                            },
+                        }
+                    ]
+                }
+            },
+            "update_type": "message_created",
+        }
+    )
+
+    assert event is not None
+    assert event.photo_url == "https://i.oneme.ru/i?r=test"
+    assert event.photo_token == "redacted"
+    assert event.has_raw_attachment is True
+
+
 @pytest.mark.asyncio
 async def test_max_photo_token_counts_as_attachment(monkeypatch):
     from app.adapters.max import bot as max_bot

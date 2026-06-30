@@ -185,7 +185,7 @@ class MaxBotClient:
         for path in (f"/files/{token}", f"/attachments/{token}", f"/uploads/{token}"):
             url = path if path.startswith("http") else self.base_url + path
             try:
-                async with self.session.get(url) as response:
+                async with self.session.get(url, timeout=self.timeout) as response:
                     if response.status >= 400:
                         continue
                     content_type = (response.headers.get("Content-Type") or "").lower()
@@ -205,13 +205,25 @@ class MaxBotClient:
                 logger.exception("Failed to download MAX attachment via token endpoint %s", path)
         return None
 
+    async def download_external_url(self, url: str, destination: Path) -> Path:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        async with self.session.get(url, allow_redirects=True, timeout=self.timeout) as response:
+            if response.status != 200:
+                raise RuntimeError(f"MAX external download error {response.status}")
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if content_type and not any(kind in content_type for kind in ("image/jpeg", "image/jpg", "image/png", "image/webp")):
+                logger.debug("MAX external download content-type=%s", content_type)
+            destination.write_bytes(await response.read())
+        return destination
+
     async def download_attachment(self, attachment: dict, destination: Path) -> Path:
         payload = attachment.get("payload") or {}
         url = _first_url(payload)
         token = _first_token(payload)
         data: bytes | None = None
         if url:
-            data = await self.download_file(url)
+            await self.download_external_url(url, destination)
+            return destination
         elif token:
             data = await self.download_by_token(token)
         if data is None:

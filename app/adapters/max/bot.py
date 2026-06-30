@@ -108,7 +108,17 @@ async def _download_event_image(client: MaxBotClient, event: IncomingEvent, case
     path = Path(settings.max_download_dir) / f"case_{case_id}_{kind}{suffix}"
     data: bytes | None = None
     if url:
-        data = await client.download_file(url)
+        try:
+            await client.download_external_url(url, path)
+            return path
+        except Exception:
+            logger.exception("MAX external image download failed")
+            if token:
+                data = await client.download_by_token(token)
+                if data is None:
+                    resolved = await client.resolve_attachment_url(token=token, message_id=event.message_id)
+                    if resolved:
+                        data = await client.download_file(resolved)
     elif token:
         data = await client.download_by_token(token)
         if data is None:
