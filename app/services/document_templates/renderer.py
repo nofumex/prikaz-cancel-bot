@@ -7,7 +7,7 @@ from pathlib import Path
 
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt
@@ -114,8 +114,8 @@ def _add_title_block(doc: Document, ctx: StatementContext, profile: StyleProfile
         bold=True,
         size=profile.title_font_size,
         align=WD_ALIGN_PARAGRAPH.CENTER,
-        before=8,
-        after=2,
+        before=profile.title_space_before,
+        after=profile.title_space_after,
     )
     subtitle = (
         "относительно исполнения судебного приказа\nс ходатайством о восстановлении срока"
@@ -129,7 +129,7 @@ def _add_title_block(doc: Document, ctx: StatementContext, profile: StyleProfile
             profile,
             size=profile.subtitle_font_size,
             align=WD_ALIGN_PARAGRAPH.CENTER,
-            after=2 if index == 0 and restore_term else 6,
+            after=2 if index == 0 and restore_term else profile.subtitle_space_after,
         )
     add_paragraph(
         doc,
@@ -137,7 +137,7 @@ def _add_title_block(doc: Document, ctx: StatementContext, profile: StyleProfile
         profile,
         size=11,
         align=WD_ALIGN_PARAGRAPH.CENTER,
-        after=6,
+        after=profile.title_note_space_after,
     )
 
 
@@ -198,22 +198,17 @@ def _add_attachments_and_signature(doc: Document, ctx: StatementContext, profile
             after=profile.list_space_after,
             keep_together=True,
         )
-    doc.add_paragraph()
-    table = doc.add_table(rows=1, cols=3)
-    table.autofit = False
-    table.columns[0].width = Cm(5.5)
-    table.columns[1].width = Cm(4.5)
-    table.columns[2].width = Cm(6.5)
-    for cell in table.rows[0].cells:
-        _set_cell_borderless(cell)
-    date_cell = table.rows[0].cells[0].paragraphs[0]
-    date_cell.add_run(signature_date_text(ctx.document_date))
-    sign_cell = table.rows[0].cells[1].paragraphs[0]
-    sign_cell.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    sign_cell.add_run("_____________")
-    name_cell = table.rows[0].cells[2].paragraphs[0]
-    name_cell.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    name_cell.add_run(f"/{debtor_short_name(ctx.data)}/")
+    p = doc.add_paragraph()
+    fmt = p.paragraph_format
+    fmt.space_before = Pt(0 if profile.compact else 2)
+    fmt.space_after = Pt(0)
+    fmt.line_spacing = 1.0
+    fmt.tab_stops.add_tab_stop(Cm(8.3), WD_TAB_ALIGNMENT.CENTER)
+    fmt.tab_stops.add_tab_stop(Cm(16.8), WD_TAB_ALIGNMENT.RIGHT)
+    run = p.add_run(f"{signature_date_text(ctx.document_date)}	_____________	/{debtor_short_name(ctx.data)}/")
+    run.font.name = FONT_NAME
+    run._element.rPr.rFonts.set(qn("w:eastAsia"), FONT_NAME)
+    run.font.size = Pt(profile.body_font_size)
 
 
 def _build_instruction_doc(path: Path, *, deadline: str, restore_term: bool) -> None:
@@ -239,7 +234,7 @@ def _build_instruction_doc(path: Path, *, deadline: str, restore_term: bool) -> 
 
 def _render_statement_docx(path: Path, ctx: StatementContext, profile: StyleProfile) -> None:
     doc = Document()
-    setup_page(doc)
+    setup_page(doc, profile)
     _add_header_block(doc, ctx, profile)
     _add_title_block(doc, ctx, profile)
     paragraphs = build_statement_paragraphs(ctx)
@@ -330,6 +325,17 @@ def create_case_documents(
                 allow_dev_fallback=settings.allow_dev_docx_preview,
             )
             page_count = pdf_page_count(full_pdf_path)
+        if page_count and page_count > 1:
+            profile = StyleProfile.ultra_compact()
+            _render_statement_docx(full_docx, ctx, profile)
+            _validate_a4_margins(full_docx)
+            if full_pdf_path:
+                full_pdf_path = convert_docx_to_pdf(
+                    full_docx,
+                    case_dir,
+                    allow_dev_fallback=settings.allow_dev_docx_preview,
+                )
+                page_count = pdf_page_count(full_pdf_path)
 
     preview_pdf_path: Path | None = None
     if settings.enable_pdf_preview and full_pdf_path is not None:

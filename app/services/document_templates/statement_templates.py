@@ -96,7 +96,8 @@ def normalize_court_instrumental(court: str) -> str:
 
 
 def normalize_creditor_address(address: str) -> str:
-    return normalize_address_line(address)
+    first_address = re.split(r"\s*;\s*", address, maxsplit=1)[0]
+    return normalize_address_line(first_address)
 
 
 def build_header_lines(ctx: StatementContext) -> list[str]:

@@ -10,12 +10,13 @@ from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.enums import CaseStatus
+from app.enums import CaseStatus, PaymentStatus
 from app.keyboards.common import case_menu, confirm_extraction, debtor_name_fix_menu, edit_fields_menu, envelope_choice, main_menu, order_rephoto_menu, restore_reason_menu
-from app.models import Case, User
+from app.models import Case, Payment, User
 from app.services.amocrm import get_amocrm_service
 from app.services.crm_background import schedule_crm_sync
 from app.services.document_delivery import delivery_instruction_text
@@ -41,7 +42,7 @@ from app.services.legal_data import (
 )
 from app.services.llm import extract_envelope_date, extract_order_amounts, extract_order_data
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
-from app.services.yookassa import YooKassaReceiptContactRequired
+from app.services.yookassa import YooKassaError, YooKassaReceiptContactRequired
 from app.texts import case_summary, payment_text
 from app.utils import ensure_dir, h, normalize_receipt_contact, parse_russian_date
 
@@ -875,19 +876,49 @@ async def receive_restore_reason_custom(message: Message, state: FSMContext, ses
 
 @router.callback_query(F.data == "payment:check")
 async def payment_check(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    await callback.answer("Проверяю оплату…")
     case = await latest_open_case(session, current_user.id)
+    if not case:
+        case = await latest_case(session, current_user.id)
+
+    payment: Payment | None = None
+    if case:
+        result = await session.execute(
+            select(Payment)
+            .where(Payment.case_id == case.id, Payment.provider == "yookassa")
+            .order_by(Payment.id.desc())
+            .limit(1)
+        )
+        payment = result.scalar_one_or_none()
+
     if case and settings.yookassa_enabled:
-        refreshed = await refresh_yookassa_payment_for_case(session, case, settings)
+        try:
+            refreshed = await refresh_yookassa_payment_for_case(session, case, settings)
+        except YooKassaError:
+            await callback.message.answer("Не удалось проверить оплату. Попробуйте ещё раз через минуту или напишите менеджеру.")
+            return
         if refreshed:
             case = refreshed
+            result = await session.execute(
+                select(Payment)
+                .where(Payment.case_id == case.id, Payment.provider == "yookassa")
+                .order_by(Payment.id.desc())
+                .limit(1)
+            )
+            payment = result.scalar_one_or_none()
+
+    if case and (case.status == CaseStatus.CANCELED.value or (payment and payment.status == PaymentStatus.CANCELED.value)):
+        await callback.message.answer("Платеж отменен или не завершен. Попробуйте оплатить снова.")
+        return
+
     if not case or case.status != CaseStatus.PAID.value:
-        await callback.answer("???? ?? ???? ??????. ???? ???????? ???????, ????????? ??????????? YooKassa ??? ???????? ?????????.", show_alert=True)
+        await callback.message.answer("Платеж пока не найден. Если вы только что оплатили, подождите 10–20 секунд и нажмите «Я оплатил» ещё раз.")
         return
     if case.delivered_at:
-        await callback.answer("????????? ??? ??????????.")
+        await callback.message.answer("Документы уже отправлены.")
         return
+    await callback.message.answer("Оплата найдена. Отправляю документы.")
     await deliver_full_documents(callback.message, session, case, settings, current_user)
-    await callback.answer()
 
 
 async def deliver_full_documents(message: Message, session: AsyncSession, case: Case, settings: Settings | None = None, user: User | None = None) -> None:

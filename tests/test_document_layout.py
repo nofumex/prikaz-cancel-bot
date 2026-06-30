@@ -10,12 +10,15 @@ from app.config import Settings
 from app.models import Case, User
 from app.services.document_qa import run_document_qa
 from app.services.document_templates.renderer import create_case_documents
-from app.services.document_templates.statement_templates import StatementContext, build_attachments, build_statement_paragraphs
+from app.services.document_templates.statement_templates import StatementContext, build_attachments, build_header_lines, build_statement_paragraphs
 from app.services.document_templates.styles import A4_HEIGHT, A4_WIDTH, MARGIN_LEFT
 from app.services.document_visual_qa import run_visual_qa
 from app.services.legal_data import legal_deadline_from_received, normalize_order_data, validate_amounts
 from app.services.pdf_tools import pdf_page_count, pdf_text
 from docx import Document
+
+LONG_POST_BANK_ADDRESS = "107061, г. Москва, Преображенская пл., д. 8; 101000, г. Москва, по улице Мясницкая, д. 35; для корреспонденции: 443001, г. Самара ул. Галактионовская д. 157"
+
 
 BELSKY_DATA = {
     "court_name": "судебный участок №5 города Ессентуки Ставропольского края",
@@ -79,6 +82,13 @@ def _settings(**kwargs):
         yookassa_return_url=None,
         yookassa_webhook_path="/payments/yookassa",
         yookassa_test_mode=False,
+        yookassa_receipt_enabled=True,
+        yookassa_vat_code=1,
+        yookassa_payment_subject="service",
+        yookassa_payment_mode="full_payment",
+        yookassa_receipt_description="Подготовка заявления об отмене судебного приказа",
+        yookassa_test_customer_email="test@example.com",
+        yookassa_tax_system_code=None,
         payment_public_base_url=None,
         payment_web_host="0.0.0.0",
         payment_web_port=8080,
@@ -285,3 +295,58 @@ def test_document_qa_amount_mismatch(tmp_path):
     )
     assert not qa.ok
     assert "amount_mismatch" in qa.bad_tokens
+
+
+
+def test_creditor_header_uses_first_normalized_address():
+    data = normalize_order_data({**BELSKY_DATA, "creditor_address": LONG_POST_BANK_ADDRESS})
+    assert "по улице" not in data["creditor_address"].lower()
+    assert "ул. Мясницкая" in data["creditor_address"]
+    ctx = StatementContext(
+        data=data,
+        received_date=date(2026, 6, 19),
+        deadline_date=date(2026, 7, 10),
+        document_date=date(2026, 6, 30),
+    )
+
+    lines = build_header_lines(ctx)
+
+    assert "107061, г. Москва, Преображенская пл., д. 8" in lines
+    assert all("Мясницкая" not in line for line in lines)
+    assert all("Галактионовская" not in line for line in lines)
+
+
+def test_in_time_long_creditor_address_compacts_to_one_page(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.services.document_templates.renderer.DOCUMENT_DIR", tmp_path / "documents")
+    case, user = _make_case({**BELSKY_DATA, "creditor_address": LONG_POST_BANK_ADDRESS})
+    case.deadline_date = date(2026, 7, 10)
+
+    artifacts = create_case_documents(case, user, _settings(), restore_reason=None)
+
+    assert artifacts.full_pdf_path is not None
+    assert pdf_page_count(artifacts.full_pdf_path) == 1
+    assert artifacts.visual_qa is not None
+    assert "signature_orphaned_on_page2" not in artifacts.visual_qa.errors
+
+
+def test_visual_qa_rejects_signature_only_page2(tmp_path):
+    fitz = pytest.importorskip("fitz")
+    pdf = tmp_path / "orphan_signature.pdf"
+    doc = fitz.open()
+    page1 = doc.new_page()
+    page1.insert_text((72, 72), "ВОЗРАЖЕНИЯ\nПРОШУ:\n1. Отменить судебный приказ")
+    page2 = doc.new_page()
+    page2.insert_text((72, 72), "«30» июня 2026 г. _____________ /Бельский В.Г./")
+    doc.save(pdf)
+    doc.close()
+
+    visual = run_visual_qa(
+        full_docx=None,
+        full_pdf=pdf,
+        preview_pdf=None,
+        data=normalize_order_data(BELSKY_DATA),
+        restore_term=False,
+        amount_check=validate_amounts(normalize_order_data(BELSKY_DATA)),
+    )
+
+    assert "signature_orphaned_on_page2" in visual.errors

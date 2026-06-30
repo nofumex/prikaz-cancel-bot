@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover
     fitz = None
 
 MAX_WORD_GAP_PT = 28.0
+SHORT_PAGE2_LINE_LIMIT = 3
 
 
 @dataclass
@@ -92,6 +93,36 @@ def _check_page_breaks(pdf_path: Path, *, restore_term: bool) -> list[str]:
     return errors
 
 
+def _short_nonempty_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _page2_has_only_signature_or_short_tail(text: str) -> bool:
+    lines = _short_nonempty_lines(text)
+    if not lines:
+        return False
+    signature_markers = ("_____________", "/")
+    has_signature = any(any(marker in line for marker in signature_markers) for line in lines)
+    if has_signature and len(lines) <= SHORT_PAGE2_LINE_LIMIT:
+        return True
+    return len(lines) <= SHORT_PAGE2_LINE_LIMIT and all(len(line) <= 80 for line in lines)
+
+
+def _check_signature_orphan(pdf_path: Path, *, restore_term: bool) -> list[str]:
+    if fitz is None or restore_term:
+        return []
+    document = fitz.open(str(pdf_path))
+    try:
+        if document.page_count < 2:
+            return []
+        page2_text = document[1].get_text("text")
+        if _page2_has_only_signature_or_short_tail(page2_text):
+            return ["signature_orphaned_on_page2"]
+    finally:
+        document.close()
+    return []
+
+
 def run_visual_qa(
     *,
     full_docx: Path | None,
@@ -105,7 +136,7 @@ def run_visual_qa(
     result = VisualQAResult(ok=True)
     profile = profile or StyleProfile.normal()
     result.body_font_size = profile.body_font_size
-    result.margins = page_margins_cm()
+    result.margins = page_margins_cm(profile)
     if amount_check.debt_amount is not None:
         result.amounts["debt_amount"] = format_money_rub_kop(amount_check.debt_amount)
     if amount_check.state_duty is not None:
@@ -159,7 +190,10 @@ def run_visual_qa(
     result.weird_space_lines = weird
     result.errors.extend(error for error in gap_errors if error not in result.errors)
 
-    if not restore_term and result.page_count == 1:
+    if not restore_term and result.page_count and result.page_count > 1:
+        result.errors.extend(_check_signature_orphan(full_pdf, restore_term=restore_term))
+        result.errors.extend(_check_page_breaks(full_pdf, restore_term=restore_term))
+    elif not restore_term and result.page_count == 1:
         result.errors.extend(_check_page_breaks(full_pdf, restore_term=restore_term))
 
     if preview_pdf and preview_pdf.exists() and full_pdf.exists():

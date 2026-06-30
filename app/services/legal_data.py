@@ -85,6 +85,7 @@ def normalize_address_text(value: object | None) -> str:
     text = re.sub(r"\bв\s+городе\s+Москва\b", "г. Москва", text, flags=re.IGNORECASE)
     text = re.sub(r"\bгород\s+Москва\b", "г. Москва", text, flags=re.IGNORECASE)
     text = re.sub(r"\bгород\s+", "г. ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bпо\s+улице\s+", "ул. ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bулица\s+", "ул. ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bул\.\s*([^,]+),\s*(?=\d)", r"ул. \1, д. ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bдом\s+№?\s*", "д. ", text, flags=re.IGNORECASE)
