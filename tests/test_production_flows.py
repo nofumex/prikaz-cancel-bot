@@ -150,6 +150,68 @@ def test_max_photo_does_not_fallback_to_main_menu():
     assert event.text != "/start"
 
 
+def test_max_message_callback_uses_callback_user_not_bot_sender():
+    event = parse_update(
+        {
+            "update_type": "message_callback",
+            "callback": {
+                "callback_id": "cb-1",
+                "user": {"user_id": "185607445", "first_name": "User"},
+                "payload": "case:new",
+                "message": {
+                    "sender": {"user_id": "331077416", "first_name": "Bot"},
+                    "recipient": {"chat_id": "chat-1"},
+                },
+            },
+            "message": {
+                "sender": {"user_id": "331077416", "first_name": "Bot"},
+                "recipient": {"chat_id": "chat-1"},
+                "body": {"text": "case:new"},
+            },
+        }
+    )
+
+    assert event is not None
+    assert event.platform_user_id == "185607445"
+    assert event.chat_id == "chat-1"
+    assert event.callback_data == "case:new"
+
+
+def test_max_message_created_uses_message_sender():
+    event = parse_update(
+        {
+            "update_type": "message_created",
+            "message": {
+                "sender": {"user_id": "185607445", "first_name": "User"},
+                "recipient": {"chat_id": "chat-1"},
+                "body": {"text": "hello"},
+            },
+        }
+    )
+
+    assert event is not None
+    assert event.platform_user_id == "185607445"
+    assert event.chat_id == "chat-1"
+
+
+def test_max_bot_started_uses_update_user_when_present():
+    event = parse_update(
+        {
+            "update_type": "bot_started",
+            "user": {"user_id": "185607445", "first_name": "User"},
+            "message": {
+                "sender": {"user_id": "331077416", "first_name": "Bot"},
+                "recipient": {"chat_id": "chat-1"},
+                "body": {"text": "/start"},
+            },
+        }
+    )
+
+    assert event is not None
+    assert event.platform_user_id == "185607445"
+    assert event.chat_id == "chat-1"
+
+
 @pytest.mark.asyncio
 async def test_start_does_not_create_case(session_factory):
     async with session_factory() as session:

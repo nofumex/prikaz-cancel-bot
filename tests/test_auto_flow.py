@@ -226,6 +226,46 @@ async def test_max_lost_state_photo_recovers_latest_waiting_case(monkeypatch):
     await max_bot.handle_update(client, event, settings)
 
     assert handle_order.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_max_attachment_with_payload_url_avoids_no_file_message(monkeypatch):
+    from app.adapters.max import bot as max_bot
+    from app.adapters.max.mapper import parse_update
+
+    settings = _make_settings(amocrm_enabled=False)
+    session = object()
+
+    class SessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    client = SimpleNamespace(answer_callback=AsyncMock(), send_message=AsyncMock())
+    user = User(id=1, platform="max", platform_user_id="185607445")
+    event = parse_update(
+        {
+            "update_type": "message_created",
+            "message": {
+                "sender": {"user_id": "185607445"},
+                "recipient": {"chat_id": "chat-1"},
+                "body": {"attachments": [{"type": "image", "payload": {"url": "https://example.test/order.jpg"}}]},
+            },
+        }
+    )
+
+    monkeypatch.setattr(max_bot, "SessionLocal", lambda: SessionContext())
+    monkeypatch.setattr(max_bot, "get_or_create_platform_user", AsyncMock(return_value=user))
+    monkeypatch.setattr(max_bot, "_state", AsyncMock(return_value=None))
+    monkeypatch.setattr(max_bot, "latest_open_case", AsyncMock(return_value=None))
+
+    await max_bot.handle_update(client, event, settings)
+
+    sent_text = client.send_message.await_args.kwargs["text"]
+    assert "MAX не передал файл" not in sent_text
+    assert "не смог скачать вложение" in sent_text
     assert client.send_message.await_count == 0
 
 

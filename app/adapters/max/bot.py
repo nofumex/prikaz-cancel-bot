@@ -8,7 +8,7 @@ from typing import Any
 
 from app.adapters.max import keyboards
 from app.adapters.max.client import MaxBotClient
-from app.adapters.max.mapper import IncomingEvent, parse_update, sanitize_raw_update
+from app.adapters.max.mapper import IncomingEvent, TOKEN_KEYS, URL_KEYS, parse_update, sanitize_raw_update
 from app.adapters.max.state import max_state_manager
 from app.config import Settings
 from app.database import SessionLocal
@@ -98,11 +98,38 @@ async def _send_order_rephoto_prompt(client: MaxBotClient, event: IncomingEvent,
     )
 
 
+def _raw_update_attachment_value(update: dict[str, Any] | None, keys: tuple[str, ...]) -> str | None:
+    def walk(value: Any) -> str | None:
+        if isinstance(value, dict):
+            payload = value.get("payload")
+            if isinstance(payload, dict):
+                found = walk(payload)
+                if found:
+                    return found
+            for key in keys:
+                item = value.get(key)
+                if item:
+                    return str(item)
+            for nested in value.values():
+                if isinstance(nested, (dict, list)):
+                    found = walk(nested)
+                    if found:
+                        return found
+        elif isinstance(value, list):
+            for item in value:
+                found = walk(item)
+                if found:
+                    return found
+        return None
+
+    return walk(update) if update else None
+
+
 async def _download_event_image(client: MaxBotClient, event: IncomingEvent, case_id: int, kind: str, settings: Settings) -> Path:
     ensure_dir(settings.max_download_dir)
     suffix = ".jpg"
-    url = event.photo_url or event.document_url
-    token = event.photo_token or event.document_token
+    url = event.photo_url or event.document_url or _raw_update_attachment_value(event.raw_update, URL_KEYS)
+    token = event.photo_token or event.document_token or _raw_update_attachment_value(event.raw_update, TOKEN_KEYS)
     if event.document_name:
         suffix = Path(event.document_name).suffix or suffix
     path = Path(settings.max_download_dir) / f"case_{case_id}_{kind}{suffix}"
@@ -396,7 +423,11 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             return
 
         if has_attachment:
-            await _send(client, event, "Фото получил, но MAX не передал файл для скачивания. Отправьте фото ещё раз как файл без сжатия.")
+            if _raw_update_attachment_value(event.raw_update, URL_KEYS):
+                text = "Фото получил, но не смог скачать вложение из MAX. Отправьте фото ещё раз как файл без сжатия."
+            else:
+                text = "Фото получил, но MAX не передал файл для скачивания. Отправьте фото ещё раз как файл без сжатия."
+            await _send(client, event, text)
             await _notify_admin_download_failure(client, event, settings, "attachment present but no downloadable file could be resolved")
             return
 
@@ -410,7 +441,11 @@ async def _handle_order_image(client: MaxBotClient, event: IncomingEvent, sessio
         path = await _download_event_image(client, event, case.id, "order", settings)
     except RuntimeError:
         logger.exception("MAX order image has no downloadable URL")
-        await _send(client, event, "MAX не передал файл для скачивания. Отправьте фото приказа ещё раз как изображение или файл без сжатия.", keyboards.order_rephoto_menu())
+        if _raw_update_attachment_value(event.raw_update, URL_KEYS):
+            text = "Не удалось скачать вложение из MAX. Отправьте фото приказа ещё раз как изображение или файл без сжатия."
+        else:
+            text = "MAX не передал файл для скачивания. Отправьте фото приказа ещё раз как изображение или файл без сжатия."
+        await _send(client, event, text, keyboards.order_rephoto_menu())
         await _notify_admin_download_failure(client, event, settings, "order image has no downloadable URL")
         return
     await save_photo_path(session, case, "order", path)
@@ -426,7 +461,11 @@ async def _handle_envelope_image(client: MaxBotClient, event: IncomingEvent, ses
         path = await _download_event_image(client, event, case.id, "envelope", settings)
     except RuntimeError:
         logger.exception("MAX envelope image has no downloadable URL")
-        await _send(client, event, "MAX не передал файл для скачивания. Отправьте фото конверта ещё раз как изображение или файл без сжатия.", keyboards.envelope_choice())
+        if _raw_update_attachment_value(event.raw_update, URL_KEYS):
+            text = "Не удалось скачать вложение из MAX. Отправьте фото конверта ещё раз как изображение или файл без сжатия."
+        else:
+            text = "MAX не передал файл для скачивания. Отправьте фото конверта ещё раз как изображение или файл без сжатия."
+        await _send(client, event, text, keyboards.envelope_choice())
         await _notify_admin_download_failure(client, event, settings, "envelope image has no downloadable URL")
         return
     await save_photo_path(session, case, "envelope", path)

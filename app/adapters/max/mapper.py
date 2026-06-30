@@ -35,6 +35,20 @@ def _message_text(message: dict[str, Any]) -> str | None:
     return str(text) if text else None
 
 
+def _select_update_user(update_type: str | None, update: dict[str, Any], callback: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
+    message_sender = _as_dict(_dig(message, "sender"))
+    callback_user = _as_dict(_dig(callback, "user"))
+    update_user = _as_dict(update.get("user"))
+
+    if update_type == "message_callback":
+        return callback_user or update_user or message_sender
+    if update_type == "message_created":
+        return message_sender or callback_user or update_user
+    if update_type == "bot_started":
+        return update_user or message_sender or callback_user
+    return message_sender or callback_user or update_user
+
+
 def _attachment_candidates(update: dict[str, Any], message: dict[str, Any]) -> list[Any]:
     body = _as_dict(message.get("body"))
     candidates: list[Any] = []
@@ -167,9 +181,11 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
     update_type = update.get("update_type")
     callback = update.get("callback") or {}
     message = update.get("message") or callback.get("message") or {}
-    user = _dig(message, "sender") or _dig(callback, "user") or update.get("user") or {}
+    user = _select_update_user(update_type, update, callback, message)
     platform_user_id = user.get("user_id") or user.get("id")
     chat_id = _dig(message, "recipient", "chat_id") or message.get("chat_id") or update.get("chat_id") or platform_user_id
+    if update_type == "message_callback":
+        chat_id = _dig(message, "recipient", "chat_id") or chat_id
     raw_attachments = _attachment_candidates(update, message)
     if not platform_user_id and raw_attachments:
         platform_user_id = str(message.get("message_id") or update.get("message_id") or "unknown")

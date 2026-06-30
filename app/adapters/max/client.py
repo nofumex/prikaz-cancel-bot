@@ -26,6 +26,7 @@ class MaxBotClient:
         self.base_url = base_url.rstrip("/")
         self.upload_retry_attempts = max(1, upload_retry_attempts)
         self.upload_retry_base_seconds = max(0, upload_retry_base_seconds)
+        self.timeout = aiohttp.ClientTimeout(total=60)
         self._session: aiohttp.ClientSession | None = None
 
     async def __aenter__(self) -> "MaxBotClient":
