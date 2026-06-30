@@ -63,7 +63,7 @@ async def run_telegram_bot(settings: Settings) -> None:
     tasks: list[asyncio.Task] = []
     try:
         tasks.append(asyncio.create_task(run_payment_reminders(bot)))
-        if settings.yoomoney_receiver or settings.yoomoney_notification_secret or settings.payment_public_base_url:
+        if settings.yookassa_enabled or settings.yoomoney_receiver or settings.yoomoney_notification_secret or settings.payment_public_base_url:
             tasks.append(asyncio.create_task(run_payment_webhook(bot, settings)))
         if settings.drop_pending_updates:
             await bot.delete_webhook(drop_pending_updates=True)

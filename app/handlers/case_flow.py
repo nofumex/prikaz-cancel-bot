@@ -19,7 +19,7 @@ from app.models import Case, User
 from app.services.amocrm import get_amocrm_service
 from app.services.crm_background import schedule_crm_sync
 from app.services.document_delivery import delivery_instruction_text
-from app.services.cases import create_case, latest_case, latest_open_case, save_photo_path, set_received_date
+from app.services.cases import create_case, get_or_create_active_case, latest_case, latest_open_case, save_photo_path, set_received_date
 from app.services.documents import create_case_documents, extraction_preview
 from app.services.app_settings import payments_enabled
 from app.services.amount_recovery import (
@@ -40,7 +40,7 @@ from app.services.legal_data import (
     validate_before_generation,
 )
 from app.services.llm import extract_envelope_date, extract_order_amounts, extract_order_data
-from app.services.payments import ensure_payment
+from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
 from app.texts import case_summary, payment_text
 from app.utils import ensure_dir, h, parse_russian_date
 
@@ -126,7 +126,7 @@ async def start_case(event: Message | CallbackQuery, state: FSMContext, session:
     start = time.monotonic()
     target = event.message if isinstance(event, CallbackQuery) else event
     chat_id = str(target.chat.id) if getattr(target, "chat", None) else current_user.platform_user_id
-    case = await create_case(session, current_user, chat_id=chat_id)
+    case = await get_or_create_active_case(session, current_user, chat_id=chat_id, force_new=True)
     await state.update_data(case_id=case.id)
     await state.set_state(CaseStates.waiting_order_photo)
     await target.answer(
@@ -830,8 +830,15 @@ async def receive_restore_reason_custom(message: Message, state: FSMContext, ses
 @router.callback_query(F.data == "payment:check")
 async def payment_check(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User) -> None:
     case = await latest_open_case(session, current_user.id)
+    if case and settings.yookassa_enabled:
+        refreshed = await refresh_yookassa_payment_for_case(session, case, settings)
+        if refreshed:
+            case = refreshed
     if not case or case.status != CaseStatus.PAID.value:
-        await callback.answer("Пока не вижу оплату. Если оплатили недавно, подождите уведомление ЮMoney или напишите менеджеру.", show_alert=True)
+        await callback.answer("???? ?? ???? ??????. ???? ???????? ???????, ????????? ??????????? YooKassa ??? ???????? ?????????.", show_alert=True)
+        return
+    if case.delivered_at:
+        await callback.answer("????????? ??? ??????????.")
         return
     await deliver_full_documents(callback.message, session, case, settings, current_user)
     await callback.answer()

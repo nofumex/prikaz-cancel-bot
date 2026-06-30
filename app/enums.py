@@ -16,12 +16,14 @@ class CaseStatus(StrEnum):
     PAID = "paid"
     DELIVERED = "delivered"
     CANCELED = "canceled"
+    SUPERSEDED = "superseded"
 
 
 class PaymentStatus(StrEnum):
     PENDING = "pending"
     PAID = "paid"
     CANCELED = "canceled"
+    SUPERSEDED = "superseded"
 
 
 class ChatStatus(StrEnum):

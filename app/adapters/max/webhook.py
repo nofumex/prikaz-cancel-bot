@@ -7,7 +7,7 @@ from aiohttp import web
 
 from app.adapters.max.bot import handle_update
 from app.adapters.max.client import MaxBotClient
-from app.adapters.max.mapper import parse_update
+from app.adapters.max.mapper import parse_update, sanitize_raw_update
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,8 @@ async def run_max_webhook(settings: Settings) -> None:
             payload = await request.json()
             update_type = payload.get("update_type")
             logger.info("MAX webhook received type=%s", update_type)
+            if settings.max_debug_raw_updates:
+                logger.info("MAX webhook raw sanitized=%s", sanitize_raw_update(payload))
             asyncio.create_task(_process_update(client, payload, settings))
             return web.Response(text="OK")
 

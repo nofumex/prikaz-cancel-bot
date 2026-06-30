@@ -33,7 +33,7 @@ async def main() -> None:
 
     telegram_active = settings.run_telegram and bool(settings.telegram_bot_token)
     max_active = settings.run_max and bool(settings.max_bot_token)
-    payment_web_configured = bool(settings.yoomoney_receiver or settings.yoomoney_notification_secret or settings.payment_public_base_url)
+    payment_web_configured = bool(settings.yookassa_enabled or settings.yoomoney_receiver or settings.yoomoney_notification_secret or settings.payment_public_base_url)
     if max_active and not telegram_active:
         tasks.append(run_payment_reminders(None))
         if payment_web_configured:

@@ -51,6 +51,7 @@ def _settings(**kwargs):
             max_upload_retry_attempts=5,
             max_upload_retry_base_seconds=1,
             max_admin_ids=set(),
+        max_debug_raw_updates=False,
         run_telegram=True,
         run_max=False,
         admin_ids=set(),
@@ -72,6 +73,12 @@ def _settings(**kwargs):
         yoomoney_receiver=None,
         yoomoney_success_url=None,
         yoomoney_notification_secret=None,
+        yookassa_enabled=False,
+        yookassa_shop_id=None,
+        yookassa_secret_key=None,
+        yookassa_return_url=None,
+        yookassa_webhook_path="/payments/yookassa",
+        yookassa_test_mode=False,
         payment_public_base_url=None,
         payment_web_host="0.0.0.0",
         payment_web_port=8080,
@@ -123,7 +130,7 @@ def _make_case(data: dict | None = None, *, envelope: bool = False) -> tuple[Cas
 def _generate(tmp_path, monkeypatch, **case_kwargs):
     monkeypatch.setattr("app.services.document_templates.renderer.DOCUMENT_DIR", tmp_path / "documents")
     case, user = _make_case(**case_kwargs)
-    return create_case_documents(case, user, _settings())
+    return create_case_documents(case, user, _settings(), restore_reason="\u041f\u0440\u0438\u0447\u0438\u043d\u0430 \u043f\u0440\u043e\u043f\u0443\u0441\u043a\u0430 \u0441\u0440\u043e\u043a\u0430: \u0442\u0435\u0441\u0442\u043e\u0432\u0430\u044f \u0433\u0435\u043d\u0435\u0440\u0430\u0446\u0438\u044f.")
 
 
 def test_amounts_belsky_are_correct():
@@ -259,7 +266,7 @@ def test_proshu_not_orphaned_at_page_bottom(tmp_path, monkeypatch):
         if "ПРОШУ:" not in text:
             text = docx_text(str(artifacts.full_docx_path))
         assert "ПРОШУ:" in text
-        assert "1. Отменить" in text
+        assert ("1. \u041e\u0442\u043c\u0435\u043d\u0438\u0442\u044c" in text) or ("2. \u041e\u0442\u043c\u0435\u043d\u0438\u0442\u044c" in text)
 
 
 def test_document_qa_amount_mismatch(tmp_path):

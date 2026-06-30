@@ -7,6 +7,7 @@ IMAGE_ATTACHMENT_TYPES = {"image", "photo"}
 FILE_ATTACHMENT_TYPES = {"file", "document"}
 ATTACHMENT_TYPES = IMAGE_ATTACHMENT_TYPES | FILE_ATTACHMENT_TYPES
 URL_KEYS = ("url", "download_url", "file_url", "photo_url", "image_url", "media_url")
+TOKEN_KEYS = ("token", "file_token", "photo_token", "image_token", "media_token")
 
 
 def _dig(data: dict[str, Any], *keys: str) -> Any:
@@ -88,6 +89,35 @@ def _payload_url(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _payload_token(payload: dict[str, Any]) -> str | None:
+    for key in TOKEN_KEYS:
+        value = payload.get(key)
+        if value:
+            return str(value)
+    for key in ("image", "file", "media"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            value = _payload_token(nested)
+            if value:
+                return value
+    return None
+
+
+def sanitize_raw_update(value: Any) -> Any:
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if any(secret in lowered for secret in ("token", "secret", "authorization")):
+                cleaned[key] = "***" if item else item
+            else:
+                cleaned[key] = sanitize_raw_update(item)
+        return cleaned
+    if isinstance(value, list):
+        return [sanitize_raw_update(item) for item in value]
+    return value
+
+
 @dataclass(slots=True)
 class IncomingEvent:
     platform_user_id: str
@@ -105,6 +135,7 @@ class IncomingEvent:
     document_token: str | None = None
     document_name: str | None = None
     document_mime: str | None = None
+    has_raw_attachment: bool = False
     raw_update: dict[str, Any] | None = None
 
 
@@ -125,6 +156,8 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
     document_name = None
     document_mime = None
 
+    raw_attachments = _attachment_candidates(update, message)
+
     for att in _normalized_attachments(update, message):
         att_type = str(att.get("type") or att.get("attachment_type") or "").lower()
         payload = _as_dict(att.get("payload")) or att
@@ -132,11 +165,20 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
             if not photo_url:
                 photo_url = _payload_url(payload)
             if not photo_token:
-                photo_token = payload.get("token") or payload.get("photo_token")
+                photo_token = _payload_token(payload)
         elif att_type in FILE_ATTACHMENT_TYPES:
-            document_token = payload.get("token") or payload.get("file_token")
+            document_token = _payload_token(payload)
             document_mime = payload.get("mime_type") or payload.get("mime") or att.get("mime_type")
-            document_name = payload.get("file_name") or payload.get("filename") or payload.get("name") or att.get("name")
+            nested_file = payload.get("file") if isinstance(payload.get("file"), dict) else {}
+            document_name = (
+                payload.get("file_name")
+                or payload.get("filename")
+                or payload.get("name")
+                or nested_file.get("file_name")
+                or nested_file.get("filename")
+                or nested_file.get("name")
+                or att.get("name")
+            )
             if not document_url:
                 document_url = _payload_url(payload)
 
@@ -156,5 +198,6 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
         document_token=document_token,
         document_name=document_name,
         document_mime=document_mime,
+        has_raw_attachment=bool(raw_attachments),
         raw_update=update,
     )

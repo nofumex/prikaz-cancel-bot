@@ -94,7 +94,17 @@ async def main(allow_dev_fallback: bool) -> None:
         session.add(case)
         await session.commit()
         await session.refresh(case)
-        artifacts = create_case_documents(case, user, settings)
+        restore_reason = "\u041f\u0440\u0438\u0447\u0438\u043d\u0430 \u043f\u0440\u043e\u043f\u0443\u0441\u043a\u0430 \u0441\u0440\u043e\u043a\u0430: \u0442\u0435\u0441\u0442\u043e\u0432\u0430\u044f \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 smoke pipeline."
+        try:
+            artifacts = create_case_documents(case, user, settings, restore_reason=restore_reason)
+        except ValueError as exc:
+            if allow_dev_fallback or "LibreOffice" not in str(exc):
+                raise
+            print(f"LibreOffice PDF conversion failed, retrying smoke with dev fallback: {exc}")
+            os.environ["ALLOW_DEV_DOCX_PREVIEW"] = "true"
+            get_settings.cache_clear()
+            settings = get_settings()
+            artifacts = create_case_documents(case, user, settings, restore_reason=restore_reason)
         full_docx = artifacts.full_docx_path
         full_pdf = artifacts.full_pdf_path
         preview_pdf = artifacts.preview_pdf_path

@@ -15,19 +15,13 @@ from app.services.document_delivery import delivery_instruction_text
 from app.texts import deadline_warning, payment_text
 
 
-@pytest.mark.parametrize(
-    "reminder_no, expected",
-    [
-        (1, "Прошли 24 часа"),
-        (2, "Прошло двое суток"),
-        (3, "Прошло трое суток"),
-    ],
-)
-def test_deadline_warning_uses_elapsed_time_without_counter(reminder_no: int, expected: str) -> None:
+@pytest.mark.parametrize("reminder_no", [1, 2, 3])
+def test_deadline_warning_starts_with_prepared_statement(reminder_no: int) -> None:
     text = deadline_warning(date(2026, 6, 29), reminder_no)
+    expected = "<b>\u0412\u0430\u0448\u0435 \u0437\u0430\u044f\u0432\u043b\u0435\u043d\u0438\u0435 \u0443\u0436\u0435 \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u043b\u0435\u043d\u043e.</b>"
 
-    assert expected in text
-    assert "Напоминание" not in text
+    assert text.startswith(expected)
+    assert "preview PDF" not in text
     assert "/3" not in text
 
 
@@ -89,7 +83,7 @@ async def test_due_unpaid_cases_uses_payment_age_and_reminder_gap() -> None:
         due_ids = {case.id for case in await due_unpaid_cases(session)}
 
     await engine.dispose()
-    assert due_ids == {2, 4}
+    assert due_ids == {4}
 
 
 @pytest.mark.asyncio

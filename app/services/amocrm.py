@@ -309,8 +309,9 @@ class AmoCrmService:
     def _lead_name(self, case: Case, user: User) -> str:
         username = user.telegram_username or user.username
         if username:
-            return f"Судебный приказ #{case.id} — @{username.lstrip('@')}"
-        return f"Судебный приказ #{case.id} — {user.platform} ID {user.platform_user_id}"
+            return f"Судебный приказ — {user.platform} @{username.lstrip('@')}"
+        return f"Судебный приказ — {user.platform} ID {user.platform_user_id}"
+
 
 
     async def find_lead_by_name(self, name: str, pipeline_id: int) -> dict | None:
@@ -322,6 +323,19 @@ class AmoCrmService:
                 return lead
         return None
 
+    async def find_lead_by_platform_user(self, user: User, pipeline_id: int) -> dict | None:
+        queries = [f"{user.platform} ID {user.platform_user_id}"]
+        if user.username or user.telegram_username:
+            queries.append((user.username or user.telegram_username or "").lstrip("@"))
+        for query in queries:
+            data, error = await self.request("GET", "/leads", params={"query": query, "limit": 50})
+            if error or not isinstance(data, dict):
+                continue
+            for lead in data.get("_embedded", {}).get("leads", []):
+                if int(lead.get("pipeline_id") or 0) == int(pipeline_id):
+                    return lead
+        return None
+
     async def create_lead(self, case: Case, user: User, status_name: str) -> int | None:
         pipeline = await self.ensure_pipeline()
         if not pipeline:
@@ -330,12 +344,13 @@ class AmoCrmService:
         statuses = await self.ensure_statuses(pipeline_id)
         status_id = statuses.get(status_name) or statuses.get("Подписался на бота")
         lead_name = self._lead_name(case, user)
-        existing = await self.find_lead_by_name(lead_name, pipeline_id)
+        existing = await self.find_lead_by_name(lead_name, pipeline_id) or await self.find_lead_by_platform_user(user, pipeline_id)
         if existing:
             lead_id = int(existing["id"])
             case.amocrm_lead_id = lead_id
             case.amo_lead_id = lead_id
             case.amocrm_pipeline_id = pipeline_id
+            await self.request("PATCH", "/leads", json_body=[{"id": lead_id, "name": lead_name}])
             await self.update_lead_status(case, status_name)
             return lead_id
         contact_id = await self.create_or_update_contact(user)

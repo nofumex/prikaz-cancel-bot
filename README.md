@@ -147,3 +147,64 @@ python scripts/smoke_test.py
 - обязательные поля кейса.
 
 Если есть проблема с PDF (например, не найден LibreOffice), платеж не создается, заявка уходит в `needs_review`, админу приходит уведомление.
+
+## YooKassa Production Setup
+
+Production payments use the YooKassa API when `YOOKASSA_ENABLED=true`. The old `YOOMONEY_RECEIVER` and `YOOMONEY_NOTIFICATION_SECRET` variables are kept only as a legacy fallback.
+
+- `YOOKASSA_SHOP_ID`: YooKassa shop identifier. For this project the shop id is `1391245`.
+- `YOOKASSA_SECRET_KEY`: generate it in the YooKassa personal account in the API/integration settings. Never commit or log it.
+- HTTP notification URL: `https://YOUR_DOMAIN/payments/yookassa`.
+- Enable events: `payment.succeeded`, `payment.canceled`.
+- YooKassa requires an HTTPS public webhook URL.
+
+Safe checks:
+
+```powershell
+python scripts/check_yookassa.py
+python scripts/check_yookassa.py --create-test-payment
+```
+
+Minimal production `.env` for verification:
+
+```env
+TG_BOT_TOKEN=...
+RUN_TELEGRAM=true
+
+MAX_BOT_TOKEN=...
+RUN_MAX=true
+MAX_API_BASE_URL=https://platform-api.max.ru
+MAX_DEBUG_RAW_UPDATES=false
+
+OPENAI_API_KEY=...
+
+DOCUMENT_PRICE_RUB=990
+PAYMENT_PUBLIC_BASE_URL=https://YOUR_DOMAIN
+YOOKASSA_ENABLED=true
+YOOKASSA_SHOP_ID=1391245
+YOOKASSA_SECRET_KEY=...
+YOOKASSA_RETURN_URL=https://YOUR_DOMAIN/payments/success
+YOOKASSA_WEBHOOK_PATH=/payments/yookassa
+YOOKASSA_TEST_MODE=false
+PAYMENT_WEB_HOST=0.0.0.0
+PAYMENT_WEB_PORT=8080
+
+ENABLE_PDF_PREVIEW=true
+REQUIRE_PDF_PREVIEW_FOR_PAYMENT=true
+ALLOW_DEV_DOCX_PREVIEW=false
+
+AMOCRM_ENABLED=true
+AMOCRM_BASE_URL=...
+AMOCRM_ACCESS_TOKEN=...
+AMOCRM_PIPELINE_NAME=Судебный приказ
+CRM_SYNC_BACKGROUND=true
+```
+
+amoCRM production stages are exactly five:
+
+1. Подписался на бота
+2. Отправил приказ
+3. Указал дату
+4. Оплатил
+5. Получил напоминание (не оплатил)
+

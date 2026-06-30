@@ -8,20 +8,20 @@ from typing import Any
 
 from app.adapters.max import keyboards
 from app.adapters.max.client import MaxBotClient
-from app.adapters.max.mapper import IncomingEvent, parse_update
+from app.adapters.max.mapper import IncomingEvent, parse_update, sanitize_raw_update
 from app.adapters.max.state import max_state_manager
 from app.config import Settings
 from app.database import SessionLocal
 from app.enums import CaseStatus
 from app.models import Case, User
 from app.services.app_settings import payments_enabled
-from app.services.cases import create_case, latest_case, latest_open_case, save_photo_path, set_received_date
+from app.services.cases import create_case, latest_case, latest_open_case, save_photo_path, set_received_date, supersede_open_cases
 from app.services.crm_background import schedule_crm_sync
 from app.services.document_delivery import deliver_documents_to_case_platform
 from app.services.documents import create_case_documents, extraction_preview
 from app.services.legal_data import FIELD_LABELS, missing_order_fields, normalize_debtor_name_fields, normalize_order_data, validate_before_generation
 from app.services.llm import extract_envelope_date, extract_order_data
-from app.services.payments import ensure_payment
+from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
 from app.services.users import get_or_create_platform_user
 from app.texts import case_summary, payment_text, profile_text, welcome_text
 from app.utils import ensure_dir, h, parse_russian_date
@@ -100,9 +100,12 @@ async def _download_event_image(client: MaxBotClient, event: IncomingEvent, case
     ensure_dir(settings.max_download_dir)
     suffix = ".jpg"
     url = event.photo_url or event.document_url
+    token = event.photo_token or event.document_token
     if event.document_name:
         suffix = Path(event.document_name).suffix or suffix
     path = Path(settings.max_download_dir) / f"case_{case_id}_{kind}{suffix}"
+    if not url:
+        url = await client.resolve_attachment_url(token=token, message_id=event.message_id)
     if not url:
         raise RuntimeError("MAX event has no downloadable image/file URL")
     path.write_bytes(await client.download_file(url))
@@ -141,7 +144,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             await client.answer_callback(event.callback_id)
         data = event.callback_data
         current_state = await _state(session, event)
-        has_attachment = bool(event.photo_url or event.document_url or event.photo_token or event.document_token)
+        has_attachment = bool(event.photo_url or event.document_url or event.photo_token or event.document_token or event.has_raw_attachment)
         is_date_text = bool(event.text and parse_russian_date(event.text))
         if not current_state and (has_attachment or is_date_text):
             current_state = await _recover_state_for_input(session, event, user, has_attachment=has_attachment, is_date_text=is_date_text)
@@ -161,20 +164,28 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 await _send(client, event, case_summary(case), keyboards.case_menu(can_pay=case.status == CaseStatus.PAYMENT_PENDING.value, payment_url=case.payment_url))
             return
         if data == "case:new":
-            case = await latest_open_case(session, user.id)
+            previous = await latest_open_case(session, user.id)
             is_empty_waiting_case = bool(
-                case
-                and case.status == CaseStatus.WAITING_ORDER_PHOTO.value
-                and not case.order_photo_path
+                previous
+                and previous.status == CaseStatus.WAITING_ORDER_PHOTO.value
+                and not previous.order_photo_path
             )
-            if not is_empty_waiting_case:
+            if is_empty_waiting_case:
+                case = previous
+            else:
+                if previous:
+                    await supersede_open_cases(session, user)
+                    if hasattr(session, "commit"):
+                        await session.commit()
                 case = await create_case(session, user, chat_id=event.chat_id)
                 schedule_crm_sync(settings, case.id, user.id, "user_started_bot", {"note": "MAX: пользователь начал оформление"})
             await _set_state(session, event, STATE_ORDER_PHOTO, {"case_id": case.id})
             await _send(
                 client,
                 event,
-                "📝 <b>Новое заявление</b>\n\nОтправьте фото судебного приказа целиком.\n\nПосле даты я сразу подготовлю preview PDF и ссылку на оплату.",
+                "\U0001f4dd <b>\u041d\u043e\u0432\u043e\u0435 \u0437\u0430\u044f\u0432\u043b\u0435\u043d\u0438\u0435</b>\n\n"
+                "\u041e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 \u0444\u043e\u0442\u043e \u0441\u0443\u0434\u0435\u0431\u043d\u043e\u0433\u043e \u043f\u0440\u0438\u043a\u0430\u0437\u0430 \u0446\u0435\u043b\u0438\u043a\u043e\u043c.\n\n"
+                "\u041f\u043e\u0441\u043b\u0435 \u0434\u0430\u0442\u044b \u044f \u0441\u0440\u0430\u0437\u0443 \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u043b\u044e preview PDF \u0438 \u0441\u0441\u044b\u043b\u043a\u0443 \u043d\u0430 \u043e\u043f\u043b\u0430\u0442\u0443.",
             )
             return
         if data == "case:rephoto_order":
@@ -249,12 +260,20 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             return
         if data == "payment:check":
             case = await latest_open_case(session, user.id)
+            if case and settings.yookassa_enabled:
+                refreshed = await refresh_yookassa_payment_for_case(session, case, settings)
+                if refreshed:
+                    case = refreshed
             if not case or case.status != CaseStatus.PAID.value:
                 await client.answer_callback(event.callback_id, "Пока не вижу оплату")
+                return
+            if case.delivered_at:
+                await client.answer_callback(event.callback_id, "Документы уже отправлены")
                 return
             await deliver_documents_to_case_platform(case.id, settings)
             await _send(client, event, "Документы отправлены.", keyboards.case_menu())
             return
+
 
         if current_state in {STATE_ORDER_PHOTO, STATE_ORDER_REPHOTO} and has_attachment:
             await _handle_order_image(client, event, session, settings, user)
@@ -297,6 +316,10 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
         if case and case.status == CaseStatus.WAITING_ENVELOPE.value:
             await _set_state(session, event, STATE_ENVELOPE, {"case_id": case.id})
             await _send(client, event, "Отправьте фото конверта со штампами или напишите дату получения в формате <code>ДД.ММ.ГГГГ</code>.", keyboards.envelope_choice())
+            return
+
+        if has_attachment:
+            await _send(client, event, "Фото получил, но MAX не передал файл для скачивания. Отправьте фото ещё раз как файл без сжатия.")
             return
 
         await _send(client, event, welcome_text(settings.company_name), keyboards.main_menu())
@@ -495,6 +518,8 @@ async def run_max_bot(settings: Settings) -> None:
                 payload = await client.get_updates(marker=marker, timeout=settings.max_longpoll_timeout_seconds)
                 marker = payload.get("marker", marker)
                 for raw in payload.get("updates", []):
+                    if settings.max_debug_raw_updates:
+                        logger.info("MAX raw update sanitized=%s", sanitize_raw_update(raw))
                     event = parse_update(raw)
                     if event:
                         await handle_update(client, event, settings)

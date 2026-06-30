@@ -156,6 +156,31 @@ class MaxBotClient:
             return await self.send_image(chat_id, file_path, caption)
         return await self.send_file(chat_id, file_path, caption)
 
+
+    async def resolve_attachment_url(self, *, token: str | None = None, message_id: str | None = None) -> str | None:
+        from app.adapters.max.mapper import parse_update
+
+        if message_id:
+            try:
+                message = await self.get_message(message_id)
+                event = parse_update({"message": message}) or parse_update({"message": message.get("message", {})})
+                if event:
+                    url = event.photo_url or event.document_url
+                    if url:
+                        return url
+            except Exception:
+                logger.exception("Failed to resolve MAX attachment URL by message_id=%s", message_id)
+        if token:
+            for path in (f"/files/{token}", f"/attachments/{token}", f"/uploads/{token}"):
+                try:
+                    payload = await self.request("GET", path)
+                except Exception:
+                    continue
+                url = _first_url(payload)
+                if url:
+                    return url
+        return None
+
     async def download_attachment(self, attachment: dict, destination: Path) -> Path:
         payload = attachment.get("payload") or {}
         url = payload.get("url") or payload.get("download_url")
@@ -173,3 +198,20 @@ class MaxBotClient:
             if response.status >= 400:
                 raise RuntimeError(f"MAX download error {response.status}")
             return await response.read()
+
+
+def _first_url(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in ("url", "download_url", "file_url", "image_url", "media_url"):
+            if value.get(key):
+                return str(value[key])
+        for item in value.values():
+            url = _first_url(item)
+            if url:
+                return url
+    elif isinstance(value, list):
+        for item in value:
+            url = _first_url(item)
+            if url:
+                return url
+    return None

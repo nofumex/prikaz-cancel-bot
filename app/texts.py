@@ -99,9 +99,9 @@ def payment_text(case, price: int) -> str:
 
 def deadline_warning(deadline: date | None, reminder_no: int) -> str:
     elapsed = {
-        1: "Прошли 24 часа после подготовки preview PDF.",
-        2: "Прошло двое суток после подготовки preview PDF.",
-        3: "Прошло трое суток после подготовки preview PDF.",
+        1: "Ваше заявление уже подготовлено.",
+        2: "Ваше заявление уже подготовлено.",
+        3: "Ваше заявление уже подготовлено.",
     }.get(reminder_no, "Заявление уже подготовлено.")
     tail = f"Срок на отмену судебного приказа истекает {deadline.strftime('%d.%m.%Y')}." if deadline else "Срок на отмену судебного приказа ограничен 10 днями."
     return (

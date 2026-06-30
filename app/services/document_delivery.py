@@ -37,6 +37,8 @@ async def deliver_documents_to_case_platform(case_id: int, settings: Settings, t
         if not case:
             raise RuntimeError(f"Case {case_id} not found")
         await session.refresh(case, ["user"])
+        if case.delivered_at:
+            return
         if case.platform == "max":
             await _deliver_to_max(case, settings)
         else:

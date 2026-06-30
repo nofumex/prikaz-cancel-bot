@@ -51,6 +51,7 @@ class Settings:
     max_upload_retry_attempts: int
     max_upload_retry_base_seconds: int
     max_admin_ids: set[int]
+    max_debug_raw_updates: bool
     run_telegram: bool
     run_max: bool
     admin_ids: set[int]
@@ -74,6 +75,12 @@ class Settings:
     yoomoney_receiver: str | None
     yoomoney_success_url: str | None
     yoomoney_notification_secret: str | None
+    yookassa_enabled: bool
+    yookassa_shop_id: str | None
+    yookassa_secret_key: str | None
+    yookassa_return_url: str | None
+    yookassa_webhook_path: str
+    yookassa_test_mode: bool
     payment_public_base_url: str | None
     payment_web_host: str
     payment_web_port: int
@@ -131,6 +138,7 @@ def get_settings() -> Settings:
         max_upload_retry_attempts=_parse_int(getenv("MAX_UPLOAD_RETRY_ATTEMPTS"), 5),
         max_upload_retry_base_seconds=_parse_int(getenv("MAX_UPLOAD_RETRY_BASE_SECONDS"), 1),
         max_admin_ids=_parse_int_set(getenv("MAX_ADMIN_IDS")),
+        max_debug_raw_updates=_parse_bool(getenv("MAX_DEBUG_RAW_UPDATES"), False),
         run_telegram=_parse_bool(getenv("RUN_TELEGRAM"), True),
         run_max=_parse_bool(getenv("RUN_MAX"), False),
         admin_ids=admin_ids,
@@ -152,6 +160,12 @@ def get_settings() -> Settings:
         yoomoney_receiver=(getenv("YOOMONEY_RECEIVER") or "").strip() or None,
         yoomoney_success_url=(getenv("YOOMONEY_SUCCESS_URL") or "").strip() or None,
         yoomoney_notification_secret=(getenv("YOOMONEY_NOTIFICATION_SECRET") or "").strip() or None,
+        yookassa_enabled=_parse_bool(getenv("YOOKASSA_ENABLED"), False),
+        yookassa_shop_id=(getenv("YOOKASSA_SHOP_ID") or "").strip() or None,
+        yookassa_secret_key=(getenv("YOOKASSA_SECRET_KEY") or "").strip() or None,
+        yookassa_return_url=(getenv("YOOKASSA_RETURN_URL") or "").strip() or None,
+        yookassa_webhook_path=(getenv("YOOKASSA_WEBHOOK_PATH") or "/payments/yookassa").strip() or "/payments/yookassa",
+        yookassa_test_mode=_parse_bool(getenv("YOOKASSA_TEST_MODE"), False),
         payment_public_base_url=(getenv("PAYMENT_PUBLIC_BASE_URL") or "").strip().rstrip("/") or None,
         payment_web_host=getenv("PAYMENT_WEB_HOST", "0.0.0.0"),
         payment_web_port=_parse_int(getenv("PAYMENT_WEB_PORT"), 8080),
