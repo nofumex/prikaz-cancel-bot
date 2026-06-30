@@ -181,16 +181,43 @@ class MaxBotClient:
                     return url
         return None
 
+    async def download_by_token(self, token: str) -> bytes | None:
+        for path in (f"/files/{token}", f"/attachments/{token}", f"/uploads/{token}"):
+            url = path if path.startswith("http") else self.base_url + path
+            try:
+                async with self.session.get(url) as response:
+                    if response.status >= 400:
+                        continue
+                    content_type = (response.headers.get("Content-Type") or "").lower()
+                    if "json" in content_type or not content_type:
+                        payload = await response.json(content_type=None)
+                        direct_url = _first_url(payload)
+                        if direct_url:
+                            return await self.download_file(direct_url)
+                        nested_token = _first_token(payload)
+                        if nested_token and nested_token != token:
+                            nested = await self.download_by_token(nested_token)
+                            if nested:
+                                return nested
+                        continue
+                    return await response.read()
+            except Exception:
+                logger.exception("Failed to download MAX attachment via token endpoint %s", path)
+        return None
+
     async def download_attachment(self, attachment: dict, destination: Path) -> Path:
         payload = attachment.get("payload") or {}
-        url = payload.get("url") or payload.get("download_url")
-        if not url:
+        url = _first_url(payload)
+        token = _first_token(payload)
+        data: bytes | None = None
+        if url:
+            data = await self.download_file(url)
+        elif token:
+            data = await self.download_by_token(token)
+        if data is None:
             raise RuntimeError("MAX attachment has no downloadable URL")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        async with self.session.get(url) as response:
-            if response.status >= 400:
-                raise RuntimeError(f"MAX download error {response.status}")
-            destination.write_bytes(await response.read())
+        destination.write_bytes(data)
         return destination
 
     async def download_file(self, url: str) -> bytes:
@@ -214,4 +241,21 @@ def _first_url(value: Any) -> str | None:
             url = _first_url(item)
             if url:
                 return url
+    return None
+
+
+def _first_token(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in ("token", "file_token", "photo_token", "image_token", "media_token", "file_id", "photo_id", "image_id"):
+            if value.get(key):
+                return str(value[key])
+        for item in value.values():
+            token = _first_token(item)
+            if token:
+                return token
+    elif isinstance(value, list):
+        for item in value:
+            token = _first_token(item)
+            if token:
+                return token
     return None

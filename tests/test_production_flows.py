@@ -1,7 +1,9 @@
 ﻿from __future__ import annotations
 
 from datetime import datetime, timedelta
+import sys
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -14,7 +16,7 @@ from app.enums import CaseStatus, PaymentStatus
 from app.models import Base, Case, Payment, User
 from app.services.cases import due_unpaid_cases, get_or_create_active_case
 from app.services.payments import ensure_payment, mark_paid_by_external_payment_id, refresh_yookassa_payment_for_case
-from app.services.yookassa import YooKassaClient
+from app.services.yookassa import YooKassaClient, YooKassaReceiptContactRequired
 
 
 @pytest_asyncio.fixture
@@ -40,6 +42,13 @@ def settings(**overrides):
         yookassa_secret_key="secret",
         yookassa_return_url="https://example.test/payments/success",
         yookassa_test_mode=False,
+        yookassa_receipt_enabled=True,
+        yookassa_vat_code=1,
+        yookassa_payment_subject="service",
+        yookassa_payment_mode="full_payment",
+        yookassa_receipt_description="Подготовка заявления об отмене судебного приказа",
+        yookassa_test_customer_email=None,
+        yookassa_tax_system_code=None,
     )
     data.update(overrides)
     return SimpleNamespace(**data)
@@ -230,7 +239,7 @@ async def test_yookassa_create_payment(monkeypatch, session_factory):
 
     monkeypatch.setattr(YooKassaClient, "request", fake_request)
     async with session_factory() as session:
-        user = User(platform="telegram", platform_user_id="1")
+        user = User(platform="telegram", platform_user_id="1", email="user@example.com")
         session.add(user)
         await session.flush()
         case = Case(user_id=user.id, platform="telegram", platform_user_id="1", status=CaseStatus.PREVIEW_READY.value)
@@ -248,6 +257,92 @@ async def test_yookassa_create_payment(monkeypatch, session_factory):
 
 
 @pytest.mark.asyncio
+async def test_yookassa_create_payment_includes_receipt(monkeypatch, session_factory):
+    captured = {}
+
+    async def fake_request(self, method, path, *, json_body=None, headers=None):
+        captured.update(method=method, path=path, json_body=json_body, headers=headers)
+        return {"id": "pay-1", "status": "pending", "confirmation": {"confirmation_url": "https://pay.test/1"}}
+
+    monkeypatch.setattr(YooKassaClient, "request", fake_request)
+    async with session_factory() as session:
+        user = User(platform="telegram", platform_user_id="1", email="buyer@example.com")
+        session.add(user)
+        await session.flush()
+        case = Case(user_id=user.id, platform="telegram", platform_user_id="1", status=CaseStatus.PREVIEW_READY.value)
+        session.add(case)
+        await session.commit()
+
+        await ensure_payment(session, case, settings())
+
+    receipt = captured["json_body"]["receipt"]
+    item = receipt["items"][0]
+    assert receipt["customer"]["email"] == "buyer@example.com"
+    assert item["description"] == "Подготовка заявления об отмене судебного приказа"
+    assert item["amount"]["value"] == "990.00"
+    assert item["amount"]["currency"] == "RUB"
+    assert item["vat_code"] == 1
+    assert item["payment_subject"] == "service"
+    assert item["payment_mode"] == "full_payment"
+    assert item["measure"] == "piece"
+
+
+@pytest.mark.asyncio
+async def test_yookassa_receipt_uses_customer_email(monkeypatch, session_factory):
+    captured = {}
+
+    async def fake_request(self, method, path, *, json_body=None, headers=None):
+        captured.update(json_body=json_body)
+        return {"id": "pay-1", "status": "pending", "confirmation": {"confirmation_url": "https://pay.test/1"}}
+
+    monkeypatch.setattr(YooKassaClient, "request", fake_request)
+    async with session_factory() as session:
+        user = User(platform="telegram", platform_user_id="1")
+        session.add(user)
+        await session.flush()
+        case = Case(user_id=user.id, platform="telegram", platform_user_id="1")
+        session.add(case)
+        await session.commit()
+
+        await ensure_payment(session, case, settings(yookassa_test_customer_email="script@example.com"))
+
+    assert captured["json_body"]["receipt"]["customer"]["email"] == "script@example.com"
+
+
+@pytest.mark.asyncio
+async def test_yookassa_requires_email_when_receipt_enabled(monkeypatch, session_factory):
+    monkeypatch.setattr(YooKassaClient, "request", AsyncMock())
+    async with session_factory() as session:
+        user = User(platform="telegram", platform_user_id="1")
+        session.add(user)
+        await session.flush()
+        case = Case(user_id=user.id, platform="telegram", platform_user_id="1")
+        session.add(case)
+        await session.commit()
+
+        with pytest.raises(YooKassaReceiptContactRequired):
+            await ensure_payment(session, case, settings(yookassa_test_customer_email=None))
+
+
+@pytest.mark.asyncio
+async def test_check_yookassa_create_test_payment_with_receipt(monkeypatch):
+    from scripts import check_yookassa
+
+    captured = {}
+
+    async def fake_request(self, method, path, *, json_body=None, headers=None):
+        captured.update(json_body=json_body, headers=headers)
+        return {"id": "pay-1", "status": "pending", "confirmation": {"confirmation_url": "https://pay.test/1"}}
+
+    monkeypatch.setattr(check_yookassa, "get_settings", lambda: settings(yookassa_test_customer_email="test@example.com"))
+    monkeypatch.setattr(YooKassaClient, "request", fake_request)
+    monkeypatch.setattr(sys, "argv", ["check_yookassa.py", "--create-test-payment"])
+
+    assert await check_yookassa.main() == 0
+    assert captured["json_body"]["receipt"]["customer"]["email"] == "test@example.com"
+
+
+@pytest.mark.asyncio
 async def test_yookassa_uses_idempotence_key(monkeypatch, session_factory):
     keys = []
 
@@ -257,7 +352,7 @@ async def test_yookassa_uses_idempotence_key(monkeypatch, session_factory):
 
     monkeypatch.setattr(YooKassaClient, "request", fake_request)
     async with session_factory() as session:
-        user = User(platform="telegram", platform_user_id="1")
+        user = User(platform="telegram", platform_user_id="1", email="user@example.com")
         session.add(user)
         await session.flush()
         case = Case(user_id=user.id, platform="telegram", platform_user_id="1")
@@ -278,7 +373,7 @@ async def test_payment_created_once_per_case(monkeypatch, session_factory):
 
     monkeypatch.setattr(YooKassaClient, "request", fake_request)
     async with session_factory() as session:
-        user = User(platform="telegram", platform_user_id="1")
+        user = User(platform="telegram", platform_user_id="1", email="user@example.com")
         session.add(user)
         await session.flush()
         case = Case(user_id=user.id, platform="telegram", platform_user_id="1")
@@ -334,7 +429,7 @@ async def test_payment_check_polls_yookassa(monkeypatch, session_factory):
 
     monkeypatch.setattr(YooKassaClient, "request", fake_request)
     async with session_factory() as session:
-        user = User(platform="telegram", platform_user_id="1")
+        user = User(platform="telegram", platform_user_id="1", email="user@example.com")
         session.add(user)
         await session.flush()
         case = Case(user_id=user.id, platform="telegram", platform_user_id="1", status=CaseStatus.PAYMENT_PENDING.value)

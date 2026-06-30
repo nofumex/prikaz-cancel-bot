@@ -41,6 +41,27 @@ def normalize_phone(raw: str | None) -> str | None:
     return "+" + digits
 
 
+def normalize_email(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
+        return value
+    return None
+
+
+def normalize_receipt_contact(raw: str | None) -> tuple[str, str] | None:
+    email = normalize_email(raw)
+    if email:
+        return "email", email
+    phone = normalize_phone(raw)
+    if phone:
+        return "phone", phone
+    return None
+
+
 def parse_russian_date(raw: str | None) -> date | None:
     if not raw:
         return None

@@ -14,6 +14,7 @@ from app.keyboards.common import envelope_choice, order_rephoto_menu
 from app.models import Case, User
 from app.services.legal_data import normalize_order_data
 from app.adapters.max.keyboards import envelope_choice as max_envelope_choice, order_rephoto_menu as max_order_rephoto_menu
+from app.adapters.max.mapper import sanitize_raw_update
 
 
 def _make_settings(**kwargs):
@@ -336,6 +337,84 @@ def test_max_parse_update_accepts_photo_attachment_variants():
     assert event.photo_token == "photo-token"
 
 
+def test_max_image_payload_token_downloads_file():
+    event = parse_update(
+        {
+            "message": {
+                "sender": {"user_id": "42"},
+                "recipient": {"chat_id": "chat-1"},
+                "body": {"attachments": [{"type": "image", "payload": {"photo": {"token": "token-123"}}}]},
+            }
+        }
+    )
+
+    assert event is not None
+    assert event.photo_token == "token-123"
+    assert event.has_raw_attachment is True
+
+
+def test_max_image_payload_url_downloads_file():
+    event = parse_update(
+        {
+            "message": {
+                "sender": {"user_id": "42"},
+                "recipient": {"chat_id": "chat-1"},
+                "attachments": [{"type": "image", "payload": {"image": {"url": "https://example.test/order.jpg"}}}],
+            }
+        }
+    )
+
+    assert event is not None
+    assert event.photo_url == "https://example.test/order.jpg"
+    assert event.has_raw_attachment is True
+
+
+def test_max_nested_attachment_downloads_file():
+    event = parse_update(
+        {
+            "message": {
+                "sender": {"user_id": "42"},
+                "recipient": {"chat_id": "chat-1"},
+                "body": {
+                    "attachments": [
+                        {
+                            "attachment_type": "file",
+                            "payload": {
+                                "video_thumbnail": {"file_id": "thumb-file-id"},
+                                "file": {"name": "order.jpg", "url": "https://example.test/order.jpg"},
+                            },
+                        }
+                    ]
+                },
+            }
+        }
+    )
+
+    assert event is not None
+    assert event.document_url == "https://example.test/order.jpg"
+    assert event.document_name == "order.jpg"
+    assert event.has_raw_attachment is True
+
+
+def test_max_debug_raw_update_redacts_tokens():
+    cleaned = sanitize_raw_update(
+        {
+            "message": {
+                "body": {
+                    "attachments": [
+                        {"payload": {"token": "secret-token", "file_id": "file-123", "nested": {"photo_token": "photo-secret"}}}
+                    ]
+                }
+            }
+        }
+    )
+
+    payload = cleaned["message"]["body"]["attachments"][0]["payload"]
+    assert payload["token"] == "***"
+    assert payload["nested"]["photo_token"] == "***"
+    assert payload["file_id"] == "file-123"
+
+
 @pytest.mark.asyncio
 async def test_max_photo_token_counts_as_attachment(monkeypatch):
     from app.adapters.max import bot as max_bot
@@ -354,6 +433,37 @@ async def test_max_photo_token_counts_as_attachment(monkeypatch):
     client = SimpleNamespace(answer_callback=AsyncMock(), send_message=AsyncMock())
     user = User(id=1, platform="max", platform_user_id="42")
     event = IncomingEvent(platform_user_id="42", chat_id="chat-1", photo_token="token-only")
+    handle_order = AsyncMock()
+
+    monkeypatch.setattr(max_bot, "SessionLocal", lambda: SessionContext())
+    monkeypatch.setattr(max_bot, "get_or_create_platform_user", AsyncMock(return_value=user))
+    monkeypatch.setattr(max_bot, "_state", AsyncMock(return_value=max_bot.STATE_ORDER_PHOTO))
+    monkeypatch.setattr(max_bot, "_handle_order_image", handle_order)
+
+    await max_bot.handle_update(client, event, settings)
+
+    assert handle_order.await_count == 1
+    assert client.send_message.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_max_photo_is_accepted_as_order(monkeypatch):
+    from app.adapters.max import bot as max_bot
+    from app.adapters.max.mapper import IncomingEvent
+
+    settings = _make_settings(amocrm_enabled=False)
+    session = object()
+
+    class SessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    client = SimpleNamespace(answer_callback=AsyncMock(), send_message=AsyncMock())
+    user = User(id=1, platform="max", platform_user_id="42")
+    event = IncomingEvent(platform_user_id="42", chat_id="chat-1", photo_url="https://example.test/order.jpg")
     handle_order = AsyncMock()
 
     monkeypatch.setattr(max_bot, "SessionLocal", lambda: SessionContext())

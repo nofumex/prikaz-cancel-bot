@@ -1,0 +1,1286 @@
+Ты работаешь в репозитории:
+
+`https://github.com/nofumex/prikaz-cancel-bot`
+
+Нужно довести проект до production-ready состояния.
+
+Сейчас проект близок, но есть критические недоработки:
+
+1. amoCRM тормозит пользовательский сценарий, потому что CRM-синхронизация выполняется через `await crm.sync_case_event(...)` прямо внутри Telegram handler’ов.
+2. В amoCRM нужно оставить ровно 5 этапов, без лишних технических этапов.
+3. MAX-бот сейчас фактически каркас, а должен быть полноценным ботом с тем же функционалом, что Telegram.
+4. MAX-интеграция должна быть сделана по актуальной официальной документации MAX.
+5. Документ case_37 уже стал лучше, но надо довести нормализацию текста.
+6. После выполнения проект должен быть реально готов к production-проверке: Telegram, MAX, amoCRM, PDF, документы, платежи, напоминания, QA, README, тесты.
+
+ВАЖНО ПО СЕКРЕТАМ:
+
+* Не выводи значения токенов в лог, README, тесты, commit message, traceback.
+* Не коммить `.env`.
+* Не создавай файлы с секретами.
+* Если нужен пример — используй только имена переменных без значений.
+* Если видишь уже раскрытые токены в локальном `.env` или логах — не копируй их в ответ.
+
+После выполнения:
+
+1. Сделай commit и push в `main`.
+2. Напиши commit hash.
+3. Дай `git diff --stat`.
+4. Дай список измененных файлов.
+5. Прогони:
+
+   * `python -m py_compile` по всем `.py`;
+   * `pytest`;
+   * `python scripts/smoke_test.py`;
+   * `python scripts/check_amocrm.py`;
+   * новый smoke/integration test для MAX.
+6. Приложи пути к новым тестовым артефактам:
+
+   * full DOCX;
+   * full PDF;
+   * preview PDF;
+   * instruction DOCX;
+   * manifest.
+7. Напиши точную инструкцию запуска:
+
+   * Telegram;
+   * MAX webhook;
+   * MAX long polling для dev;
+   * amoCRM;
+   * YooMoney;
+   * PDF/LibreOffice.
+8. Не писать “готово к production”, если не выполнены acceptance criteria внизу.
+
+---
+
+# 1. Главная проблема: amoCRM не должна блокировать пользователя
+
+Сейчас пользователь нажимает `Подготовить заявление`, а handler сначала делает `await crm.sync_case_event(...)`, и только потом отвечает пользователю. Если amoCRM отвечает медленно, бот молчит минуту.
+
+Это недопустимо.
+
+## 1.1. Главный принцип
+
+Во всех пользовательских сценариях:
+
+```text
+сначала ответить пользователю
+потом синхронизировать CRM в фоне
+```
+
+Нельзя:
+
+```python
+await crm.sync_case_event(...)
+await message.answer(...)
+```
+
+Нужно:
+
+```python
+await message.answer(...)
+schedule_crm_sync(...)
+```
+
+или:
+
+```python
+await message.answer(...)
+asyncio.create_task(...)
+```
+
+но с правильной DB-сессией и обработкой ошибок.
+
+## 1.2. Создать background CRM layer
+
+Добавь модуль:
+
+```text
+app/services/crm_background.py
+```
+
+В нем реализуй:
+
+```python
+def schedule_crm_sync(
+    settings: Settings,
+    case_id: int,
+    user_id: int,
+    event_type: str,
+    payload: dict | None = None,
+) -> None:
+    ...
+```
+
+и внутреннюю корутину:
+
+```python
+async def run_crm_sync_job(
+    settings: Settings,
+    case_id: int,
+    user_id: int,
+    event_type: str,
+    payload: dict | None = None,
+) -> None:
+    ...
+```
+
+Требования:
+
+* не передавать живой `AsyncSession` из handler’а в background task;
+* внутри background task открывать новую DB session через `SessionLocal`;
+* заново загружать `Case` и `User`;
+* вызывать `crm.sync_case_event(...)`;
+* ловить все исключения;
+* писать ошибки в `crm_sync_logs`;
+* не ломать Telegram/MAX flow;
+* логировать длительность;
+* не логировать токены.
+
+Пример логов:
+
+```text
+CRM sync scheduled event=user_started_bot case_id=...
+CRM sync start event=user_started_bot case_id=...
+CRM sync done event=user_started_bot case_id=... duration_ms=...
+CRM sync failed event=user_started_bot case_id=... duration_ms=... error=...
+```
+
+## 1.3. Конфиг CRM background
+
+Добавить env:
+
+```text
+CRM_SYNC_BACKGROUND=true
+CRM_SYNC_TIMEOUT_SECONDS=5
+CRM_SYNC_MAX_ATTEMPTS=3
+CRM_SYNC_RETRY_BASE_SECONDS=2
+CRM_SYNC_DEBUG=false
+```
+
+По умолчанию:
+
+```text
+CRM_SYNC_BACKGROUND=true
+CRM_SYNC_TIMEOUT_SECONDS=5
+CRM_SYNC_MAX_ATTEMPTS=3
+CRM_SYNC_RETRY_BASE_SECONDS=2
+```
+
+Если `CRM_SYNC_BACKGROUND=false`, можно выполнять sync синхронно только для debug scripts, но в production по умолчанию background.
+
+## 1.4. Явное отключение CRM
+
+Сейчас была проблема: CRM включается автоматически, если есть URL + token.
+
+Нужно сделать так:
+
+* если `AMOCRM_ENABLED=false` явно задано в `.env` — CRM выключена всегда;
+* если `AMOCRM_ENABLED=true` — CRM включена;
+* если `AMOCRM_ENABLED` не задан вообще — можно auto-enable при наличии `AMOCRM_BASE_URL` + `AMOCRM_ACCESS_TOKEN`.
+
+То есть явный false имеет приоритет над auto-enable.
+
+## 1.5. Убрать blocking CRM из handler’ов
+
+Проверить и исправить все места:
+
+```text
+app/handlers/case_flow.py
+app/handlers/chat.py
+app/handlers/admin.py
+app/services/payment_web.py
+app/services/reminders.py
+app/adapters/max/*
+```
+
+Все события CRM должны идти через `schedule_crm_sync`, кроме специальных admin-команд типа `check_amocrm.py`.
+
+События:
+
+```text
+user_started_bot
+order_photo_uploaded
+received_date_entered
+envelope_photo_uploaded
+ocr_completed
+case_data_confirmed
+preview_generated
+payment_created
+payment_paid
+documents_delivered
+document_qa_failed
+manager_requested
+payment_abandoned
+reminder_sent
+```
+
+Пользователь не должен ждать CRM ни на одном шаге.
+
+## 1.6. Performance acceptance
+
+Добавить timing logs:
+
+```text
+handler case:new answered_to_user duration_ms=...
+handler order_photo_received answered_to_user duration_ms=...
+handler received_date_entered answered_to_user duration_ms=...
+```
+
+Acceptance:
+
+* `case:new` отвечает пользователю меньше чем за 1 секунду даже если amoCRM спит 60 секунд;
+* отправка фото приказа отвечает пользователю меньше чем за 1 секунду после скачивания файла;
+* ввод даты не ждет amoCRM;
+* генерация документов может ждать OpenAI/PDF, но не CRM;
+* CRM ошибка не видна пользователю.
+
+---
+
+# 2. amoCRM: оставить ровно 5 этапов
+
+Нужно оставить в воронке `Судебный приказ` ровно 5 рабочих этапов:
+
+```text
+1. Подписался на бота
+2. Отправил приказ
+3. Указал дату
+4. Оплатил
+5. Получил напоминание (не оплатил)
+```
+
+НЕ надо возвращать 11 этапов. НЕ надо менять на другие названия.
+
+## 2.1. Mapping событий
+
+Сделать `EVENT_STATUS_MAP`:
+
+```python
+EVENT_STATUS_MAP = {
+    "user_started_bot": "Подписался на бота",
+
+    "order_photo_uploaded": "Отправил приказ",
+
+    "received_date_entered": "Указал дату",
+    "envelope_photo_uploaded": "Указал дату",
+    "ocr_completed": "Указал дату",
+    "case_data_confirmed": "Указал дату",
+    "preview_generated": "Указал дату",
+    "payment_created": "Указал дату",
+    "document_qa_failed": "Указал дату",
+    "manager_requested": "Указал дату",
+
+    "payment_paid": "Оплатил",
+    "documents_delivered": "Оплатил",
+
+    "reminder_sent": "Получил напоминание (не оплатил)",
+    "payment_abandoned": "Получил напоминание (не оплатил)",
+}
+```
+
+Важно:
+
+* если человек получил reminder и потом оплатил — сделка должна перейти в `Оплатил`;
+* если пользователь оплатил, дальнейшие reminders не должны уводить сделку обратно;
+* если документы выданы — можно оставить на `Оплатил`, потому что пользователь просит только 5 этапов.
+
+## 2.2. Статусы в amoCRM
+
+В `amocrm.py`:
+
+```python
+PIPELINE_STATUSES = [
+    "Подписался на бота",
+    "Отправил приказ",
+    "Указал дату",
+    "Оплатил",
+    "Получил напоминание (не оплатил)",
+]
+```
+
+Технические события не должны создавать технические этапы.
+
+## 2.3. Старые этапы
+
+Если в amoCRM уже есть старые этапы:
+
+* не удалять автоматически;
+* не ломать чужие этапы;
+* создать/найти только нужные 5;
+* использовать только эти 5 для движения сделок;
+* в `scripts/check_amocrm.py` показать:
+
+  * нужные этапы;
+  * лишние этапы;
+  * рекомендацию удалить лишние вручную, если нужно.
+
+## 2.4. Не делать ensure_pipeline/ensure_statuses на каждый event
+
+Чтобы CRM не тормозила:
+
+* кэшировать pipeline_id;
+* кэшировать status_id mapping;
+* использовать `AMOCRM_PIPELINE_ID`, если он задан;
+* выполнять `ensure_statuses`:
+
+  * при старте;
+  * по admin-кнопке “Проверить CRM”;
+  * в `scripts/check_amocrm.py`;
+  * но не на каждом пользовательском событии.
+
+## 2.5. CRM contact/lead
+
+Одна заявка `Case` = одна сделка.
+
+Сделка:
+
+```text
+Судебный приказ #{{case_id}} — @{{username}}
+```
+
+или:
+
+```text
+Судебный приказ #{{case_id}} — {{platform}} ID {{platform_user_id}}
+```
+
+Контакт должен учитывать платформу:
+
+```text
+Telegram user id
+MAX user id
+username
+first_name
+last_name
+phone, если есть
+source: Telegram бот / MAX бот
+```
+
+Не создавать дубль сделки на повторное событие.
+
+---
+
+# 3. Полноценный MAX-бот с тем же функционалом, что Telegram
+
+Сейчас MAX-бот — только каркас. Нужно сделать MAX-бота полностью функциональным.
+
+## 3.1. Изучить актуальную документацию MAX
+
+Перед реализацией изучи официальную документацию MAX:
+
+* общая документация API;
+* `POST /messages`;
+* `POST /subscriptions`;
+* `GET /updates`;
+* `POST /uploads`;
+* объекты `Update`, `Message`, attachments, inline keyboard, callback.
+
+Критично:
+
+* использовать `platform-api2.max.ru`, а не устаревший/неправильный домен;
+* токен передавать через заголовок `Authorization: <token>`;
+* для production использовать webhook;
+* long polling оставить только для dev/test;
+* webhook должен проверять `X-Max-Bot-Api-Secret`, если задан secret;
+* загрузка файлов идет через `POST /uploads` → upload URL → отправка message attachment.
+
+## 3.2. Конфиг MAX
+
+Добавить/обновить `.env.example`:
+
+```text
+RUN_MAX=false
+MAX_BOT_TOKEN=
+MAX_API_BASE_URL=https://platform-api2.max.ru
+MAX_USE_WEBHOOK=false
+MAX_WEBHOOK_URL=
+MAX_WEBHOOK_SECRET=
+MAX_WEBHOOK_HOST=0.0.0.0
+MAX_WEBHOOK_PORT=8081
+MAX_LONGPOLL_TIMEOUT_SECONDS=30
+MAX_DOWNLOAD_DIR=storage/max
+MAX_UPLOAD_RETRY_ATTEMPTS=5
+MAX_UPLOAD_RETRY_BASE_SECONDS=1
+```
+
+Для production:
+
+```text
+RUN_MAX=true
+MAX_USE_WEBHOOK=true
+MAX_WEBHOOK_URL=https://your-domain.com/max/webhook
+MAX_WEBHOOK_SECRET=<random secret>
+```
+
+Для dev:
+
+```text
+RUN_MAX=true
+MAX_USE_WEBHOOK=false
+```
+
+## 3.3. MAX client
+
+Переделать `app/adapters/max/client.py`.
+
+Нужны методы:
+
+```python
+class MaxBotClient:
+    async def get_me(self) -> dict: ...
+    async def get_updates(self, marker: int | None = None, timeout: int = 30, limit: int = 100, types: list[str] | None = None) -> dict: ...
+    async def send_message(self, chat_id=None, user_id=None, text="", keyboard=None, attachments=None) -> dict: ...
+    async def answer_callback(self, callback_id: str, text: str | None = None) -> None: ...
+    async def get_upload_url(self, upload_type: str) -> dict: ...
+    async def upload_file(self, path: str | Path, upload_type: str) -> dict: ...
+    async def send_file(self, chat_id, path: str | Path, caption: str | None = None) -> dict: ...
+    async def send_image(self, chat_id, path: str | Path, caption: str | None = None) -> dict: ...
+    async def download_attachment(self, attachment: dict, destination: Path) -> Path: ...
+```
+
+Требования:
+
+* `base_url` по умолчанию `https://platform-api2.max.ru`;
+* `Authorization` header;
+* timeout;
+* retry/backoff на 429/503;
+* не логировать токен;
+* корректно обрабатывать `attachment.not.ready` при отправке файла после upload;
+* для файлов использовать `type=file`;
+* для изображений использовать `type=image`;
+* не использовать `type=photo`.
+
+## 3.4. MAX webhook server
+
+Добавить модуль:
+
+```text
+app/adapters/max/webhook.py
+```
+
+Реализовать endpoint:
+
+```text
+POST /max/webhook
+```
+
+Логика:
+
+1. Проверить `X-Max-Bot-Api-Secret`, если `MAX_WEBHOOK_SECRET` задан.
+2. Быстро вернуть HTTP 200.
+3. Обработку события запускать в background task/queue.
+4. Не держать webhook больше 1–2 секунд.
+5. Логировать update_id / event type без персональных лишних данных.
+
+Если webhook secret неверный:
+
+```text
+403 Forbidden
+```
+
+## 3.5. MAX long polling для dev
+
+Оставить `run_max_bot`, но:
+
+* использовать `platform-api2.max.ru`;
+* использовать правильные update types;
+* не использовать long polling в production;
+* README явно написать: long polling только для dev/test.
+
+## 3.6. Unified business flow
+
+Не копировать всю Telegram-логику хаотично. Создать общий слой сценария:
+
+```text
+app/services/case_workflow.py
+```
+
+или:
+
+```text
+app/bot_flows/case_flow_core.py
+```
+
+В нем сделать платформо-независимые функции:
+
+```python
+async def start_new_case(ctx: BotContext) -> None
+async def handle_order_image(ctx: BotContext, file_path: Path) -> None
+async def handle_envelope_image(ctx: BotContext, file_path: Path) -> None
+async def handle_manual_date(ctx: BotContext, text: str) -> None
+async def handle_confirm_data(ctx: BotContext) -> None
+async def handle_edit_field(ctx: BotContext, field: str, value: str) -> None
+async def handle_restore_reason(ctx: BotContext, reason: str) -> None
+async def handle_payment_check(ctx: BotContext) -> None
+async def deliver_documents(ctx: BotContext) -> None
+async def handle_manager_request(ctx: BotContext) -> None
+```
+
+`BotContext` должен абстрагировать платформу:
+
+```python
+class BotContext:
+    platform: Literal["telegram", "max"]
+    platform_user_id: str
+    chat_id: str
+    user: User
+    case: Case | None
+    session: AsyncSession
+    settings: Settings
+
+    async def send_text(...)
+    async def send_file(...)
+    async def send_keyboard(...)
+    async def answer_callback(...)
+```
+
+Telegram handlers и MAX handlers должны вызывать один и тот же workflow.
+
+Цель: MAX должен быть функционально равен Telegram, а не отдельной урезанной копией.
+
+## 3.7. MAX сценарии, обязательные к реализации
+
+MAX должен поддерживать:
+
+### `/start` / bot_started
+
+Показывает то же меню:
+
+```text
+Подготовить заявление
+Профиль
+Менеджер
+```
+
+### Подготовить заявление
+
+* создать case;
+* CRM event `user_started_bot` в фоне;
+* попросить отправить фото судебного приказа.
+
+### Приказ
+
+Пользователь может отправить:
+
+* изображение;
+* файл-картинку без сжатия.
+
+MAX должен скачать файл/изображение, сохранить в `storage/photos` или `storage/max`, записать `order_photo_path`, отправить CRM event `order_photo_uploaded` в фоне и попросить конверт/дату.
+
+### Конверт / дата
+
+Поддержать:
+
+* фото конверта;
+* ручную дату `ДД.ММ.ГГГГ`.
+
+После даты:
+
+* OpenAI OCR;
+* amount recovery;
+* name normalization;
+* карточка распознанных данных;
+* кнопки подтверждения/редактирования.
+
+### Подтверждение данных
+
+* генерация документов;
+* PDF QA;
+* preview PDF;
+* платеж YooMoney;
+* отправка preview PDF в MAX как файл;
+* кнопка оплаты.
+
+### Оплата
+
+* YooMoney webhook общий;
+* после оплаты full DOCX + full PDF + instruction DOCX должны отправляться в ту платформу, где создан case;
+* если case создан в MAX, документы уходят в MAX;
+* если case создан в Telegram, документы уходят в Telegram.
+
+### Напоминания
+
+* 3 напоминания раз в сутки;
+* если case создан в MAX — напоминание отправляется в MAX;
+* если case создан в Telegram — в Telegram;
+* CRM event `reminder_sent` в фоне переводит сделку на `Получил напоминание (не оплатил)`.
+
+### Менеджер
+
+* кнопка “Менеджер” в MAX;
+* сообщение пользователю;
+* уведомление админам/менеджерам с платформой и ссылкой/ID;
+* CRM event `manager_requested` в фоне, но статус остается согласно 5-stage mapping.
+
+### Профиль
+
+* как в Telegram;
+* показывает текущую заявку;
+* статус;
+* оплату;
+* документы, если есть.
+
+## 3.8. MAX admin
+
+Минимально:
+
+* админы получают уведомления о QA fail, amount recovery warning, manager request;
+* если админ в Telegram — можно уведомлять Telegram;
+* если есть MAX admin IDs — добавить `MAX_ADMIN_IDS`.
+
+Добавить env:
+
+```text
+MAX_ADMIN_IDS=
+```
+
+## 3.9. MAX tests
+
+Добавить тесты:
+
+```text
+tests/test_max_mapper.py
+tests/test_max_client.py
+tests/test_max_workflow.py
+tests/test_max_webhook.py
+```
+
+Тесты:
+
+* parse `bot_started`;
+* parse `message_created` text;
+* parse callback payload;
+* parse image/file attachment;
+* send_message payload contains inline keyboard;
+* upload_file uses `/uploads?type=file`;
+* upload_image uses `/uploads?type=image`;
+* webhook rejects wrong secret;
+* webhook accepts correct secret and schedules processing;
+* MAX start creates user with platform=max;
+* MAX case:new creates case;
+* MAX order image saves `order_photo_path`;
+* MAX manual date triggers extraction flow;
+* MAX payment delivery sends documents;
+* MAX reminders are sent to MAX case.
+
+---
+
+# 4. Документы: довести нормализацию case_37
+
+Документ case_37 стал намного лучше, но в нем остались текстовые дефекты.
+
+Исправить генератор/normalizers:
+
+## 4.1. Нормализация номера участка
+
+Везде:
+
+```text
+№5 -> № 5
+```
+
+Области:
+
+* шапка;
+* основной текст;
+* блок `ПРОШУ`;
+* названия суда;
+* любые поля OCR.
+
+Добавить QA bad token:
+
+```text
+№5
+```
+
+## 4.2. Адрес суда
+
+Сейчас плохо:
+
+```text
+ул. Шмидта, 72
+```
+
+Нужно:
+
+```text
+ул. Шмидта, д. 72
+```
+
+Если строка переносится, не должно быть:
+
+```text
+ул.
+Шмидта
+```
+
+Лучше:
+
+```text
+357600, Ставропольский край, г. Ессентуки,
+ул. Шмидта, д. 72
+```
+
+## 4.3. Адрес взыскателя
+
+Сейчас плохо:
+
+```text
+107061, в городе Москва, Преображенская пл., д. 8
+```
+
+Нужно:
+
+```text
+107061, г. Москва, Преображенская пл., д. 8
+```
+
+Добавить QA bad token:
+
+```text
+в городе Москва
+```
+
+## 4.4. Договор
+
+Сейчас плохо:
+
+```text
+по договор №43006327
+```
+
+Нужно:
+
+```text
+по договору № 43006327
+```
+
+Добавить QA bad token:
+
+```text
+по договор №
+```
+
+## 4.5. Двойная точка после копеек
+
+Сейчас плохо:
+
+```text
+коп..
+```
+
+Нужно:
+
+```text
+коп.
+```
+
+Добавить QA bad token:
+
+```text
+коп..
+руб..
+```
+
+## 4.6. Тесты нормализации
+
+Добавить тесты:
+
+```python
+def test_normalize_court_unit_number_spacing()
+def test_normalize_court_address_house_prefix()
+def test_normalize_creditor_address_moscow()
+def test_normalize_contract_phrase()
+def test_no_double_dot_after_money()
+def test_belsky_case_37_bad_tokens_are_absent()
+```
+
+## 4.7. Smoke acceptance по Бельскому
+
+Перегенерировать кейс Бельского.
+
+Проверить:
+
+```text
+page_count = 1
+no_weird_spaces = true
+no_bad_tokens = true
+amounts_ok = true
+debt_amount = 78 472 руб. 87 коп.
+state_duty = 1 277 руб. 00 коп.
+total_amount = 79 749 руб. 87 коп.
+signature = «24» июня 2026 г. _____________ /Бельский В.Г./
+нет "№5"
+нет "в городе Москва"
+нет "по договор №"
+нет "коп.."
+есть "№ 5"
+есть "ул. Шмидта, д. 72"
+есть "107061, г. Москва, Преображенская пл., д. 8"
+есть "по договору № 43006327"
+```
+
+CRM-этапы не менять сверх 5-stage mapping из этого промпта.
+
+---
+
+# 5. YooMoney / выдача документов: платформа должна сохраняться
+
+Проверь модель `Case` и `User`.
+
+Нужно, чтобы case знал, где создан:
+
+```text
+case.platform = telegram|max
+case.platform_chat_id
+case.platform_user_id
+```
+
+Если этих полей нет — добавить с безопасной миграцией SQLite.
+
+После оплаты YooMoney:
+
+* если case.platform = telegram — документы отправить в Telegram;
+* если case.platform = max — документы отправить в MAX;
+* если отправка не удалась — уведомить админа и сохранить retry state.
+
+Добавить delivery job:
+
+```text
+app/services/document_delivery.py
+```
+
+Функции:
+
+```python
+async def deliver_documents_to_case_platform(case_id: int) -> None
+async def schedule_document_delivery(case_id: int) -> None
+```
+
+Не блокировать webhook YooMoney долгой отправкой файлов.
+
+Webhook оплаты должен:
+
+1. быстро подтвердить получение;
+2. отметить case paid;
+3. запланировать отправку документов в background;
+4. запланировать CRM event `payment_paid` в background.
+
+---
+
+# 6. Напоминания
+
+Сейчас пользователь хочет этап CRM:
+
+```text
+Получил напоминание (не оплатил)
+```
+
+Нужно убедиться:
+
+* reminders отправляются на правильную платформу;
+* reminder не отправляется после оплаты;
+* после первого/каждого reminder CRM event `reminder_sent` переводит сделку в `Получил напоминание (не оплатил)`;
+* если потом оплата пришла — сделка переходит в `Оплатил`.
+
+Добавить тесты:
+
+```text
+test_reminder_for_telegram_case
+test_reminder_for_max_case
+test_reminder_does_not_send_after_paid
+test_reminder_moves_crm_to_unpaid_reminder_stage
+test_paid_after_reminder_moves_to_paid_stage
+```
+
+---
+
+# 7. README и .env.example привести в порядок
+
+Сейчас README/.env.example местами не соответствуют текущему состоянию.
+
+Обновить README:
+
+## Разделы:
+
+```text
+1. Что делает бот
+2. Telegram
+3. MAX
+4. amoCRM
+5. YooMoney
+6. Документы и PDF
+7. OpenAI usage
+8. Production запуск
+9. Dev запуск
+10. Проверки
+11. Troubleshooting
+```
+
+## README должен честно описывать:
+
+* Telegram полностью работает;
+* MAX полностью работает после этой задачи;
+* MAX production использует webhook;
+* MAX long polling только для dev/test;
+* CRM синхронизация background;
+* CRM имеет ровно 5 этапов;
+* PDF требует LibreOffice;
+* платеж не создается без preview PDF;
+* raw debug для OCR сохраняется без секретов.
+
+## .env.example
+
+Привести к актуальному виду:
+
+```text
+# Platforms
+RUN_TELEGRAM=true
+TG_BOT_TOKEN=
+
+RUN_MAX=false
+MAX_BOT_TOKEN=
+MAX_API_BASE_URL=https://platform-api2.max.ru
+MAX_USE_WEBHOOK=false
+MAX_WEBHOOK_URL=
+MAX_WEBHOOK_SECRET=
+MAX_WEBHOOK_HOST=0.0.0.0
+MAX_WEBHOOK_PORT=8081
+MAX_LONGPOLL_TIMEOUT_SECONDS=30
+MAX_ADMIN_IDS=
+
+# Admin
+ADMIN_ID=
+MANAGER_IDS=
+
+# Database
+DATABASE_URL=sqlite+aiosqlite:///data/prikaz_bot.sqlite3
+
+# OpenAI
+OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.openai.com/v1
+VISION_MODEL=gpt-5.4-mini
+TEXT_MODEL=gpt-5.4-mini
+LLM_TIMEOUT_SECONDS=90
+
+# Payments
+DOCUMENT_PRICE_RUB=990
+YOOMONEY_RECEIVER=
+YOOMONEY_SUCCESS_URL=
+YOOMONEY_NOTIFICATION_SECRET=
+PAYMENT_PUBLIC_BASE_URL=
+PAYMENT_WEB_HOST=0.0.0.0
+PAYMENT_WEB_PORT=8080
+
+# PDF
+ENABLE_PDF_PREVIEW=true
+REQUIRE_PDF_PREVIEW_FOR_PAYMENT=true
+ALLOW_DEV_DOCX_PREVIEW=false
+
+# amoCRM
+AMOCRM_ENABLED=true
+AMOCRM_BASE_URL=
+AMOCRM_ACCESS_TOKEN=
+AMOCRM_PIPELINE_NAME=Судебный приказ
+AMOCRM_PIPELINE_ID=
+AMOCRM_AUTO_CREATE_PIPELINE=false
+AMOCRM_AUTO_CREATE_STATUSES=true
+AMOCRM_ATTACH_FILES=true
+AMOCRM_RPS_LIMIT=5
+
+# CRM background
+CRM_SYNC_BACKGROUND=true
+CRM_SYNC_TIMEOUT_SECONDS=5
+CRM_SYNC_MAX_ATTEMPTS=3
+CRM_SYNC_RETRY_BASE_SECONDS=2
+CRM_SYNC_DEBUG=false
+
+# Amount recovery
+AMOUNT_RETRY_ON_MISMATCH=true
+AUTO_RECOVER_AMOUNT_MISMATCH=true
+AUTO_RECOVER_AMOUNT_MIN_CONFIDENCE=0.75
+```
+
+Убрать устаревшие переменные:
+
+```text
+AMOCRM_WRITE_ENABLED
+AMOCRM_STATUS_ID_NEW
+AMOCRM_STATUS_ID_IN_PROGRESS
+AMOCRM_STATUS_ID_CONSULTATION
+```
+
+если они больше не используются.
+
+---
+
+# 8. Production scripts
+
+Добавить/обновить scripts:
+
+```text
+scripts/check_amocrm.py
+scripts/smoke_test.py
+scripts/check_max.py
+scripts/register_max_webhook.py
+scripts/delete_max_webhook.py
+scripts/simulate_case_crm_flow.py
+scripts/simulate_max_flow.py
+scripts/debug_case_amounts.py
+```
+
+## 8.1. check_max.py
+
+Проверяет:
+
+* `MAX_BOT_TOKEN`;
+* `MAX_API_BASE_URL`;
+* `GET /me`;
+* возможность отправки тестового сообщения, если задан `--chat-id`;
+* upload test, если задан `--upload-test`.
+
+Пример:
+
+```bash
+python scripts/check_max.py
+python scripts/check_max.py --chat-id 123
+python scripts/check_max.py --upload-test storage/test_artifacts/sample.pdf
+```
+
+## 8.2. register_max_webhook.py
+
+Создает webhook subscription:
+
+```bash
+python scripts/register_max_webhook.py
+```
+
+Показывает:
+
+```text
+MAX webhook registered
+url=...
+update_types=...
+secret_set=true
+```
+
+Не выводить secret.
+
+## 8.3. simulate_max_flow.py
+
+Без реального MAX API должен прогонять workflow на fake client:
+
+```text
+/start
+case:new
+upload order image
+manual date
+ocr stub
+confirm
+generate preview
+payment stub
+deliver documents
+```
+
+---
+
+# 9. Tests
+
+Добавить/обновить тесты.
+
+## 9.1. CRM tests
+
+```text
+test_case_new_does_not_wait_for_crm
+test_order_photo_does_not_wait_for_crm
+test_received_date_does_not_wait_for_crm
+test_payment_does_not_wait_for_crm
+test_crm_background_uses_new_session
+test_crm_error_is_logged_not_raised
+test_amocrm_enabled_false_has_priority
+test_event_status_map_has_only_five_statuses
+test_reminder_sent_maps_to_unpaid_reminder
+test_paid_after_reminder_maps_to_paid
+```
+
+В тестах замокать CRM так, чтобы она спала 60 секунд, и проверить, что handler отвечает быстро.
+
+## 9.2. MAX tests
+
+```text
+test_max_client_uses_platform_api2
+test_max_auth_header
+test_max_send_message_keyboard
+test_max_upload_file
+test_max_upload_image
+test_max_attachment_not_ready_retries
+test_max_webhook_secret_valid
+test_max_webhook_secret_invalid
+test_max_parse_bot_started
+test_max_parse_message_created_text
+test_max_parse_callback
+test_max_parse_image_attachment
+test_max_start_flow
+test_max_case_new_flow
+test_max_order_file_flow
+test_max_manual_date_flow
+test_max_document_delivery_flow
+```
+
+## 9.3. Document tests
+
+```text
+test_no_num_without_space
+test_no_v_gorode_moskva
+test_no_po_dogovor
+test_no_double_money_period
+test_belsky_document_has_clean_address
+test_belsky_document_has_clean_contract_phrase
+test_belsky_pdf_one_page
+test_belsky_pdf_no_weird_spaces
+```
+
+## 9.4. Payment/delivery tests
+
+```text
+test_yoomoney_paid_schedules_platform_delivery
+test_telegram_case_delivered_to_telegram
+test_max_case_delivered_to_max
+test_delivery_failure_notifies_admin
+```
+
+---
+
+# 10. Manual live test plan
+
+После реализации выполнить вручную и описать результат.
+
+## 10.1. Telegram live
+
+1. `/start`
+2. `Подготовить заявление`
+3. Убедиться, что ответ меньше 1 секунды при включенном AMOCRM_ACCESS_TOKEN.
+4. Отправить приказ.
+5. Указать дату.
+6. Подтвердить данные.
+7. Получить preview PDF.
+8. Проверить платеж.
+9. Отметить оплату.
+10. Получить full DOCX + full PDF + instruction DOCX.
+11. Проверить движение сделки в amoCRM.
+
+## 10.2. MAX live
+
+1. `/start` или bot_started.
+2. `Подготовить заявление`.
+3. Отправить приказ изображением.
+4. Отправить приказ файлом без сжатия.
+5. Указать дату.
+6. Проверить карточку данных.
+7. Подтвердить.
+8. Получить preview PDF.
+9. Получить оплату.
+10. После оплаты получить full DOCX + full PDF + instruction DOCX.
+11. Проверить напоминание, если не оплачено.
+12. Проверить движение сделки в amoCRM.
+
+## 10.3. amoCRM live
+
+В amoCRM должна быть воронка `Судебный приказ` с 5 этапами:
+
+```text
+Подписался на бота
+Отправил приказ
+Указал дату
+Оплатил
+Получил напоминание (не оплатил)
+```
+
+Проверить:
+
+```text
+/start -> Подписался на бота
+отправил приказ -> Отправил приказ
+указал дату -> Указал дату
+оплатил -> Оплатил
+получил reminder без оплаты -> Получил напоминание (не оплатил)
+оплатил после reminder -> Оплатил
+```
+
+---
+
+# 11. Acceptance criteria
+
+Проект можно считать готовым только если выполнено всё:
+
+## CRM
+
+* CRM не блокирует Telegram.
+* CRM не блокирует MAX.
+* Все CRM events идут background.
+* `case:new` отвечает меньше 1 секунды при включенном AMOCRM_ACCESS_TOKEN.
+* В amoCRM используется ровно 5 этапов:
+
+  * `Подписался на бота`
+  * `Отправил приказ`
+  * `Указал дату`
+  * `Оплатил`
+  * `Получил напоминание (не оплатил)`
+* Сделка реально двигается по этапам при действиях пользователя.
+* Старые этапы не используются.
+* Ошибка amoCRM не ломает пользовательский сценарий.
+* `AMOCRM_ENABLED=false` реально выключает CRM.
+
+## MAX
+
+* MAX не каркас, а полноценный бот.
+* MAX функционально равен Telegram.
+* MAX умеет:
+
+  * start/menu;
+  * profile;
+  * manager;
+  * создать заявку;
+  * принять фото/файл приказа;
+  * принять конверт/дату;
+  * показать карточку данных;
+  * редактировать поля;
+  * подтвердить данные;
+  * сгенерировать preview PDF;
+  * показать оплату;
+  * проверить оплату;
+  * получить full DOCX/PDF/instruction;
+  * получить reminders;
+  * синхронизироваться с CRM.
+* MAX использует `platform-api2.max.ru`.
+* MAX production использует webhook.
+* MAX dev может использовать long polling.
+* MAX webhook проверяет secret.
+* MAX умеет upload/download файлов.
+* MAX документы отправляются после оплаты.
+
+## Документы
+
+* Нет `№5`; есть `№ 5`.
+* Нет `в городе Москва`; есть `г. Москва`.
+* Нет `по договор №`; есть `по договору №`.
+* Нет `коп..` и `руб..`.
+* Бельский case генерирует 1 страницу.
+* Нет странных пробелов.
+* Суммы правильные.
+* Preview PDF создается из full PDF.
+* Платеж не создается без QA/PDF.
+
+## Tests
+
+* `python -m py_compile` проходит.
+* `pytest` проходит.
+* `python scripts/smoke_test.py` проходит.
+* `python scripts/check_amocrm.py` проходит.
+* `python scripts/check_max.py` проходит хотя бы на `GET /me`.
+* `python scripts/simulate_max_flow.py` проходит.
+* README обновлен.
+* `.env.example` актуален.
+* Commit + push сделаны.
+
+Если хотя бы один пункт не выполнен — не писать, что проект готов к production.

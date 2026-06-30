@@ -7,9 +7,14 @@ import aiohttp
 
 from app.config import Settings
 from app.models import Case, Payment
+from app.utils import normalize_receipt_contact
 
 
 class YooKassaError(RuntimeError):
+    pass
+
+
+class YooKassaReceiptContactRequired(YooKassaError):
     pass
 
 
@@ -63,7 +68,40 @@ class YooKassaClient:
                     raise YooKassaError(f"YooKassa API error {response.status}: {raw[:600]}")
                 return payload
 
-    async def create_payment(self, case: Case, payment: Payment) -> dict[str, Any]:
+    def _receipt_contact(self, case: Case, *, receipt_contact: str | None = None) -> tuple[str, str] | None:
+        if not self.settings.yookassa_receipt_enabled:
+            return None
+        raw_contact = receipt_contact or self.settings.yookassa_test_customer_email
+        if not raw_contact:
+            user = getattr(case, "user", None)
+            raw_contact = getattr(user, "email", None) or getattr(user, "phone", None)
+        return normalize_receipt_contact(raw_contact)
+
+    def _build_receipt(self, case: Case, payment: Payment, *, receipt_contact: str | None = None) -> dict[str, Any]:
+        contact = self._receipt_contact(case, receipt_contact=receipt_contact)
+        if self.settings.yookassa_receipt_enabled and not contact:
+            raise YooKassaReceiptContactRequired("Receipt contact is required for YooKassa payments")
+        if not self.settings.yookassa_receipt_enabled:
+            return {}
+        contact_kind, contact_value = contact or ("email", "")
+        item: dict[str, Any] = {
+            "description": self.settings.yookassa_receipt_description,
+            "quantity": "1.00",
+            "amount": {"value": f"{payment.amount:.2f}", "currency": "RUB"},
+            "vat_code": self.settings.yookassa_vat_code,
+            "payment_subject": self.settings.yookassa_payment_subject,
+            "payment_mode": self.settings.yookassa_payment_mode,
+            "measure": "piece",
+        }
+        receipt: dict[str, Any] = {
+            "items": [item],
+            "customer": {contact_kind: contact_value},
+        }
+        if self.settings.yookassa_tax_system_code is not None:
+            receipt["tax_system_code"] = self.settings.yookassa_tax_system_code
+        return receipt
+
+    async def create_payment(self, case: Case, payment: Payment, *, receipt_contact: str | None = None) -> dict[str, Any]:
         return_url = self.settings.yookassa_return_url or (self.settings.payment_public_base_url and f"{self.settings.payment_public_base_url}/payments/success")
         if not return_url:
             raise YooKassaError("YOOKASSA_RETURN_URL or PAYMENT_PUBLIC_BASE_URL is required")
@@ -80,6 +118,9 @@ class YooKassaClient:
                 "platform_user_id": case.platform_user_id or "",
             },
         }
+        receipt = self._build_receipt(case, payment, receipt_contact=receipt_contact)
+        if receipt:
+            body["receipt"] = receipt
         if self.settings.yookassa_test_mode:
             body["test"] = True
         return await self.request("POST", "/payments", json_body=body, headers={"Idempotence-Key": payment.label})

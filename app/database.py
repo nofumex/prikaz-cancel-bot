@@ -66,6 +66,7 @@ async def _upgrade_sqlite_schema(conn) -> None:
         [
             ("amocrm_contact_id", "amocrm_contact_id INTEGER"),
             ("telegram_username", "telegram_username TEXT"),
+            ("email", "email TEXT"),
         ],
     )
     await conn.exec_driver_sql(

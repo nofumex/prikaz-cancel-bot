@@ -81,6 +81,13 @@ class Settings:
     yookassa_return_url: str | None
     yookassa_webhook_path: str
     yookassa_test_mode: bool
+    yookassa_receipt_enabled: bool
+    yookassa_vat_code: int
+    yookassa_payment_subject: str
+    yookassa_payment_mode: str
+    yookassa_receipt_description: str
+    yookassa_test_customer_email: str | None
+    yookassa_tax_system_code: int | None
     payment_public_base_url: str | None
     payment_web_host: str
     payment_web_port: int
@@ -166,6 +173,13 @@ def get_settings() -> Settings:
         yookassa_return_url=(getenv("YOOKASSA_RETURN_URL") or "").strip() or None,
         yookassa_webhook_path=(getenv("YOOKASSA_WEBHOOK_PATH") or "/payments/yookassa").strip() or "/payments/yookassa",
         yookassa_test_mode=_parse_bool(getenv("YOOKASSA_TEST_MODE"), False),
+        yookassa_receipt_enabled=_parse_bool(getenv("YOOKASSA_RECEIPT_ENABLED"), False),
+        yookassa_vat_code=_parse_int(getenv("YOOKASSA_VAT_CODE"), 1),
+        yookassa_payment_subject=(getenv("YOOKASSA_PAYMENT_SUBJECT") or "service").strip(),
+        yookassa_payment_mode=(getenv("YOOKASSA_PAYMENT_MODE") or "full_payment").strip(),
+        yookassa_receipt_description=(getenv("YOOKASSA_RECEIPT_DESCRIPTION") or "Подготовка заявления об отмене судебного приказа").strip(),
+        yookassa_test_customer_email=(getenv("YOOKASSA_TEST_CUSTOMER_EMAIL") or "").strip() or None,
+        yookassa_tax_system_code=_parse_int(getenv("YOOKASSA_TAX_SYSTEM_CODE"), 0) or None,
         payment_public_base_url=(getenv("PAYMENT_PUBLIC_BASE_URL") or "").strip().rstrip("/") or None,
         payment_web_host=getenv("PAYMENT_WEB_HOST", "0.0.0.0"),
         payment_web_port=_parse_int(getenv("PAYMENT_WEB_PORT"), 8080),

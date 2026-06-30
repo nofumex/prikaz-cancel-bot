@@ -12,7 +12,8 @@ from app.config import Settings
 from app.enums import CaseStatus, PaymentStatus
 from app.models import Case, Payment
 from app.services.cases import new_payment_label
-from app.services.yookassa import YooKassaClient, raw_json
+from app.services.yookassa import YooKassaClient, YooKassaReceiptContactRequired, raw_json
+from app.utils import normalize_receipt_contact
 
 
 def build_yoomoney_url(settings: Settings, label: str, amount: int, target: str) -> str:
@@ -40,22 +41,28 @@ async def ensure_payment(session: AsyncSession, case: Case, settings: Settings) 
         .limit(1)
     )
     payment = result.scalar_one_or_none()
-    if not payment:
+    is_new_payment = payment is None
+    if is_new_payment:
         label = new_payment_label(case.id)
         payment = Payment(case_id=case.id, label=label, amount=settings.document_price_rub)
-        session.add(payment)
         case.payment_label = label
-        await session.flush()
     else:
         case.payment_label = payment.label
 
     if settings.yookassa_enabled:
         if not payment.external_payment_id or not payment.confirmation_url or payment.provider != "yookassa":
+            receipt_contact = _resolve_yookassa_receipt_contact(case, settings)
+            if settings.yookassa_receipt_enabled and not receipt_contact:
+                raise YooKassaReceiptContactRequired("Receipt contact is required for YooKassa payments")
             payment.provider = "yookassa"
-            response = await YooKassaClient(settings).create_payment(case, payment)
+            response = await YooKassaClient(settings).create_payment(case, payment, receipt_contact=receipt_contact)
+            if is_new_payment:
+                session.add(payment)
             _apply_yookassa_payment_response(payment, response)
         case.payment_url = payment.confirmation_url
     else:
+        if is_new_payment:
+            session.add(payment)
         payment.provider = payment.provider or "yoomoney"
         case.payment_url = build_yoomoney_url(
             settings,
@@ -67,6 +74,16 @@ async def ensure_payment(session: AsyncSession, case: Case, settings: Settings) 
     await session.commit()
     await session.refresh(payment)
     return payment
+
+
+def _resolve_yookassa_receipt_contact(case: Case, settings: Settings) -> str | None:
+    preferred = settings.yookassa_test_customer_email or None
+    if preferred:
+        return preferred
+    user = getattr(case, "user", None)
+    raw_contact = getattr(user, "email", None) or getattr(user, "phone", None)
+    normalized = normalize_receipt_contact(raw_contact)
+    return normalized[1] if normalized else None
 
 
 def _apply_yookassa_payment_response(payment: Payment, response: dict) -> None:

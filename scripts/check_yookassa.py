@@ -31,6 +31,8 @@ async def main() -> int:
         missing.append("YOOKASSA_SECRET_KEY")
     if not (settings.yookassa_return_url or settings.payment_public_base_url):
         missing.append("YOOKASSA_RETURN_URL or PAYMENT_PUBLIC_BASE_URL")
+    if settings.yookassa_receipt_enabled and args.create_test_payment and not settings.yookassa_test_customer_email:
+        missing.append("YOOKASSA_TEST_CUSTOMER_EMAIL")
     if missing:
         print("YooKassa env is incomplete:")
         for item in missing:
@@ -44,6 +46,7 @@ async def main() -> int:
     print(f"  shop_id: {settings.yookassa_shop_id}")
     print(f"  webhook_path: {settings.yookassa_webhook_path}")
     print(f"  test_mode: {settings.yookassa_test_mode}")
+    print(f"  receipt_enabled: {settings.yookassa_receipt_enabled}")
     print("  secret_key: ***")
 
     if not args.create_test_payment:

@@ -41,8 +41,9 @@ from app.services.legal_data import (
 )
 from app.services.llm import extract_envelope_date, extract_order_amounts, extract_order_data
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
+from app.services.yookassa import YooKassaReceiptContactRequired
 from app.texts import case_summary, payment_text
-from app.utils import ensure_dir, h, parse_russian_date
+from app.utils import ensure_dir, h, normalize_receipt_contact, parse_russian_date
 
 router = Router(name="case_flow")
 logger = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ class CaseStates(StatesGroup):
     waiting_manual_date = State()
     waiting_manual_fields = State()
     waiting_field_value = State()
+    waiting_payment_contact = State()
     waiting_restore_reason = State()
     waiting_restore_reason_custom = State()
 
@@ -118,6 +120,39 @@ async def _send_order_rephoto_prompt(message: Message, missing: list[str], *, at
         await message.answer(text, reply_markup=order_rephoto_menu())
         return
     await message.answer(text, reply_markup=order_rephoto_menu())
+
+
+def _resolve_receipt_contact(current_user: User, settings: Settings) -> str | None:
+    if settings.yookassa_test_customer_email:
+        return settings.yookassa_test_customer_email
+    normalized = normalize_receipt_contact(getattr(current_user, "email", None) or getattr(current_user, "phone", None))
+    return normalized[1] if normalized else None
+
+
+async def _request_payment_contact(message: Message, state: FSMContext, case: Case) -> None:
+    await state.update_data(case_id=case.id)
+    await state.set_state(CaseStates.waiting_payment_contact)
+    await message.answer("Для оплаты укажите email для чека.")
+
+
+async def _finalize_payment(message: Message, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User, case: Case) -> bool:
+    try:
+        payment = await ensure_payment(session, case, settings)
+    except YooKassaReceiptContactRequired:
+        await _request_payment_contact(message, state, case)
+        return False
+    except Exception:
+        raise
+    await state.clear()
+    schedule_crm_sync(
+        settings,
+        case.id,
+        current_user.id,
+        "payment_created",
+        {"note": f"Платеж: {case.payment_label}, сумма {payment.amount} руб."},
+    )
+    await message.answer(payment_text(case, payment.amount), reply_markup=case_menu(can_pay=True, payment_url=case.payment_url))
+    return True
 
 
 @router.callback_query(F.data == "case:new")
@@ -288,6 +323,23 @@ async def receive_manual_date(message: Message, state: FSMContext, session: Asyn
         {"received_date": received.strftime("%d.%m.%Y"), "deadline": case.deadline_date.strftime("%d.%m.%Y") if case.deadline_date else ""},
     )
     await _extract_and_process_order(message, state, session, settings, case, current_user)
+
+
+@router.message(CaseStates.waiting_payment_contact, F.text)
+async def receive_payment_contact(message: Message, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    data = await state.get_data()
+    case = await session.get(Case, data["case_id"])
+    contact = normalize_receipt_contact(message.text)
+    if not contact:
+        await message.answer("Напишите email для чека или номер телефона в международном формате.")
+        return
+    if contact[0] == "email":
+        current_user.email = contact[1]
+    else:
+        current_user.phone = contact[1]
+    await session.commit()
+    await message.answer(f"✅ Контакт для чека сохранен: <code>{h(contact[1])}</code>.")
+    await _finalize_payment(message, state, session, settings, current_user, case)
 
 
 @router.message(CaseStates.waiting_envelope_photo, F.photo)
@@ -741,25 +793,19 @@ async def _generate_documents_flow(
             await message.answer_document(
                 FSInputFile(preview_file),
                 caption="Предпросмотр заявления." if preview_pdf else "Предпросмотр заявления (dev-only DOCX).",
-            )
+        )
         await message.answer("🧪 Режим оплаты выключен. Сразу отправляю полный DOCX для теста.")
         await deliver_full_documents(message, session, case, settings, current_user)
         return True
-    payment = await ensure_payment(session, case, settings)
-    schedule_crm_sync(
-        settings,
-        case.id,
-        current_user.id,
-        "payment_created",
-        {"note": f"Платеж: {case.payment_label}, сумма {payment.amount} руб."},
-    )
     if preview_file:
         await message.answer_document(
             FSInputFile(preview_file),
             caption="Скрытый предпросмотр заявления." if preview_pdf else "Скрытый предпросмотр заявления (dev-only DOCX).",
         )
-    await message.answer(payment_text(case, payment.amount), reply_markup=case_menu(can_pay=True, payment_url=case.payment_url))
-    return True
+    if settings.yookassa_enabled and settings.yookassa_receipt_enabled and not _resolve_receipt_contact(current_user, settings):
+        await _request_payment_contact(message, state, case)
+        return True
+    return await _finalize_payment(message, state, session, settings, current_user, case)
 
 
 @router.callback_query(F.data == "case:generate")

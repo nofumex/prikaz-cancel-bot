@@ -22,6 +22,7 @@ class User(Base):
     telegram_username: Mapped[str | None] = mapped_column(String(255), index=True)
     first_name: Mapped[str | None] = mapped_column(String(255))
     last_name: Mapped[str | None] = mapped_column(String(255))
+    email: Mapped[str | None] = mapped_column(String(255))
     phone: Mapped[str | None] = mapped_column(String(64))
     amocrm_contact_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     is_manager: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

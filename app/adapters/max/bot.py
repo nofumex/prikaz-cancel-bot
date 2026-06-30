@@ -22,9 +22,10 @@ from app.services.documents import create_case_documents, extraction_preview
 from app.services.legal_data import FIELD_LABELS, missing_order_fields, normalize_debtor_name_fields, normalize_order_data, validate_before_generation
 from app.services.llm import extract_envelope_date, extract_order_data
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
+from app.services.yookassa import YooKassaReceiptContactRequired
 from app.services.users import get_or_create_platform_user
 from app.texts import case_summary, payment_text, profile_text, welcome_text
-from app.utils import ensure_dir, h, parse_russian_date
+from app.utils import ensure_dir, h, normalize_receipt_contact, parse_russian_date
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ STATE_ORDER_REPHOTO = "max_waiting_order_rephoto"
 STATE_ENVELOPE = "max_waiting_envelope"
 STATE_MANUAL_DATE = "max_waiting_manual_date"
 STATE_FIELD_VALUE = "max_waiting_field_value"
+STATE_PAYMENT_CONTACT = "max_waiting_payment_contact"
 
 
 async def _send(client: MaxBotClient, event: IncomingEvent, text: str, keyboard=None) -> None:
@@ -104,13 +106,74 @@ async def _download_event_image(client: MaxBotClient, event: IncomingEvent, case
     if event.document_name:
         suffix = Path(event.document_name).suffix or suffix
     path = Path(settings.max_download_dir) / f"case_{case_id}_{kind}{suffix}"
-    if not url:
-        url = await client.resolve_attachment_url(token=token, message_id=event.message_id)
-    if not url:
+    data: bytes | None = None
+    if url:
+        data = await client.download_file(url)
+    elif token:
+        data = await client.download_by_token(token)
+        if data is None:
+            resolved = await client.resolve_attachment_url(token=token, message_id=event.message_id)
+            if resolved:
+                data = await client.download_file(resolved)
+    else:
+        resolved = await client.resolve_attachment_url(token=token, message_id=event.message_id)
+        if resolved:
+            data = await client.download_file(resolved)
+    if data is None:
         raise RuntimeError("MAX event has no downloadable image/file URL")
-    path.write_bytes(await client.download_file(url))
+    path.write_bytes(data)
     return path
 
+
+
+def _resolve_receipt_contact(current_user: User, settings: Settings) -> str | None:
+    if settings.yookassa_test_customer_email:
+        return settings.yookassa_test_customer_email
+    normalized = normalize_receipt_contact(getattr(current_user, "email", None) or getattr(current_user, "phone", None))
+    return normalized[1] if normalized else None
+
+
+async def _request_payment_contact(client: MaxBotClient, event: IncomingEvent, session, case: Case) -> None:
+    await _set_state(session, event, STATE_PAYMENT_CONTACT, {"case_id": case.id})
+    await _send(client, event, "Для оплаты укажите email для чека.")
+
+
+async def _finalize_payment(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User, case: Case, *, state=None) -> bool:
+    try:
+        payment = await ensure_payment(session, case, settings)
+    except YooKassaReceiptContactRequired:
+        await _request_payment_contact(client, event, session, case)
+        return False
+    await _clear_state(session, event)
+    schedule_crm_sync(settings, case.id, user.id, "payment_created", {"note": f"MAX: платеж {case.payment_label}"})
+    await _send(client, event, payment_text(case, payment.amount), keyboards.case_menu(can_pay=True, payment_url=case.payment_url))
+    return True
+
+
+async def _notify_admin_download_failure(client: MaxBotClient, event: IncomingEvent, settings: Settings, reason: str) -> None:
+    raw = json.dumps(sanitize_raw_update(event.raw_update or {}), ensure_ascii=False)
+    text = f"⚠️ MAX не смог скачать вложение.\n\nПричина: {reason}\n\nraw_update={raw}"
+    admin_ids = settings.max_admin_ids or settings.admin_ids
+    for admin_id in admin_ids:
+        try:
+            await client.send_message(user_id=admin_id, text=text[:3500])
+        except Exception:
+            logger.exception("Failed to notify MAX admin %s about download failure", admin_id)
+
+
+async def _handle_payment_contact(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User, text: str) -> None:
+    contact = normalize_receipt_contact(text)
+    if not contact:
+        await _send(client, event, "Напишите email для чека или номер телефона в международном формате.")
+        return
+    if contact[0] == "email":
+        user.email = contact[1]
+    else:
+        user.phone = contact[1]
+    await session.commit()
+    data = await _state_data(session, event)
+    case = await session.get(Case, data["case_id"])
+    await _finalize_payment(client, event, session, settings, user, case)
 
 
 async def _recover_state_for_input(session, event: IncomingEvent, user: User, *, has_attachment: bool, is_date_text: bool) -> str | None:
@@ -274,6 +337,10 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             await _send(client, event, "Документы отправлены.", keyboards.case_menu())
             return
 
+        if current_state == STATE_PAYMENT_CONTACT and event.text:
+            await _handle_payment_contact(client, event, session, settings, user, event.text)
+            return
+
 
         if current_state in {STATE_ORDER_PHOTO, STATE_ORDER_REPHOTO} and has_attachment:
             await _handle_order_image(client, event, session, settings, user)
@@ -320,6 +387,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
 
         if has_attachment:
             await _send(client, event, "Фото получил, но MAX не передал файл для скачивания. Отправьте фото ещё раз как файл без сжатия.")
+            await _notify_admin_download_failure(client, event, settings, "attachment present but no downloadable file could be resolved")
             return
 
         await _send(client, event, welcome_text(settings.company_name), keyboards.main_menu())
@@ -333,6 +401,7 @@ async def _handle_order_image(client: MaxBotClient, event: IncomingEvent, sessio
     except RuntimeError:
         logger.exception("MAX order image has no downloadable URL")
         await _send(client, event, "MAX не передал файл для скачивания. Отправьте фото приказа ещё раз как изображение или файл без сжатия.", keyboards.order_rephoto_menu())
+        await _notify_admin_download_failure(client, event, settings, "order image has no downloadable URL")
         return
     await save_photo_path(session, case, "order", path)
     await _set_state(session, event, STATE_ENVELOPE, {"case_id": case.id})
@@ -348,6 +417,7 @@ async def _handle_envelope_image(client: MaxBotClient, event: IncomingEvent, ses
     except RuntimeError:
         logger.exception("MAX envelope image has no downloadable URL")
         await _send(client, event, "MAX не передал файл для скачивания. Отправьте фото конверта ещё раз как изображение или файл без сжатия.", keyboards.envelope_choice())
+        await _notify_admin_download_failure(client, event, settings, "envelope image has no downloadable URL")
         return
     await save_photo_path(session, case, "envelope", path)
     await _send(client, event, "✅ Конверт принят. Считываю дату и приказ, это может занять минуту.")
@@ -497,11 +567,12 @@ async def _generate_documents(client: MaxBotClient, event: IncomingEvent, sessio
         await session.commit()
         await _send(client, event, "⚠️ Preview PDF не создан, платеж не сформирован. Нужен LibreOffice/PyMuPDF.")
         return
-    payment = await ensure_payment(session, case, settings)
-    schedule_crm_sync(settings, case.id, user.id, "payment_created", {"note": f"MAX: платеж {case.payment_label}"})
     if preview_file:
         await client.send_file(event.chat_id, preview_file, caption="Скрытый предпросмотр заявления.")
-    await _send(client, event, payment_text(case, payment.amount), keyboards.case_menu(can_pay=True, payment_url=case.payment_url))
+    if settings.yookassa_enabled and settings.yookassa_receipt_enabled and not _resolve_receipt_contact(user, settings):
+        await _request_payment_contact(client, event, session, case)
+        return
+    await _finalize_payment(client, event, session, settings, user, case)
 
 
 async def run_max_bot(settings: Settings) -> None:

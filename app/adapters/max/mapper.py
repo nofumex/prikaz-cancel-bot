@@ -7,7 +7,7 @@ IMAGE_ATTACHMENT_TYPES = {"image", "photo"}
 FILE_ATTACHMENT_TYPES = {"file", "document"}
 ATTACHMENT_TYPES = IMAGE_ATTACHMENT_TYPES | FILE_ATTACHMENT_TYPES
 URL_KEYS = ("url", "download_url", "file_url", "photo_url", "image_url", "media_url")
-TOKEN_KEYS = ("token", "file_token", "photo_token", "image_token", "media_token")
+TOKEN_KEYS = ("token", "file_token", "photo_token", "image_token", "media_token", "file_id", "photo_id", "image_id", "media_id")
 
 
 def _dig(data: dict[str, Any], *keys: str) -> Any:
@@ -53,6 +53,26 @@ def _attachment_candidates(update: dict[str, Any], message: dict[str, Any]) -> l
     return candidates
 
 
+def _walk_attachment_nodes(value: Any) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        nodes.append(value)
+        payload = value.get("payload")
+        if isinstance(payload, dict):
+            nodes.extend(_walk_attachment_nodes(payload))
+        for key in ("photo", "image", "file", "media", "video_thumbnail", "thumbnail"):
+            nested = value.get(key)
+            if isinstance(nested, dict):
+                nodes.extend(_walk_attachment_nodes(nested))
+        for nested in value.values():
+            if isinstance(nested, (dict, list)):
+                nodes.extend(_walk_attachment_nodes(nested))
+    elif isinstance(value, list):
+        for item in value:
+            nodes.extend(_walk_attachment_nodes(item))
+    return nodes
+
+
 def _normalized_attachments(update: dict[str, Any], message: dict[str, Any]) -> list[dict[str, Any]]:
     attachments: list[dict[str, Any]] = []
     for candidate in _attachment_candidates(update, message):
@@ -60,6 +80,10 @@ def _normalized_attachments(update: dict[str, Any], message: dict[str, Any]) -> 
             continue
         att_type = str(candidate.get("type") or candidate.get("attachment_type") or "").lower()
         if att_type in ATTACHMENT_TYPES:
+            attachments.append(candidate)
+            continue
+        payload = _as_dict(candidate.get("payload")) or candidate
+        if _payload_url(payload) or _payload_token(payload):
             attachments.append(candidate)
     return attachments
 
@@ -69,7 +93,7 @@ def _payload_url(payload: dict[str, Any]) -> str | None:
         value = payload.get(key)
         if value:
             return str(value)
-    for key in ("photo", "image", "file", "media"):
+    for key in ("photo", "image", "file", "media", "video_thumbnail", "thumbnail"):
         nested = payload.get(key)
         if isinstance(nested, dict):
             value = _payload_url(nested)
@@ -94,7 +118,7 @@ def _payload_token(payload: dict[str, Any]) -> str | None:
         value = payload.get(key)
         if value:
             return str(value)
-    for key in ("image", "file", "media"):
+    for key in ("photo", "image", "file", "media", "video_thumbnail", "thumbnail"):
         nested = payload.get(key)
         if isinstance(nested, dict):
             value = _payload_token(nested)
@@ -161,6 +185,17 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
     for att in _normalized_attachments(update, message):
         att_type = str(att.get("type") or att.get("attachment_type") or "").lower()
         payload = _as_dict(att.get("payload")) or att
+        payload_nodes = _walk_attachment_nodes(payload)
+        if payload_nodes:
+            for node in payload_nodes:
+                if not photo_url:
+                    photo_url = _payload_url(node)
+                if not photo_token:
+                    photo_token = _payload_token(node)
+                if not document_url:
+                    document_url = _payload_url(node)
+                if not document_token:
+                    document_token = _payload_token(node)
         if att_type in IMAGE_ATTACHMENT_TYPES:
             if not photo_url:
                 photo_url = _payload_url(payload)
