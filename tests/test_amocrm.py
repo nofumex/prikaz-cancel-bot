@@ -2,7 +2,7 @@ import pytest
 
 from app.config import Settings
 from app.models import Case, User
-from app.services.amocrm import AmoCrmService, EVENT_STATUS_MAP
+from app.services.amocrm import AmoCrmService, EVENT_STATUS_MAP, _stage_can_move, crm_event_dedupe_key
 
 
 def _settings(**kwargs):
@@ -33,6 +33,8 @@ def _settings(**kwargs):
         text_model="gpt-5.4-mini",
         llm_timeout_seconds=90,
         max_ai_review_regenerations=1,
+        document_ai_review_mode="shadow",
+        admin_debug_to_telegram=False,
         document_price_rub=990,
         document_preview_mode="pdf",
         enable_pdf_preview=True,

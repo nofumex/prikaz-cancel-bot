@@ -142,7 +142,7 @@ async def test_max_photo_event_without_text_keeps_case_flow(monkeypatch):
     from app.adapters.max import bot as max_bot
     from app.adapters.max.mapper import IncomingEvent
 
-    settings = _make_settings(amocrm_enabled=False)
+    settings = _make_settings(amocrm_enabled=False, admin_ids=[], max_admin_ids=[])
     session = object()
 
     class SessionContext:
@@ -173,7 +173,7 @@ async def test_max_manual_date_starts_order_processing(monkeypatch):
     from app.adapters.max import bot as max_bot
     from app.adapters.max.mapper import IncomingEvent
 
-    settings = _make_settings(amocrm_enabled=False)
+    settings = _make_settings(amocrm_enabled=False, admin_ids=[], max_admin_ids=[])
     case = _case(platform="max", platform_user_id="42", received_date=None, deadline_date=None)
     user = User(id=1, platform="max", platform_user_id="42")
     session = SimpleNamespace(get=AsyncMock(return_value=case))
@@ -200,7 +200,7 @@ async def test_max_lost_state_photo_recovers_latest_waiting_case(monkeypatch):
     from app.adapters.max import bot as max_bot
     from app.adapters.max.mapper import IncomingEvent
 
-    settings = _make_settings(amocrm_enabled=False)
+    settings = _make_settings(amocrm_enabled=False, admin_ids=[], max_admin_ids=[])
     session = object()
 
     class SessionContext:
@@ -233,7 +233,7 @@ async def test_max_attachment_with_payload_url_avoids_no_file_message(monkeypatc
     from app.adapters.max import bot as max_bot
     from app.adapters.max.mapper import parse_update
 
-    settings = _make_settings(amocrm_enabled=False)
+    settings = _make_settings(amocrm_enabled=False, admin_ids=[], max_admin_ids=[])
     session = object()
 
     class SessionContext:
@@ -266,7 +266,7 @@ async def test_max_attachment_with_payload_url_avoids_no_file_message(monkeypatc
     sent_text = client.send_message.await_args.kwargs["text"]
     assert "MAX не передал файл" not in sent_text
     assert "не смог скачать вложение" in sent_text
-    assert client.send_message.await_count == 0
+    assert client.send_message.await_count == 1
 
 
 @pytest.mark.asyncio

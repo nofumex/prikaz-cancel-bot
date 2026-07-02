@@ -605,7 +605,8 @@ async def review_generated_document(
 
     instructions = (
         "You are a legal QA reviewer for a final Russian court-order cancellation statement. "
-        "Review the final client-visible text, not only OCR input. Return strict JSON only. "
+        "Review the final client-visible text. Return strict JSON only. "
+        "Only issues present in FINAL STATEMENT TEXT may block delivery. SOURCE OCR/CASE FIELDS is reference-only and must not be treated as client-visible text. "
         "Check the header for OCR garbage, passport data, birthplace used as debtor address, multiple creditor addresses, "
         "non-nominative debtor full name, bad court-address wrapping, missing space after the numero sign, unsupported legal claims, "
         "empty required fields, signature/page-two layout problems, weird spaces, and obvious OCR garbage. "

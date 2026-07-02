@@ -65,6 +65,7 @@ async def _upgrade_sqlite_schema(conn) -> None:
         "users",
         [
             ("amocrm_contact_id", "amocrm_contact_id INTEGER"),
+            ("amocrm_current_case_id", "amocrm_current_case_id INTEGER"),
             ("telegram_username", "telegram_username TEXT"),
             ("email", "email TEXT"),
         ],
@@ -106,6 +107,7 @@ async def _upgrade_sqlite_schema(conn) -> None:
             case_id INTEGER,
             user_id INTEGER,
             event_type VARCHAR(64) NOT NULL,
+            dedupe_key VARCHAR(512),
             amo_entity_type VARCHAR(32),
             amo_entity_id INTEGER,
             request_payload TEXT,
@@ -117,6 +119,14 @@ async def _upgrade_sqlite_schema(conn) -> None:
         """
     )
 
+
+    await _sqlite_add_columns(
+        conn,
+        "crm_sync_logs",
+        [
+            ("dedupe_key", "dedupe_key VARCHAR(512)"),
+        ],
+    )
 
 async def init_db() -> None:
     async with engine.begin() as conn:

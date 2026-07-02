@@ -491,6 +491,9 @@ async def _handle_envelope_image(client: MaxBotClient, event: IncomingEvent, ses
 
 
 async def _notify_admin_document_review_failure(client: MaxBotClient, settings: Settings, reason: str) -> None:
+    if not settings.admin_debug_to_telegram:
+        logger.warning("MAX admin document-review Telegram report suppressed reason=%s", reason[:500])
+        return
     for admin_id in settings.max_admin_ids or settings.admin_ids:
         try:
             await client.send_message(user_id=admin_id, text=reason[:3500])

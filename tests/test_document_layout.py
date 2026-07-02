@@ -67,6 +67,8 @@ def _settings(**kwargs):
         text_model="gpt-5.4-mini",
         llm_timeout_seconds=90,
         max_ai_review_regenerations=1,
+        document_ai_review_mode="shadow",
+        admin_debug_to_telegram=False,
         document_price_rub=990,
         document_preview_mode="pdf",
         enable_pdf_preview=True,

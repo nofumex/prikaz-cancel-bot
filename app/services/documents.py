@@ -1,20 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any
 
-from app.config import Settings
-from app.models import Case, User
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import Settings
+from app.models import Case, User
 from app.services.document_templates import DocumentArtifacts, create_case_documents as _create_case_documents
 from app.services.legal_data import (
     FIELD_LABELS,
     clean_case_number,
     clean_uid,
+    docx_text,
     format_money_rub_kop,
     is_deadline_missed,
     missing_order_fields,
@@ -22,14 +25,13 @@ from app.services.legal_data import (
     normalize_order_data,
     suggest_nominative_full_name,
     validate_before_generation,
-    docx_text,
 )
 from app.services.llm import review_generated_document
 from app.utils import h
 
+logger = logging.getLogger(__name__)
 
-
-MANUAL_REVIEW_USER_TEXT = 'Документ требует ручной проверки специалистом. Мы проверим данные и подготовим заявление.'
+MANUAL_REVIEW_USER_TEXT = "Документ требует ручной проверки специалистом. Мы проверим данные и подготовим заявление."
 SAFE_AI_REVIEW_FIELDS = {
     "debtor_full_name",
     "debtor_address",
@@ -39,6 +41,36 @@ SAFE_AI_REVIEW_FIELDS = {
     "creditor_address",
     "debt_contract",
     "debt_period",
+}
+VALID_DOCUMENT_AI_REVIEW_MODES = {"off", "shadow", "blocking"}
+SOURCE_ONLY_HINTS = {
+    "passport",
+    "паспорт",
+    "дата рождения",
+    "birth",
+    "место рождения",
+    "birthplace",
+    "регистрац",
+    "registration",
+    "прописк",
+    "уфмс",
+    "оуфмс",
+    "мвд",
+    "выдан",
+    "урожен",
+}
+FINAL_TEXT_SENSITIVE_MARKERS = {
+    "паспорт",
+    "дата рождения",
+    "место рождения",
+    "зарегистрирован",
+    "регистрац",
+    "прописан",
+    "уфмс",
+    "оуфмс",
+    "мвд",
+    "выдан",
+    "урожен",
 }
 
 
@@ -52,6 +84,48 @@ class DocumentReviewOutcome:
     admin_report: str = ""
 
 
+def document_ai_review_mode(settings: Settings) -> str:
+    mode = str(getattr(settings, "document_ai_review_mode", "shadow") or "shadow").strip().lower()
+    return mode if mode in VALID_DOCUMENT_AI_REVIEW_MODES else "shadow"
+
+
+def _final_text_has_sensitive_marker(final_text: str) -> bool:
+    text = (final_text or "").lower()
+    return any(marker in text for marker in FINAL_TEXT_SENSITIVE_MARKERS)
+
+
+def _issue_is_source_only(issue: dict[str, Any], final_text: str) -> bool:
+    haystack = " ".join(
+        str(issue.get(key) or "")
+        for key in ("code", "field", "message", "suggested_fix")
+    ).lower()
+    if not any(hint in haystack for hint in SOURCE_ONLY_HINTS):
+        return False
+    return not _final_text_has_sensitive_marker(final_text)
+
+
+def _review_scoped_to_final_text(review: dict[str, Any], final_text: str) -> dict[str, Any]:
+    scoped = dict(review or {})
+    issues: list[dict[str, Any]] = []
+    for raw_issue in scoped.get("issues") or []:
+        if not isinstance(raw_issue, dict):
+            continue
+        issue = dict(raw_issue)
+        if issue.get("severity") == "blocker" and _issue_is_source_only(issue, final_text):
+            issue["severity"] = "warning"
+            issue["source_only"] = True
+            issue["message"] = (str(issue.get("message") or "") + " (source-only; not present in FINAL STATEMENT TEXT)").strip()
+        issues.append(issue)
+    scoped["issues"] = issues
+    has_blocker = any(issue.get("severity") == "blocker" for issue in issues)
+    has_warning = any(issue.get("severity") == "warning" for issue in issues)
+    scoped["severity"] = "blocker" if has_blocker else ("warning" if has_warning else "ok")
+    scoped["ok"] = not has_blocker
+    if not has_blocker and all(issue.get("source_only") for issue in issues if issue.get("severity") == "warning"):
+        scoped["needs_regeneration"] = False
+    return scoped
+
+
 def _review_issue_lines(review: dict[str, Any], *, applied_fixes: dict[str, str], case_id: int | None, document_path: str) -> list[str]:
     lines = [
         f"AI document review: case #{case_id or 'unknown'}",
@@ -60,6 +134,8 @@ def _review_issue_lines(review: dict[str, Any], *, applied_fixes: dict[str, str]
         f"auto_fixed: {bool(applied_fixes)}",
         f"document: {document_path}",
     ]
+    if review.get("mode"):
+        lines.append(f"mode: {review.get('mode')}")
     for issue in review.get("issues") or []:
         if not isinstance(issue, dict):
             continue
@@ -73,6 +149,7 @@ def _review_issue_lines(review: dict[str, Any], *, applied_fixes: dict[str, str]
                 f"confidence: {issue.get('confidence') or 0}",
                 f"suggested_fix: {issue.get('suggested_fix') or ''}",
                 f"auto_fixed: {field in applied_fixes}",
+                f"source_only: {bool(issue.get('source_only'))}",
                 f"message: {issue.get('message') or ''}",
             ]
         )
@@ -83,7 +160,7 @@ def _safe_review_fixes(data: dict[str, Any], review: dict[str, Any]) -> dict[str
     clean_fields = review.get("clean_fields") if isinstance(review.get("clean_fields"), dict) else {}
     confidence_by_field: dict[str, float] = {}
     for issue in review.get("issues") or []:
-        if not isinstance(issue, dict):
+        if not isinstance(issue, dict) or issue.get("source_only"):
             continue
         field = str(issue.get("field") or "").strip()
         try:
@@ -103,18 +180,82 @@ def _safe_review_fixes(data: dict[str, Any], review: dict[str, Any]) -> dict[str
     return fixes
 
 
-def _review_blocks_delivery(review: dict[str, Any], applied_fixes: dict[str, str]) -> bool:
-    if review.get("ok") is True and str(review.get("severity") or "ok") == "ok":
-        return False
+def _review_blocks_delivery(review: dict[str, Any], applied_fixes: dict[str, str] | None = None) -> bool:
     for issue in review.get("issues") or []:
         if not isinstance(issue, dict):
             continue
-        if issue.get("severity") != "blocker":
-            continue
-        field = str(issue.get("field") or "")
-        if field not in applied_fixes:
+        if issue.get("severity") == "blocker" and not issue.get("source_only"):
             return True
-    return bool(review.get("needs_regeneration")) and not applied_fixes
+    return False
+
+
+def _schedule_shadow_document_review(
+    settings: Settings,
+    *,
+    case_id: int,
+    user_id: int,
+    document_text: str,
+    source_data: dict[str, Any],
+    visual_summary: dict[str, Any],
+    document_path: str,
+) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning("Document AI shadow review skipped: no running event loop case_id=%s", case_id)
+        return
+    task = loop.create_task(
+        _run_shadow_document_review(
+            settings,
+            case_id=case_id,
+            user_id=user_id,
+            document_text=document_text,
+            source_data=source_data,
+            visual_summary=visual_summary,
+            document_path=document_path,
+        )
+    )
+    task.add_done_callback(_consume_shadow_review_exception)
+
+
+def _consume_shadow_review_exception(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Document AI shadow review crashed")
+
+
+async def _run_shadow_document_review(
+    settings: Settings,
+    *,
+    case_id: int,
+    user_id: int,
+    document_text: str,
+    source_data: dict[str, Any],
+    visual_summary: dict[str, Any],
+    document_path: str,
+) -> None:
+    from app.database import SessionLocal
+    from app.services.crm_background import schedule_crm_sync
+
+    async with SessionLocal() as session:
+        raw_review = await review_generated_document(
+            settings,
+            session,
+            case_id=case_id,
+            user_id=user_id,
+            document_text=document_text,
+            source_data=source_data,
+            visual_summary=visual_summary,
+            regeneration_happened=False,
+        )
+        review = _review_scoped_to_final_text(raw_review, document_text)
+        lines = _review_issue_lines(review, applied_fixes={}, case_id=case_id, document_path=document_path)
+        report = "[shadow] " + "\n".join(lines)
+        logger.info("Document AI shadow review case_id=%s severity=%s", case_id, review.get("severity"))
+        schedule_crm_sync(settings, case_id, user_id, "document_ai_review_shadow", {"note": report[:65000]})
 
 
 async def create_case_documents_reviewed(
@@ -125,6 +266,24 @@ async def create_case_documents_reviewed(
     *,
     restore_reason: str | None = None,
 ) -> DocumentReviewOutcome:
+    mode = document_ai_review_mode(settings)
+    if mode in {"off", "shadow"}:
+        artifacts = create_case_documents_with_qa(case, user, settings, restore_reason=restore_reason)
+        review = {"ok": True, "severity": "ok", "needs_regeneration": False, "issues": [], "clean_fields": {}, "mode": mode}
+        if mode == "shadow":
+            data = normalize_order_data(json.loads(case.extracted_json or "{}"))
+            final_text = docx_text(str(artifacts.full_docx_path))
+            _schedule_shadow_document_review(
+                settings,
+                case_id=case.id,
+                user_id=user.id,
+                document_text=final_text,
+                source_data=data,
+                visual_summary=artifacts.qa_report,
+                document_path=str(artifacts.full_docx_path),
+            )
+        return DocumentReviewOutcome(ok=True, artifacts=artifacts, review=review)
+
     max_regenerations = max(0, int(getattr(settings, "max_ai_review_regenerations", 1)))
     applied_all: dict[str, str] = {}
     regeneration_count = 0
@@ -135,16 +294,18 @@ async def create_case_documents_reviewed(
         artifacts = create_case_documents_with_qa(case, user, settings, restore_reason=restore_reason)
         last_artifacts = artifacts
         data = normalize_order_data(json.loads(case.extracted_json or "{}"))
-        review = await review_generated_document(
+        final_text = docx_text(str(artifacts.full_docx_path))
+        raw_review = await review_generated_document(
             settings,
             session,
             case_id=case.id,
             user_id=user.id,
-            document_text=docx_text(str(artifacts.full_docx_path)),
+            document_text=final_text,
             source_data=data,
             visual_summary=artifacts.qa_report,
             regeneration_happened=regeneration_count > 0,
         )
+        review = _review_scoped_to_final_text(raw_review, final_text)
         last_review = review
         fixes = _safe_review_fixes(data, review)
         if fixes and regeneration_count < max_regenerations:
@@ -157,7 +318,7 @@ async def create_case_documents_reviewed(
             applied_all.update(fixes)
             regeneration_count += 1
             continue
-        blocks = _review_blocks_delivery(review, applied_all)
+        blocks = _review_blocks_delivery(review, fixes)
         report_lines = _review_issue_lines(
             review,
             applied_fixes=applied_all,
@@ -172,6 +333,7 @@ async def create_case_documents_reviewed(
             regeneration_count=regeneration_count,
             admin_report="\n".join(report_lines),
         )
+
 
 def build_statement_paragraphs(data: dict, received_date: date, deadline_date: date | None, restore_reason: str | None = None) -> list[str]:
     from app.services.document_templates.statement_templates import StatementContext, build_statement_paragraphs as _build
@@ -230,25 +392,25 @@ def extraction_preview(
         f"<b>Должник:</b> {h(data.get('debtor_full_name') or 'не заполнено')}",
         f"<b>Адрес должника:</b> {h(data.get('debtor_address') or 'не заполнено')}",
         f"<b>Взыскатель:</b> {h(data.get('creditor_name') or 'не заполнено')}",
-        f"<b>Номер дела:</b> {h(data.get('case_number') or 'не заполнено')}",
-        f"<b>УИД:</b> {h(data.get('uid') or 'нет в приказе')}",
+        f"<b>Адрес взыскателя:</b> {h(data.get('creditor_address') or 'не заполнено')}",
+        f"<b>Номер дела:</b> {h(clean_case_number(data.get('case_number') or '') or 'не заполнено')}",
+        f"<b>УИД:</b> {h(clean_uid(data.get('uid') or '') or 'не заполнено')}",
         f"<b>Дата приказа:</b> {h(data.get('order_date') or 'не заполнено')}",
-        f"<b>Договор:</b> {h(data.get('debt_contract') or 'не заполнено')}",
-        f"<b>Период:</b> {h(data.get('debt_period') or 'не заполнено')}",
-        f"<b>Сумма долга:</b> {h(data.get('debt_amount') or 'не заполнено')}",
-        f"<b>Госпошлина:</b> {h(data.get('state_duty') or 'не указана')}",
-        f"<b>Дата получения:</b> {received_date.strftime('%d.%m.%Y') if received_date else 'не указана'}",
+        f"<b>Долг:</b> {h(format_money_rub_kop(data.get('debt_amount') or '') or 'не заполнено')}",
+        f"<b>Госпошлина:</b> {h(format_money_rub_kop(data.get('state_duty') or '') or 'не заполнено')}",
+        f"<b>Итого:</b> {h(format_money_rub_kop(data.get('total_amount') or '') or 'не заполнено')}",
     ]
+    if data.get("debt_contract"):
+        lines.append(f"<b>Договор:</b> {h(data.get('debt_contract'))}")
+    if data.get("debt_period"):
+        lines.append(f"<b>Период:</b> {h(data.get('debt_period'))}")
+    if received_date:
+        lines.append(f"<b>Дата получения:</b> {received_date.strftime('%d.%m.%Y')}")
     if deadline_date:
-        lines.append(f"<b>Срок до:</b> {deadline_date.strftime('%d.%m.%Y')} включительно")
-    if include_name_debug:
-        raw_name = data.get("debtor_name_raw") or ""
-        if raw_name and raw_name != data.get("debtor_full_name"):
-            lines.append(f"<i>Исходно распознано:</i> {h(raw_name)}")
-            lines.append(f"<i>Нормализовано:</i> {h(data.get('debtor_full_name') or '')}")
+        lines.append(f"<b>Срок подачи:</b> до {deadline_date.strftime('%d.%m.%Y')}")
     if missing:
-        labels = [FIELD_LABELS.get(field, field) for field in missing]
-        lines.extend(["", "⚠️ <b>Перед генерацией нужно заполнить:</b>", ", ".join(labels)])
-    else:
-        lines.extend(["", "Если все верно, можно готовить документы. Если видите ошибку OCR, исправьте поле кнопкой ниже."])
+        lines.extend(["", "⚠️ <b>Не распознано:</b> " + ", ".join(h(FIELD_LABELS.get(field, field)) for field in missing)])
+    suggested = suggest_nominative_full_name(data.get("debtor_full_name")) if include_name_debug else None
+    if suggested and suggested != data.get("debtor_full_name"):
+        lines.append(f"💡 Возможно, ФИО в заявлении лучше указать: <b>{h(suggested)}</b>")
     return "\n".join(lines)

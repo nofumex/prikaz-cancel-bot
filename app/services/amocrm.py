@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
@@ -26,6 +27,45 @@ PIPELINE_STATUSES = [
     "Оплатил",
     "Получил напоминание (не оплатил)",
 ]
+
+
+STAGE_ORDER = {name: index for index, name in enumerate(PIPELINE_STATUSES)}
+DEDUPED_EVENTS = {
+    "user_started_bot",
+    "order_photo_uploaded",
+    "received_date_entered",
+    "preview_generated",
+    "payment_created",
+    "payment_paid",
+    "documents_delivered",
+}
+
+
+def crm_event_dedupe_key(case_id: int | None, event_type: str, payload: dict | None = None) -> str:
+    payload = payload or {}
+    stable: dict[str, Any] = {"case_id": case_id, "event_type": event_type}
+    if event_type == "order_photo_uploaded":
+        stable["files"] = sorted(str(item.get("path") or "") for item in payload.get("files") or [])
+    elif event_type == "received_date_entered":
+        stable["received_date"] = payload.get("received_date")
+    elif event_type == "payment_created":
+        stable["payment"] = payload.get("payment") or payload.get("label") or payload.get("note")
+    elif event_type == "payment_paid":
+        stable["payment"] = payload.get("payment") or payload.get("label") or payload.get("note")
+    elif event_type in {"preview_generated", "documents_delivered", "user_started_bot"}:
+        stable["case"] = case_id
+    else:
+        stable["payload"] = payload
+    return json.dumps(stable, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _stage_can_move(current_status_name: str | None, target_status_name: str, *, reset_allowed: bool) -> bool:
+    if reset_allowed or not current_status_name:
+        return True
+    current_order = STAGE_ORDER.get(current_status_name, -1)
+    target_order = STAGE_ORDER.get(target_status_name, current_order)
+    return target_order >= current_order
+
 
 EVENT_STATUS_MAP = {
     "user_started_bot": "Подписался на бота",
@@ -145,6 +185,7 @@ class AmoCrmService:
         response_payload: Any,
         success: bool,
         error_message: str | None,
+        dedupe_key: str | None = None,
     ) -> None:
         if session is None:
             return
@@ -152,6 +193,7 @@ class AmoCrmService:
             case_id=case.id if case else None,
             user_id=user.id if user else None,
             event_type=event_type,
+            dedupe_key=dedupe_key,
             amo_entity_type=amo_entity_type,
             amo_entity_id=amo_entity_id,
             request_payload=_safe_json(request_payload),
@@ -340,7 +382,7 @@ class AmoCrmService:
                     return lead
         return None
 
-    async def create_lead(self, case: Case, user: User, status_name: str) -> int | None:
+    async def create_lead(self, case: Case, user: User, status_name: str, *, reset_allowed: bool = False) -> int | None:
         pipeline = await self.ensure_pipeline()
         if not pipeline:
             return None
@@ -354,8 +396,13 @@ class AmoCrmService:
             case.amocrm_lead_id = lead_id
             case.amo_lead_id = lead_id
             case.amocrm_pipeline_id = pipeline_id
+            existing_status_id = int(existing.get("status_id") or 0)
+            if existing_status_id:
+                case.amocrm_status_id = existing_status_id
+                reverse_statuses = {value: key for key, value in statuses.items()}
+                case.amocrm_status_name = reverse_statuses.get(existing_status_id, case.amocrm_status_name)
             await self.request("PATCH", "/leads", json_body=[{"id": lead_id, "name": lead_name}])
-            await self.update_lead_status(case, status_name)
+            await self.update_lead_status(case, status_name, reset_allowed=reset_allowed)
             return lead_id
         contact_id = await self.create_or_update_contact(user)
         payload = [
@@ -379,11 +426,12 @@ class AmoCrmService:
         case.amocrm_status_name = status_name
         return lead_id
 
-    async def update_lead_status(self, case: Case, status_name: str) -> bool:
+    async def update_lead_status(self, case: Case, status_name: str, *, reset_allowed: bool = False) -> bool:
         lead_id = case.amocrm_lead_id or case.amo_lead_id
         if not lead_id:
             return False
-        if case.amocrm_status_name == "Оплатил" and status_name == "Получил напоминание (не оплатил)":
+        if not _stage_can_move(case.amocrm_status_name, status_name, reset_allowed=reset_allowed):
+            logger.info("Skip backward amoCRM stage case_id=%s current=%s target=%s", case.id, case.amocrm_status_name, status_name)
             return True
         pipeline = await self.ensure_pipeline()
         if not pipeline:
@@ -535,6 +583,17 @@ class AmoCrmService:
         payload: dict | None = None,
     ) -> None:
         payload = payload or {}
+        dedupe_key = crm_event_dedupe_key(case.id, event_type, payload) if event_type in DEDUPED_EVENTS else None
+        if session is not None and dedupe_key:
+            existing = await session.execute(
+                select(CrmSyncLog.id)
+                .where(CrmSyncLog.dedupe_key == dedupe_key, CrmSyncLog.success.is_(True))
+                .limit(1)
+            )
+            if existing.scalar_one_or_none() is not None:
+                logger.info("Skip duplicate CRM event case_id=%s event=%s key=%s", case.id, event_type, dedupe_key)
+                return
+
         if not self.is_enabled():
             if session:
                 await self._log_sync(
@@ -548,29 +607,47 @@ class AmoCrmService:
                     response_payload=None,
                     success=False,
                     error_message="amoCRM disabled",
+                    dedupe_key=dedupe_key,
                 )
             return
 
         status_name = EVENT_STATUS_MAP.get(event_type)
         response_payload: dict[str, Any] = {}
+        current_case_id = user.amocrm_current_case_id
+        new_cycle = current_case_id != case.id
+        reset_allowed = bool(new_cycle)
         try:
             if not (case.amocrm_lead_id or case.amo_lead_id):
                 contact_id = await self.create_or_update_contact(user)
                 if contact_id:
                     user.amocrm_contact_id = contact_id
                     case.amocrm_contact_id = contact_id
-                lead_id = await self.create_lead(case, user, status_name or "Подписался на бота")
+                lead_id = await self.create_lead(case, user, status_name or "Подписался на бота", reset_allowed=reset_allowed)
                 if lead_id:
                     case.amocrm_lead_id = lead_id
                     case.amo_lead_id = lead_id
             elif status_name:
-                await self.update_lead_status(case, status_name)
+                await self.update_lead_status(case, status_name, reset_allowed=reset_allowed)
+
+            if new_cycle:
+                user.amocrm_current_case_id = case.id
+                response_payload["new_case_cycle"] = True
+                response_payload["previous_case_id"] = current_case_id
 
             if status_name:
                 response_payload["status_name"] = status_name
                 response_payload["status_id"] = case.amocrm_status_id
 
             note_parts = [f"Событие: {event_type}"]
+            if new_cycle:
+                if current_case_id:
+                    note_parts.append(f"Новая заявка #{case.id} начата")
+                else:
+                    note_parts.append(f"Заявка #{case.id} начата")
+            if event_type == "order_photo_uploaded":
+                note_parts.append(f"Фото приказа по заявке #{case.id}")
+            if event_type == "documents_delivered":
+                note_parts.append(f"Заявка #{case.id} завершена")
             if payload.get("note"):
                 note_parts.append(str(payload["note"]))
             if payload.get("text"):
@@ -599,6 +676,7 @@ class AmoCrmService:
                     response_payload=response_payload,
                     success=True,
                     error_message=None,
+                    dedupe_key=dedupe_key,
                 )
         except Exception as exc:
             logger.exception("amoCRM sync failed case=%s event=%s", case.id, event_type)
@@ -614,6 +692,7 @@ class AmoCrmService:
                     response_payload=response_payload,
                     success=False,
                     error_message=str(exc),
+                    dedupe_key=dedupe_key,
                 )
 
     async def sync_case_current_state(self, session: AsyncSession, case: Case, user: User) -> None:

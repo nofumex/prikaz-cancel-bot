@@ -65,7 +65,8 @@ class Settings:
     text_model: str
     llm_timeout_seconds: int
     max_ai_review_regenerations: int
-
+    document_ai_review_mode: str
+    admin_debug_to_telegram: bool
     document_price_rub: int
     document_preview_mode: str
     enable_pdf_preview: bool
@@ -161,6 +162,8 @@ def get_settings() -> Settings:
         text_model=(getenv("TEXT_MODEL") or getenv("VISION_MODEL") or "gpt-5.4-mini").strip(),
         llm_timeout_seconds=_parse_int(getenv("LLM_TIMEOUT_SECONDS"), 90),
         max_ai_review_regenerations=_parse_int(getenv("MAX_AI_REVIEW_REGENERATIONS"), 1),
+        document_ai_review_mode=(getenv("DOCUMENT_AI_REVIEW_MODE") or "shadow").strip().lower(),
+        admin_debug_to_telegram=_parse_bool(getenv("ADMIN_DEBUG_TO_TELEGRAM"), False),
         document_price_rub=_parse_int(getenv("DOCUMENT_PRICE_RUB"), 990),
         document_preview_mode=(getenv("DOCUMENT_PREVIEW_MODE") or "pdf").strip().lower(),
         enable_pdf_preview=_parse_bool(getenv("ENABLE_PDF_PREVIEW"), True),

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import logging
@@ -594,6 +594,9 @@ async def process_manual_fields(message: Message, state: FSMContext, session: As
 
 
 async def _notify_admin_qa_failure(bot: Bot, settings: Settings, case: Case, reason: str) -> None:
+    if not settings.admin_debug_to_telegram:
+        logger.warning("Admin QA/debug Telegram report suppressed case_id=%s reason=%s", case.id, reason[:500])
+        return
     for admin_id in settings.admin_ids:
         try:
             await bot.send_message(admin_id, reason)
