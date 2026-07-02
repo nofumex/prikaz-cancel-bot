@@ -12,7 +12,7 @@ from app.models import Case, Payment, User
 from app.services.legal_data import legal_deadline_from_received
 
 
-ACTIVE_FINAL_STATUSES = {CaseStatus.DELIVERED.value, CaseStatus.CANCELED.value, CaseStatus.SUPERSEDED.value}
+ACTIVE_FINAL_STATUSES = {CaseStatus.PAID.value, CaseStatus.DELIVERED.value, CaseStatus.CANCELED.value, CaseStatus.SUPERSEDED.value}
 
 
 async def create_case(session: AsyncSession, user: User, *, chat_id: str | None = None) -> Case:

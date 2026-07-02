@@ -14,7 +14,7 @@ from app.keyboards.common import envelope_choice, order_rephoto_menu
 from app.models import Case, User
 from app.services.legal_data import normalize_order_data
 from app.adapters.max.keyboards import envelope_choice as max_envelope_choice, order_rephoto_menu as max_order_rephoto_menu
-from app.adapters.max.mapper import sanitize_raw_update
+from app.adapters.max.mapper import parse_update, sanitize_raw_update
 
 
 def _make_settings(**kwargs):
@@ -330,19 +330,19 @@ async def test_max_case_new_reuses_empty_waiting_case(monkeypatch):
     user = User(id=1, platform="max", platform_user_id="42")
     case = _case(id=79, platform="max", platform_user_id="42", status=CaseStatus.WAITING_ORDER_PHOTO.value, order_photo_path=None)
     event = IncomingEvent(platform_user_id="42", chat_id="chat-1", callback_data="case:new", callback_id="cb-1")
-    create = AsyncMock()
+    get_or_create = AsyncMock(return_value=case)
 
     monkeypatch.setattr(max_bot, "SessionLocal", lambda: SessionContext())
     monkeypatch.setattr(max_bot, "get_or_create_platform_user", AsyncMock(return_value=user))
     monkeypatch.setattr(max_bot, "_state", AsyncMock(return_value=None))
     monkeypatch.setattr(max_bot, "latest_open_case", AsyncMock(return_value=case))
-    monkeypatch.setattr(max_bot, "create_case", create)
+    monkeypatch.setattr(max_bot, "get_or_create_active_case", get_or_create)
     monkeypatch.setattr(max_bot, "_set_state", AsyncMock())
     monkeypatch.setattr(max_bot, "schedule_crm_sync", lambda *args, **kwargs: None)
 
     await max_bot.handle_update(client, event, settings)
 
-    assert create.await_count == 0
+    get_or_create.assert_awaited_once_with(session, user, chat_id="chat-1", force_new=False)
     assert client.send_message.await_count == 1
 
 def test_max_parse_update_accepts_photo_attachment_variants():

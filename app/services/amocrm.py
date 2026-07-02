@@ -29,7 +29,8 @@ PIPELINE_STATUSES = [
 ]
 
 
-STAGE_ORDER = {name: index for index, name in enumerate(PIPELINE_STATUSES)}
+STAGE_RANK = {name: index for index, name in enumerate(PIPELINE_STATUSES)}
+STAGE_ORDER = STAGE_RANK
 DEDUPED_EVENTS = {
     "user_started_bot",
     "order_photo_uploaded",
@@ -59,12 +60,21 @@ def crm_event_dedupe_key(case_id: int | None, event_type: str, payload: dict | N
     return json.dumps(stable, ensure_ascii=False, sort_keys=True, default=str)
 
 
-def _stage_can_move(current_status_name: str | None, target_status_name: str, *, reset_allowed: bool) -> bool:
-    if reset_allowed or not current_status_name:
+def _stage_can_move(
+    current_case_id: int | None,
+    event_case_id: int | None,
+    current_status: str | None,
+    target_status: str | None,
+) -> bool:
+    if not target_status or not current_status:
         return True
-    current_order = STAGE_ORDER.get(current_status_name, -1)
-    target_order = STAGE_ORDER.get(target_status_name, current_order)
-    return target_order >= current_order
+    if current_case_id is None or event_case_id is None or current_case_id != event_case_id:
+        return True
+    current_rank = STAGE_RANK.get(current_status)
+    target_rank = STAGE_RANK.get(target_status)
+    if current_rank is None or target_rank is None:
+        return True
+    return target_rank >= current_rank
 
 
 EVENT_STATUS_MAP = {
@@ -382,7 +392,7 @@ class AmoCrmService:
                     return lead
         return None
 
-    async def create_lead(self, case: Case, user: User, status_name: str, *, reset_allowed: bool = False) -> int | None:
+    async def create_lead(self, case: Case, user: User, status_name: str, *, current_case_id: int | None = None) -> int | None:
         pipeline = await self.ensure_pipeline()
         if not pipeline:
             return None
@@ -402,7 +412,7 @@ class AmoCrmService:
                 reverse_statuses = {value: key for key, value in statuses.items()}
                 case.amocrm_status_name = reverse_statuses.get(existing_status_id, case.amocrm_status_name)
             await self.request("PATCH", "/leads", json_body=[{"id": lead_id, "name": lead_name}])
-            await self.update_lead_status(case, status_name, reset_allowed=reset_allowed)
+            await self.update_lead_status(case, status_name, current_case_id=current_case_id, event_case_id=case.id)
             return lead_id
         contact_id = await self.create_or_update_contact(user)
         payload = [
@@ -426,12 +436,12 @@ class AmoCrmService:
         case.amocrm_status_name = status_name
         return lead_id
 
-    async def update_lead_status(self, case: Case, status_name: str, *, reset_allowed: bool = False) -> bool:
+    async def update_lead_status(self, case: Case, status_name: str, *, current_case_id: int | None = None, event_case_id: int | None = None) -> bool:
         lead_id = case.amocrm_lead_id or case.amo_lead_id
         if not lead_id:
             return False
-        if not _stage_can_move(case.amocrm_status_name, status_name, reset_allowed=reset_allowed):
-            logger.info("Skip backward amoCRM stage case_id=%s current=%s target=%s", case.id, case.amocrm_status_name, status_name)
+        if not _stage_can_move(current_case_id, event_case_id or case.id, case.amocrm_status_name, status_name):
+            logger.info("Skip backward amoCRM stage case_id=%s current_case_id=%s event_case_id=%s current=%s target=%s", case.id, current_case_id, event_case_id or case.id, case.amocrm_status_name, status_name)
             return True
         pipeline = await self.ensure_pipeline()
         if not pipeline:
@@ -615,19 +625,18 @@ class AmoCrmService:
         response_payload: dict[str, Any] = {}
         current_case_id = user.amocrm_current_case_id
         new_cycle = current_case_id != case.id
-        reset_allowed = bool(new_cycle)
         try:
             if not (case.amocrm_lead_id or case.amo_lead_id):
                 contact_id = await self.create_or_update_contact(user)
                 if contact_id:
                     user.amocrm_contact_id = contact_id
                     case.amocrm_contact_id = contact_id
-                lead_id = await self.create_lead(case, user, status_name or "Подписался на бота", reset_allowed=reset_allowed)
+                lead_id = await self.create_lead(case, user, status_name or "\u041f\u043e\u0434\u043f\u0438\u0441\u0430\u043b\u0441\u044f \u043d\u0430 \u0431\u043e\u0442\u0430", current_case_id=current_case_id)
                 if lead_id:
                     case.amocrm_lead_id = lead_id
                     case.amo_lead_id = lead_id
             elif status_name:
-                await self.update_lead_status(case, status_name, reset_allowed=reset_allowed)
+                await self.update_lead_status(case, status_name, current_case_id=current_case_id, event_case_id=case.id)
 
             if new_cycle:
                 user.amocrm_current_case_id = case.id

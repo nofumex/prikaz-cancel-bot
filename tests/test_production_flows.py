@@ -256,6 +256,38 @@ async def test_new_case_supersedes_old_pending_cases(session_factory):
 
 
 @pytest.mark.asyncio
+async def test_case_new_continues_unfinished_case_without_force(session_factory):
+    async with session_factory() as session:
+        user = User(platform="telegram", platform_user_id="1")
+        session.add(user)
+        await session.flush()
+        old = Case(user_id=user.id, platform="telegram", platform_user_id="1", status=CaseStatus.PAYMENT_PENDING.value)
+        session.add(old)
+        await session.commit()
+
+        case = await get_or_create_active_case(session, user, force_new=False)
+
+        assert case.id == old.id
+        assert case.status == CaseStatus.PAYMENT_PENDING.value
+
+
+@pytest.mark.asyncio
+async def test_case_new_starts_fresh_after_paid_case(session_factory):
+    async with session_factory() as session:
+        user = User(platform="telegram", platform_user_id="1")
+        session.add(user)
+        await session.flush()
+        old = Case(user_id=user.id, platform="telegram", platform_user_id="1", status=CaseStatus.PAID.value)
+        session.add(old)
+        await session.commit()
+
+        case = await get_or_create_active_case(session, user, force_new=False)
+
+        assert case.id != old.id
+        assert case.status == CaseStatus.WAITING_ORDER_PHOTO.value
+
+
+@pytest.mark.asyncio
 async def test_reminders_only_latest_active_case(session_factory):
     async with session_factory() as session:
         now = datetime.utcnow()

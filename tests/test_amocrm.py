@@ -176,3 +176,103 @@ async def test_attach_file_to_lead_fallback_note_includes_api_error(tmp_path):
 
     assert "Файл не загружен в amoCRM, fallback path" in notes[0]
     assert "Причина: HTTP 403: access denied" in notes[0]
+
+
+
+def test_crm_stage_moves_forward_only_inside_same_case():
+    assert _stage_can_move(63, 63, "\u041e\u0442\u043f\u0440\u0430\u0432\u0438\u043b \u043f\u0440\u0438\u043a\u0430\u0437", "\u0423\u043a\u0430\u0437\u0430\u043b \u0434\u0430\u0442\u0443") is True
+    assert _stage_can_move(63, 63, "\u041e\u043f\u043b\u0430\u0442\u0438\u043b", "\u041f\u043e\u0434\u043f\u0438\u0441\u0430\u043b\u0441\u044f \u043d\u0430 \u0431\u043e\u0442\u0430") is False
+    assert _stage_can_move(63, 64, "\u041e\u043f\u043b\u0430\u0442\u0438\u043b", "\u041f\u043e\u0434\u043f\u0438\u0441\u0430\u043b\u0441\u044f \u043d\u0430 \u0431\u043e\u0442\u0430") is True
+
+
+def test_crm_event_dedupe_key_uses_stable_payload_fields():
+    first = crm_event_dedupe_key(63, "order_photo_uploaded", {"files": [{"path": "b.jpg"}, {"path": "a.jpg"}]})
+    same = crm_event_dedupe_key(63, "order_photo_uploaded", {"files": [{"path": "a.jpg"}, {"path": "b.jpg"}]})
+    different = crm_event_dedupe_key(63, "order_photo_uploaded", {"files": [{"path": "c.jpg"}]})
+
+    assert first == same
+    assert first != different
+
+
+@pytest.mark.asyncio
+async def test_duplicate_crm_event_skips_note_and_network_calls():
+    service = AmoCrmService(_settings(amocrm_enabled=True))
+    case = Case(id=63, user_id=1, amocrm_lead_id=123, amocrm_status_name="\u041e\u0442\u043f\u0440\u0430\u0432\u0438\u043b \u043f\u0440\u0438\u043a\u0430\u0437")
+    user = User(id=1, platform="telegram", platform_user_id="1", amocrm_current_case_id=63)
+    notes = []
+    requests = []
+
+    class ExistingResult:
+        def scalar_one_or_none(self):
+            return 1
+
+    class FakeSession:
+        async def execute(self, stmt):
+            return ExistingResult()
+
+    async def fake_note(case, text):
+        notes.append(text)
+        return True
+
+    async def fake_request(method, path, **kwargs):
+        requests.append((method, path, kwargs))
+        return {}, None
+
+    service.add_lead_note = fake_note
+    service.request = fake_request
+
+    await service.sync_case_event(
+        FakeSession(),
+        case,
+        user,
+        "order_photo_uploaded",
+        {"files": [{"path": "same-order.jpg", "caption": "order"}]},
+    )
+
+    assert notes == []
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_update_lead_status_skips_backward_without_new_cycle():
+    service = AmoCrmService(_settings(amocrm_enabled=True))
+    calls = []
+
+    async def fake_request(method, path, *, json_body=None, params=None, files=None, retries=3):
+        calls.append((method, path, json_body))
+        return {}, None
+
+    service.request = fake_request
+    case = Case(id=63, user_id=1, amocrm_lead_id=123, amocrm_status_name="\u041e\u043f\u043b\u0430\u0442\u0438\u043b")
+
+    assert await service.update_lead_status(case, "\u041f\u043e\u0434\u043f\u0438\u0441\u0430\u043b\u0441\u044f \u043d\u0430 \u0431\u043e\u0442\u0430", current_case_id=63, event_case_id=63) is True
+    assert calls == []
+    assert case.amocrm_status_name == "\u041e\u043f\u043b\u0430\u0442\u0438\u043b"
+
+
+@pytest.mark.asyncio
+async def test_update_lead_status_allows_reset_for_new_cycle():
+    service = AmoCrmService(_settings(amocrm_enabled=True))
+    calls = []
+
+    async def fake_ensure_pipeline():
+        return {
+            "id": 1,
+            "_embedded": {"statuses": [{"id": 10, "name": "\u041f\u043e\u0434\u043f\u0438\u0441\u0430\u043b\u0441\u044f \u043d\u0430 \u0431\u043e\u0442\u0430"}]},
+        }
+
+    async def fake_request(method, path, *, json_body=None, params=None, files=None, retries=3):
+        calls.append((method, path, json_body))
+        return {}, None
+
+    async def fake_ensure_statuses(pipeline_id):
+        return {"\u041f\u043e\u0434\u043f\u0438\u0441\u0430\u043b\u0441\u044f \u043d\u0430 \u0431\u043e\u0442\u0430": 10}
+
+    service.ensure_pipeline = fake_ensure_pipeline
+    service.ensure_statuses = fake_ensure_statuses
+    service.request = fake_request
+    case = Case(id=64, user_id=1, amocrm_lead_id=123, amocrm_status_name="\u041e\u043f\u043b\u0430\u0442\u0438\u043b")
+
+    assert await service.update_lead_status(case, "\u041f\u043e\u0434\u043f\u0438\u0441\u0430\u043b\u0441\u044f \u043d\u0430 \u0431\u043e\u0442\u0430", current_case_id=63, event_case_id=64) is True
+    assert calls == [("PATCH", "/leads", [{"id": 123, "pipeline_id": 1, "status_id": 10}])]
+    assert case.amocrm_status_name == "\u041f\u043e\u0434\u043f\u0438\u0441\u0430\u043b\u0441\u044f \u043d\u0430 \u0431\u043e\u0442\u0430"

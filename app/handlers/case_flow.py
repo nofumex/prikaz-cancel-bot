@@ -162,7 +162,9 @@ async def start_case(event: Message | CallbackQuery, state: FSMContext, session:
     start = time.monotonic()
     target = event.message if isinstance(event, CallbackQuery) else event
     chat_id = str(target.chat.id) if getattr(target, "chat", None) else current_user.platform_user_id
-    case = await get_or_create_active_case(session, current_user, chat_id=chat_id, force_new=True)
+    previous = await latest_open_case(session, current_user.id)
+    case = await get_or_create_active_case(session, current_user, chat_id=chat_id, force_new=False)
+    is_new_case = previous is None or previous.id != case.id
     await state.update_data(case_id=case.id)
     await state.set_state(CaseStates.waiting_order_photo)
     await target.answer(
@@ -172,7 +174,8 @@ async def start_case(event: Message | CallbackQuery, state: FSMContext, session:
         "После даты я сразу подготовлю preview PDF и ссылку на оплату."
     )
     logger.info("handler case:new answered_to_user duration_ms=%s", int((time.monotonic() - start) * 1000))
-    schedule_crm_sync(settings, case.id, current_user.id, "user_started_bot", {"note": "Пользователь запустил бот"})
+    if is_new_case:
+        schedule_crm_sync(settings, case.id, current_user.id, "user_started_bot", {"note": "Пользователь запустил бот"})
     if isinstance(event, CallbackQuery):
         await event.answer()
 
