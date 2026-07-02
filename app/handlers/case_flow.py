@@ -21,7 +21,7 @@ from app.services.amocrm import get_amocrm_service
 from app.services.crm_background import schedule_crm_sync
 from app.services.document_delivery import delivery_instruction_text
 from app.services.cases import create_case, get_or_create_active_case, latest_case, latest_open_case, save_photo_path, set_received_date
-from app.services.documents import create_case_documents, extraction_preview
+from app.services.documents import MANUAL_REVIEW_USER_TEXT, create_case_documents_reviewed, extraction_preview
 from app.services.app_settings import payments_enabled
 from app.services.amount_recovery import (
     AmountRecoveryResult,
@@ -735,10 +735,11 @@ async def _generate_documents_flow(
         return False
 
     try:
-        full_docx, full_pdf, preview_pdf, preview_docx, instruction_path = create_case_documents(
+        review_outcome = await create_case_documents_reviewed(
             case,
             current_user,
             settings,
+            session,
             restore_reason=stored_reason or None,
         )
     except ValueError as exc:
@@ -750,11 +751,22 @@ async def _generate_documents_flow(
         if state is not None:
             await state.update_data(case_id=case.id)
             await state.set_state(CaseStates.waiting_order_rephoto)
-        await message.answer(
-            f"⚠️ {exc}\n\nПожалуйста, сфотографируйте судебный приказ целиком ещё раз.",
-            reply_markup=order_rephoto_menu(),
-        )
+        await message.answer(MANUAL_REVIEW_USER_TEXT)
         return False
+    if not review_outcome.ok or review_outcome.artifacts is None:
+        case.status = CaseStatus.NEEDS_REVIEW.value
+        await session.commit()
+        report = review_outcome.admin_report or "AI document review failed"
+        schedule_crm_sync(settings, case.id, current_user.id, "document_qa_failed", {"note": report[:65000]})
+        if bot:
+            await _notify_admin_qa_failure(bot, settings, case, report)
+        await message.answer(MANUAL_REVIEW_USER_TEXT)
+        return False
+    full_docx = review_outcome.artifacts.full_docx_path
+    full_pdf = review_outcome.artifacts.full_pdf_path
+    preview_pdf = review_outcome.artifacts.preview_pdf_path
+    preview_docx = None
+    instruction_path = review_outcome.artifacts.instruction_docx_path
     case.full_doc_path = str(full_docx)
     case.full_pdf_path = str(full_pdf) if full_pdf else None
     case.preview_pdf_path = str(preview_pdf) if preview_pdf else None
@@ -937,5 +949,11 @@ async def deliver_full_documents(message: Message, session: AsyncSession, case: 
             case.id,
             user.id,
             "documents_delivered",
-            {"note": "Клиенту выдан полный DOCX и инструкция текстом"},
+            {
+                "note": "Полные документы: DOCX и инструкция выданы",
+                "files": [
+                    {"path": case.full_doc_path or "", "caption": "Полный DOCX"},
+                    {"path": case.full_pdf_path or "", "caption": "Полный PDF"},
+                ],
+            },
         )

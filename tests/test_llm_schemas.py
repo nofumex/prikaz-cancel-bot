@@ -1,4 +1,4 @@
-from app.services.llm import AMOUNTS_JSON_SCHEMA, ENVELOPE_JSON_SCHEMA, NAME_JSON_SCHEMA, ORDER_JSON_SCHEMA
+from app.services.llm import AMOUNTS_JSON_SCHEMA, DOCUMENT_REVIEW_SCHEMA, ENVELOPE_JSON_SCHEMA, NAME_JSON_SCHEMA, ORDER_JSON_SCHEMA
 
 
 def assert_openai_strict_schema(schema: dict) -> None:
@@ -21,3 +21,10 @@ def test_name_schema_is_openai_strict():
 
 def test_amounts_schema_is_strict():
     assert_openai_strict_schema(AMOUNTS_JSON_SCHEMA)
+
+def test_document_review_schema_is_strict():
+    assert_openai_strict_schema(DOCUMENT_REVIEW_SCHEMA)
+    clean_fields = DOCUMENT_REVIEW_SCHEMA["properties"]["clean_fields"]
+    assert_openai_strict_schema(clean_fields)
+    issue = DOCUMENT_REVIEW_SCHEMA["properties"]["issues"]["items"]
+    assert_openai_strict_schema(issue)

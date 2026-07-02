@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -15,7 +16,29 @@ from app.models import Case, User
 from app.services.amocrm import PIPELINE_STATUSES, get_amocrm_service
 
 
-async def main(create_test_lead: bool) -> int:
+async def _check_file_upload(service, lead_id: int | None = None) -> bool:
+    with TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "amocrm_upload_check.txt"
+        path.write_text("amoCRM file upload check", encoding="utf-8")
+        file_uuid, error = await service.upload_file_to_drive(path)
+        if error or not file_uuid:
+            print("Token cannot upload files to amoCRM")
+            print(f"Files API error: {error or 'empty file uuid'}")
+            return False
+        print(f"Files API upload OK: file_uuid={file_uuid}")
+        if lead_id:
+            linked, link_error = await service.link_file_to_lead(lead_id, file_uuid)
+            if not linked:
+                print("Token cannot upload files to amoCRM")
+                print(f"Files API link error: {link_error or 'unknown link error'}")
+                return False
+            print(f"Files API attach OK: lead_id={lead_id}, file_uuid={file_uuid}")
+        else:
+            print("Files API attach skipped: use --create-test-lead or --attach-test-file-to-lead LEAD_ID")
+        return True
+
+
+async def main(create_test_lead: bool, check_file_upload: bool, attach_test_file_to_lead: int | None) -> int:
     settings = get_settings()
     required = {
         "AMOCRM_ENABLED": settings.amocrm_enabled,
@@ -45,6 +68,8 @@ async def main(create_test_lead: bool) -> int:
     print(f"Missing created: {report.get('created', 0)}")
     print("Errors: " + ("none" if not report.get("errors") else ", ".join(report["errors"])))
 
+    test_lead_id = attach_test_file_to_lead
+
     if create_test_lead:
         async with SessionLocal() as session:
             user = User(
@@ -63,12 +88,20 @@ async def main(create_test_lead: bool) -> int:
             await session.commit()
             await session.refresh(case)
             await service.sync_case_event(session, case, user, "user_started_bot", {"note": "Test lead from scripts/check_amocrm.py"})
-            print(f"Test lead created: case_id={case.id}, lead_id={case.amocrm_lead_id or case.amo_lead_id}")
+            test_lead_id = case.amocrm_lead_id or case.amo_lead_id
+            print(f"Test lead created: case_id={case.id}, lead_id={test_lead_id}")
+
+    if check_file_upload:
+        upload_ok = await _check_file_upload(service, int(test_lead_id) if test_lead_id else None)
+        if not upload_ok:
+            return 4
     return 0
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--create-test-lead", action="store_true")
+    parser.add_argument("--skip-file-upload-check", action="store_true")
+    parser.add_argument("--attach-test-file-to-lead", type=int, default=None)
     args = parser.parse_args()
-    raise SystemExit(asyncio.run(main(args.create_test_lead)))
+    raise SystemExit(asyncio.run(main(args.create_test_lead, not args.skip_file_upload_check, args.attach_test_file_to_lead)))

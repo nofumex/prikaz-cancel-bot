@@ -18,7 +18,7 @@ from app.services.app_settings import payments_enabled
 from app.services.cases import create_case, latest_case, latest_open_case, save_photo_path, set_received_date, supersede_open_cases
 from app.services.crm_background import schedule_crm_sync
 from app.services.document_delivery import deliver_documents_to_case_platform
-from app.services.documents import create_case_documents, extraction_preview
+from app.services.documents import MANUAL_REVIEW_USER_TEXT, create_case_documents_reviewed, extraction_preview
 from app.services.legal_data import FIELD_LABELS, missing_order_fields, normalize_debtor_name_fields, normalize_order_data, validate_before_generation
 from app.services.llm import extract_envelope_date, extract_order_data
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
@@ -365,7 +365,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 if refreshed:
                     case = refreshed
             if not case or case.status != CaseStatus.PAID.value:
-                await client.answer_callback(event.callback_id, "Пока не вижу оплату")
+                await client.answer_callback(event.callback_id, "Платеж пока не найден. Попробуйте через 10–20 секунд.")
                 return
             if case.delivered_at:
                 await client.answer_callback(event.callback_id, "Документы уже отправлены")
@@ -490,6 +490,14 @@ async def _handle_envelope_image(client: MaxBotClient, event: IncomingEvent, ses
     await _extract_and_process_order(client, event, session, settings, user, case)
 
 
+async def _notify_admin_document_review_failure(client: MaxBotClient, settings: Settings, reason: str) -> None:
+    for admin_id in settings.max_admin_ids or settings.admin_ids:
+        try:
+            await client.send_message(user_id=admin_id, text=reason[:3500])
+        except Exception:
+            logger.exception("Failed to notify MAX admin %s about document review", admin_id)
+
+
 async def _handle_manual_date(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User, text: str) -> None:
     received = parse_russian_date(text)
     if not received:
@@ -582,20 +590,29 @@ async def _generate_documents(client: MaxBotClient, event: IncomingEvent, sessio
         await _send_order_rephoto_prompt(client, event, validation.missing, attempts=case.order_rephoto_attempts)
         return
     try:
-        full_docx, full_pdf, preview_pdf, preview_docx, instruction = create_case_documents(case, user, settings)
+        review_outcome = await create_case_documents_reviewed(case, user, settings, session)
     except Exception as exc:
         logger.exception("MAX document generation failed")
         case.status = CaseStatus.NEEDS_REVIEW.value
         await session.commit()
         schedule_crm_sync(settings, case.id, user.id, "document_qa_failed", {"note": str(exc)})
         await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})
-        await _send(
-            client,
-            event,
-            f"⚠️ {h(exc)}\n\nПожалуйста, сфотографируйте судебный приказ целиком ещё раз.",
-            keyboards.order_rephoto_menu(),
-        )
+        await _notify_admin_document_review_failure(client, settings, f"⚠️ QA не пройден по заявке #{case.id}: {exc}")
+        await _send(client, event, MANUAL_REVIEW_USER_TEXT)
         return
+    if not review_outcome.ok or review_outcome.artifacts is None:
+        case.status = CaseStatus.NEEDS_REVIEW.value
+        await session.commit()
+        report = review_outcome.admin_report or "AI document review failed"
+        schedule_crm_sync(settings, case.id, user.id, "document_qa_failed", {"note": report[:65000]})
+        await _notify_admin_document_review_failure(client, settings, report)
+        await _send(client, event, MANUAL_REVIEW_USER_TEXT)
+        return
+    full_docx = review_outcome.artifacts.full_docx_path
+    full_pdf = review_outcome.artifacts.full_pdf_path
+    preview_pdf = review_outcome.artifacts.preview_pdf_path
+    preview_docx = None
+    instruction = review_outcome.artifacts.instruction_docx_path
     case.full_doc_path = str(full_docx)
     case.full_pdf_path = str(full_pdf) if full_pdf else None
     case.preview_pdf_path = str(preview_pdf) if preview_pdf else None

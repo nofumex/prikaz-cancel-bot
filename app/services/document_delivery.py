@@ -50,7 +50,19 @@ async def deliver_documents_to_case_platform(case_id: int, settings: Settings, t
         case.delivered_at = datetime.utcnow()
         await session.commit()
         schedule_crm_sync(settings, case.id, case.user.id, "payment_paid", {"note": "Оплата подтверждена"})
-        schedule_crm_sync(settings, case.id, case.user.id, "documents_delivered", {"note": "Клиенту выдан полный DOCX и инструкция текстом"})
+        schedule_crm_sync(
+            settings,
+            case.id,
+            case.user.id,
+            "documents_delivered",
+            {
+                "note": "Полные документы: DOCX и инструкция выданы",
+                "files": [
+                    {"path": case.full_doc_path or "", "caption": "Полный DOCX"},
+                    {"path": case.full_pdf_path or "", "caption": "Полный PDF"},
+                ],
+            },
+        )
 
 
 def delivery_instruction_text(case: Case) -> str:

@@ -26,6 +26,18 @@ def is_probably_not_nominative(full_name: str) -> bool:
     parts = [p for p in _clean_name(full_name).split() if p]
     if len(parts) < 2:
         return False
+    if len(parts) >= 3:
+        surname = parts[0].lower().strip(".,")
+        given = parts[1].lower().strip(".,")
+        patronymic = parts[2].lower().strip(".,")
+        feminine_nominative = (
+            surname.endswith(("\u043e\u0432\u0430", "\u0435\u0432\u0430", "\u0451\u0432\u0430", "\u0438\u043d\u0430", "\u044b\u043d\u0430"))
+            and given.endswith(("\u0430", "\u044f"))
+            and patronymic.endswith(_FEMALE_PATRONYMIC_ENDINGS)
+        )
+        feminine_oblique = surname.endswith(("\u043e\u0432\u043e\u0439", "\u0435\u0432\u043e\u0439", "\u0438\u043d\u043e\u0439", "\u044b\u043d\u043e\u0439")) or given.endswith("\u0435") or patronymic.endswith(("\u043e\u0432\u043d\u0435", "\u0435\u0432\u043d\u0435", "\u0438\u0447\u043d\u0435"))
+        if feminine_nominative and not feminine_oblique:
+            return False
     suspicious_suffixes = (
         "ого", "его", "ому", "ему", "ой", "ей", "у", "ю",
         "а", "я", "е", "и", "ы",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import time
 from datetime import datetime
 from pathlib import Path
@@ -80,6 +81,9 @@ class AmoCrmService:
         self._statuses_cache: dict[str, int] | None = None
         self._limiter = _RateLimiter(settings.amocrm_rps_limit)
         self._timeout = aiohttp.ClientTimeout(total=30)
+        file_timeout_seconds = getattr(settings, "amocrm_file_upload_timeout_seconds", 30)
+        self._file_timeout = aiohttp.ClientTimeout(total=file_timeout_seconds)
+        self._drive_url_cache: str | None = None
 
     def is_enabled(self) -> bool:
         return bool(self.settings.amocrm_enabled and self.settings.amocrm_base_url and self.settings.amocrm_access_token)
@@ -414,14 +418,112 @@ class AmoCrmService:
         )
         return error is None
 
+    async def _request_raw_url(
+        self,
+        method: str,
+        url: str,
+        *,
+        json_body: Any = None,
+        data: bytes | None = None,
+        content_type: str | None = None,
+    ) -> tuple[dict | list | None, str | None]:
+        headers = {"Authorization": f"Bearer {self.settings.amocrm_access_token}"}
+        if content_type:
+            headers["Content-Type"] = content_type
+        elif json_body is not None:
+            headers["Content-Type"] = "application/json"
+        await self._limiter.wait()
+        try:
+            async with aiohttp.ClientSession(timeout=self._file_timeout, headers=headers) as session:
+                async with session.request(method, url, json=json_body, data=data) as response:
+                    raw_text = await response.text()
+                    if response.status >= 400:
+                        return None, f"HTTP {response.status}: {raw_text[:600]}"
+                    if not raw_text.strip():
+                        return {}, None
+                    try:
+                        return json.loads(raw_text), None
+                    except json.JSONDecodeError:
+                        return {"raw": raw_text}, None
+        except Exception as exc:
+            logger.warning("amoCRM file request failed method=%s url=%s err=%s", method, url, exc)
+            return None, str(exc)
+
+    async def get_drive_url(self) -> tuple[str | None, str | None]:
+        if self._drive_url_cache:
+            return self._drive_url_cache, None
+        data, error = await self.request("GET", "/account", params={"with": "drive_url"})
+        if error or not isinstance(data, dict):
+            return None, error or "drive_url response is empty"
+        drive_url = str(data.get("drive_url") or "").strip().rstrip("/")
+        if not drive_url:
+            links = data.get("_links") or {}
+            drive = links.get("drive") if isinstance(links, dict) else None
+            if isinstance(drive, dict):
+                drive_url = str(drive.get("href") or "").strip().rstrip("/")
+        if not drive_url:
+            return None, "amoCRM account response has no drive_url"
+        self._drive_url_cache = drive_url
+        return drive_url, None
+
+    async def upload_file_to_drive(self, file_path: str | Path) -> tuple[str | None, str | None]:
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            return None, f"file not found: {path}"
+        drive_url, error = await self.get_drive_url()
+        if error or not drive_url:
+            return None, error or "drive_url unavailable"
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        session_payload = {
+            "file_name": path.name,
+            "file_size": path.stat().st_size,
+            "content_type": content_type,
+            "with_preview": content_type.startswith("image/") or content_type == "application/pdf",
+        }
+        session_data, error = await self._request_raw_url("POST", f"{drive_url}/v1.0/sessions", json_body=session_payload)
+        if error or not isinstance(session_data, dict):
+            return None, error or "file upload session response is empty"
+        upload_url = str(session_data.get("upload_url") or "").strip()
+        if not upload_url:
+            return None, "file upload session has no upload_url"
+        max_part_size = int(session_data.get("max_part_size") or 0) or path.stat().st_size or 1
+        with path.open("rb") as fh:
+            next_url = upload_url
+            while True:
+                chunk = fh.read(max_part_size)
+                if not chunk:
+                    return None, "file upload finished without file uuid"
+                upload_data, error = await self._request_raw_url("POST", next_url, data=chunk, content_type="application/octet-stream")
+                if error or not isinstance(upload_data, dict):
+                    return None, error or "file upload response is empty"
+                file_uuid = upload_data.get("uuid") or upload_data.get("file_uuid")
+                if file_uuid:
+                    return str(file_uuid), None
+                next_url = str(upload_data.get("next_url") or "").strip()
+                if not next_url:
+                    return None, "file upload response has no next_url or uuid"
+
+    async def link_file_to_lead(self, lead_id: int, file_uuid: str) -> tuple[bool, str | None]:
+        _, error = await self.request("PUT", f"/leads/{int(lead_id)}/files", json_body=[{"file_uuid": file_uuid}], retries=1)
+        return error is None, error
+
     async def attach_file_to_lead(self, case: Case, file_path: str | Path, caption: str) -> bool:
-        # amoCRM file API varies by account permissions and token scope.
-        # Keep production-safe fallback: note with local path + explicit marker.
         path = Path(file_path)
         lead_id = case.amocrm_lead_id or case.amo_lead_id
         if not lead_id or not path.exists():
             return False
-        note = f"{caption}: {path.resolve()}\nФайл не загружен в amoCRM, fallback path"
+        if not getattr(self.settings, "amocrm_file_upload_enabled", True):
+            reason = "AMOCRM_FILE_UPLOAD_ENABLED=false"
+            note = f"{caption}: {path.resolve()}\nФайл не загружен в amoCRM, fallback path\nПричина: {reason}"
+            return await self.add_lead_note(case, note)
+        file_uuid, error = await self.upload_file_to_drive(path)
+        if not error and file_uuid:
+            linked, link_error = await self.link_file_to_lead(int(lead_id), file_uuid)
+            if linked:
+                await self.add_lead_note(case, f"{caption}: файл загружен в amoCRM (uuid: {file_uuid})")
+                return True
+            error = link_error or "file uploaded but link failed"
+        note = f"{caption}: {path.resolve()}\nФайл не загружен в amoCRM, fallback path\nПричина: {error or 'unknown amoCRM file upload error'}"
         return await self.add_lead_note(case, note)
 
     async def sync_case_event(

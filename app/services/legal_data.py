@@ -42,7 +42,6 @@ BAD_DOCUMENT_TOKENS = [
     "зарегистрированному",
     "урожен",
     "паспорт",
-    "г. Ачинск Красноярского края",
 ]
 
 PREVIEW_IGNORED_TOKENS = {"▒"}
@@ -100,20 +99,45 @@ def normalize_address_text(value: object | None) -> str:
     return text.strip(" ,.;")
 
 
+ADDRESS_MARKER_RE = re.compile(
+    r"(?:"
+    r"\b\u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d(?:\u0430|\u043d\u043e\u043c\u0443|\u043d\u043e\u0439)?\s*(?:\u043f\u043e\s+\u0430\u0434\u0440\u0435\u0441\u0443)?"
+    r"|\b\u043f\u0440\u043e\u0436\u0438\u0432\u0430\u0435\u0442\s+\u043f\u043e\s+\u0430\u0434\u0440\u0435\u0441\u0443"
+    r"|\b\u043f\u0440\u043e\u0436\u0438\u0432\u0430\u044e\u0449(?:\u0438\u0439|\u0435\u043c\u0443)\s+\u043f\u043e\s+\u0430\u0434\u0440\u0435\u0441\u0443"
+    r"|\b\u043c\u0435\u0441\u0442\u043e\s+\u0436\u0438\u0442\u0435\u043b\u044c\u0441\u0442\u0432\u0430"
+    r"|\b\u0430\u0434\u0440\u0435\u0441\s+\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u0438"
+    r")\s*[:,-]?\s*",
+    flags=re.IGNORECASE,
+)
+
+DEBTOR_ADDRESS_STOP_RE = re.compile(
+    r"\b(?:\u043f\u0430\u0441\u043f\u043e\u0440\u0442|\u0432\u044b\u0434\u0430\u043d|\u0443\u0444\u043c\u0441|\u043e\u0443\u0444\u043c\u0441|\u043c\u0432\u0434|\u043a\u043e\u0434\s+\u043f\u043e\u0434\u0440\u0430\u0437\u0434\u0435\u043b\u0435\u043d\u0438\u044f|\u0434\u0430\u0442\u0430\s+\u0440\u043e\u0436\u0434\u0435\u043d\u0438\u044f)\b",
+    flags=re.IGNORECASE,
+)
+
+DEBTOR_ADDRESS_GARBAGE_RE = re.compile(
+    r"\b(?:\u0443\u0440\u043e\u0436\u0435\u043d|\u043f\u0430\u0441\u043f\u043e\u0440\u0442|\u0432\u044b\u0434\u0430\u043d|\u0443\u0444\u043c\u0441|\u043e\u0443\u0444\u043c\u0441|\u043c\u0432\u0434|\u043a\u043e\u0434\s+\u043f\u043e\u0434\u0440\u0430\u0437\u0434\u0435\u043b\u0435\u043d\u0438\u044f|\u0434\u0430\u0442\u0430\s+\u0440\u043e\u0436\u0434\u0435\u043d\u0438\u044f)\b",
+    flags=re.IGNORECASE,
+)
+
+
 def clean_debtor_address(value: object | None) -> str:
     text = clean_text(value)
     if not text:
         return ""
-    registration = re.search(
-        r"\bзарегистрирован\w*\s*(?:по\s+адресу)?\s*[:,-]?\s*(.+)$",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if registration:
-        text = registration.group(1)
-    text = re.split(r"\bпаспорт\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
-    text = re.sub(r"^\s*(?:адрес\s*)?[:,-]\s*", "", text, flags=re.IGNORECASE)
-    return normalize_address_text(text)
+    marker = None
+    for match in ADDRESS_MARKER_RE.finditer(text):
+        marker = match
+    if marker:
+        text = text[marker.end() :]
+    stop = DEBTOR_ADDRESS_STOP_RE.search(text)
+    if stop:
+        text = text[: stop.start()]
+    text = re.sub(r"^\s*(?:\u0430\u0434\u0440\u0435\u0441\s*)?[:,-]\s*", "", text, flags=re.IGNORECASE)
+    normalized = normalize_address_text(text)
+    if DEBTOR_ADDRESS_GARBAGE_RE.search(normalized) or ADDRESS_MARKER_RE.search(normalized):
+        return ""
+    return normalized
 
 
 def keep_house_number_together(value: str) -> str:

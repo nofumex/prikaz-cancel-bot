@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 from app.config import Settings
 from app.models import Case, User
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.services.document_templates import DocumentArtifacts, create_case_documents as _create_case_documents
 from app.services.legal_data import (
     FIELD_LABELS,
@@ -17,9 +22,156 @@ from app.services.legal_data import (
     normalize_order_data,
     suggest_nominative_full_name,
     validate_before_generation,
+    docx_text,
 )
+from app.services.llm import review_generated_document
 from app.utils import h
 
+
+
+MANUAL_REVIEW_USER_TEXT = 'Документ требует ручной проверки специалистом. Мы проверим данные и подготовим заявление.'
+SAFE_AI_REVIEW_FIELDS = {
+    "debtor_full_name",
+    "debtor_address",
+    "court_name",
+    "court_address",
+    "creditor_name",
+    "creditor_address",
+    "debt_contract",
+    "debt_period",
+}
+
+
+@dataclass
+class DocumentReviewOutcome:
+    ok: bool
+    artifacts: DocumentArtifacts | None = None
+    review: dict[str, Any] = field(default_factory=dict)
+    applied_fixes: dict[str, str] = field(default_factory=dict)
+    regeneration_count: int = 0
+    admin_report: str = ""
+
+
+def _review_issue_lines(review: dict[str, Any], *, applied_fixes: dict[str, str], case_id: int | None, document_path: str) -> list[str]:
+    lines = [
+        f"AI document review: case #{case_id or 'unknown'}",
+        f"severity: {review.get('severity') or 'ok'}",
+        f"needs_regeneration: {bool(review.get('needs_regeneration'))}",
+        f"auto_fixed: {bool(applied_fixes)}",
+        f"document: {document_path}",
+    ]
+    for issue in review.get("issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        field = str(issue.get("field") or "")
+        lines.extend(
+            [
+                "",
+                f"issue code: {issue.get('code') or ''}",
+                f"field: {field}",
+                f"severity: {issue.get('severity') or ''}",
+                f"confidence: {issue.get('confidence') or 0}",
+                f"suggested_fix: {issue.get('suggested_fix') or ''}",
+                f"auto_fixed: {field in applied_fixes}",
+                f"message: {issue.get('message') or ''}",
+            ]
+        )
+    return lines
+
+
+def _safe_review_fixes(data: dict[str, Any], review: dict[str, Any]) -> dict[str, str]:
+    clean_fields = review.get("clean_fields") if isinstance(review.get("clean_fields"), dict) else {}
+    confidence_by_field: dict[str, float] = {}
+    for issue in review.get("issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        field = str(issue.get("field") or "").strip()
+        try:
+            confidence = float(issue.get("confidence") or 0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if field:
+            confidence_by_field[field] = max(confidence_by_field.get(field, 0.0), confidence)
+    fixes: dict[str, str] = {}
+    for field in SAFE_AI_REVIEW_FIELDS:
+        value = str(clean_fields.get(field) or "").strip()
+        if not value or confidence_by_field.get(field, 0.0) < 0.85:
+            continue
+        if str(data.get(field) or "").strip() == value:
+            continue
+        fixes[field] = value
+    return fixes
+
+
+def _review_blocks_delivery(review: dict[str, Any], applied_fixes: dict[str, str]) -> bool:
+    if review.get("ok") is True and str(review.get("severity") or "ok") == "ok":
+        return False
+    for issue in review.get("issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        if issue.get("severity") != "blocker":
+            continue
+        field = str(issue.get("field") or "")
+        if field not in applied_fixes:
+            return True
+    return bool(review.get("needs_regeneration")) and not applied_fixes
+
+
+async def create_case_documents_reviewed(
+    case: Case,
+    user: User,
+    settings: Settings,
+    session: AsyncSession | None,
+    *,
+    restore_reason: str | None = None,
+) -> DocumentReviewOutcome:
+    max_regenerations = max(0, int(getattr(settings, "max_ai_review_regenerations", 1)))
+    applied_all: dict[str, str] = {}
+    regeneration_count = 0
+    last_review: dict[str, Any] = {}
+    last_artifacts: DocumentArtifacts | None = None
+
+    while True:
+        artifacts = create_case_documents_with_qa(case, user, settings, restore_reason=restore_reason)
+        last_artifacts = artifacts
+        data = normalize_order_data(json.loads(case.extracted_json or "{}"))
+        review = await review_generated_document(
+            settings,
+            session,
+            case_id=case.id,
+            user_id=user.id,
+            document_text=docx_text(str(artifacts.full_docx_path)),
+            source_data=data,
+            visual_summary=artifacts.qa_report,
+            regeneration_happened=regeneration_count > 0,
+        )
+        last_review = review
+        fixes = _safe_review_fixes(data, review)
+        if fixes and regeneration_count < max_regenerations:
+            updated = dict(data)
+            updated.update(fixes)
+            updated = normalize_order_data(updated)
+            case.extracted_json = json.dumps(updated, ensure_ascii=False)
+            if session is not None:
+                await session.commit()
+            applied_all.update(fixes)
+            regeneration_count += 1
+            continue
+        blocks = _review_blocks_delivery(review, applied_all)
+        report_lines = _review_issue_lines(
+            review,
+            applied_fixes=applied_all,
+            case_id=case.id,
+            document_path=str(artifacts.full_docx_path),
+        )
+        return DocumentReviewOutcome(
+            ok=not blocks,
+            artifacts=artifacts,
+            review=last_review,
+            applied_fixes=applied_all,
+            regeneration_count=regeneration_count,
+            admin_report="\n".join(report_lines),
+        )
 
 def build_statement_paragraphs(data: dict, received_date: date, deadline_date: date | None, restore_reason: str | None = None) -> list[str]:
     from app.services.document_templates.statement_templates import StatementContext, build_statement_paragraphs as _build

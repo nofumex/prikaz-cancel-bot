@@ -68,7 +68,8 @@ def run_document_qa(
         reasons.append("не заполнены обязательные поля: " + ", ".join(FIELD_LABELS.get(f, f) for f in missing))
 
     debtor = normalized.get("debtor_full_name", "")
-    if looks_like_dative_full_name(debtor):
+    raw_debtor = str(data.get("debtor_full_name") or data.get("debtor_name_raw") or "")
+    if looks_like_dative_full_name(raw_debtor) or looks_like_dative_full_name(debtor):
         bad.append("debtor_full_name:dative")
         reasons.append("подозрительное ФИО должника")
 

@@ -67,4 +67,38 @@ def test_document_qa_rejects_debtor_header_ocr_noise(tmp_path):
     assert "\u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u043e\u043c\u0443" in qa.bad_tokens
     assert "\u0443\u0440\u043e\u0436\u0435\u043d" in qa.bad_tokens
     assert "\u043f\u0430\u0441\u043f\u043e\u0440\u0442" in qa.bad_tokens
-    assert "\u0433. \u0410\u0447\u0438\u043d\u0441\u043a \u041a\u0440\u0430\u0441\u043d\u043e\u044f\u0440\u0441\u043a\u043e\u0433\u043e \u043a\u0440\u0430\u044f" in qa.bad_tokens
+
+
+
+def test_document_qa_accepts_feminine_nominative_name(tmp_path):
+    name = "\u041a\u0430\u0440\u0438\u043c\u043e\u0432\u0430 \u0415\u043b\u0435\u043d\u0430 \u0412\u0438\u043a\u0442\u043e\u0440\u043e\u0432\u043d\u0430"
+    docx = tmp_path / "female_nom.docx"
+    _write_docx(docx, name)
+    qa = run_document_qa(
+        data={"court_name": "x", "court_address": "x", "debtor_full_name": name, "debtor_address": "x", "creditor_name": "x", "creditor_address": "x", "case_number": "1", "order_date": "01.01.2020", "debt_contract": "x", "debt_period": "x", "debt_amount": "1", "state_duty": "1"},
+        received_date=date(2026, 6, 19),
+        deadline_date=date(2026, 6, 29),
+        full_docx=docx,
+        full_pdf=None,
+        preview_pdf=None,
+        instruction_docx=docx,
+        require_preview_pdf=False,
+    )
+    assert "debtor_full_name:dative" not in qa.bad_tokens
+
+
+def test_document_qa_rejects_feminine_dative_name(tmp_path):
+    name = "\u041a\u0430\u0440\u0438\u043c\u043e\u0432\u043e\u0439 \u0415\u043b\u0435\u043d\u0435 \u0412\u0438\u043a\u0442\u043e\u0440\u043e\u0432\u043d\u0435"
+    docx = tmp_path / "female_dat.docx"
+    _write_docx(docx, name)
+    qa = run_document_qa(
+        data={"court_name": "x", "court_address": "x", "debtor_full_name": name, "debtor_address": "x", "creditor_name": "x", "creditor_address": "x", "case_number": "1", "order_date": "01.01.2020", "debt_contract": "x", "debt_period": "x", "debt_amount": "1", "state_duty": "1"},
+        received_date=date(2026, 6, 19),
+        deadline_date=date(2026, 6, 29),
+        full_docx=docx,
+        full_pdf=None,
+        preview_pdf=None,
+        instruction_docx=docx,
+        require_preview_pdf=False,
+    )
+    assert "debtor_full_name:dative" in qa.bad_tokens

@@ -113,6 +113,51 @@ ENVELOPE_JSON_SCHEMA = {
     "required": ["dates", "latest_date", "confidence", "comment"],
 }
 
+DOCUMENT_REVIEW_CLEAN_FIELDS = {
+    "debtor_full_name": "",
+    "debtor_address": "",
+    "court_name": "",
+    "court_address": "",
+    "creditor_name": "",
+    "creditor_address": "",
+    "case_number": "",
+    "uid": "",
+    "debt_contract": "",
+    "debt_period": "",
+}
+
+DOCUMENT_REVIEW_ISSUE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "code": {"type": "string"},
+        "field": {"type": "string"},
+        "severity": {"type": "string", "enum": ["ok", "warning", "blocker"]},
+        "message": {"type": "string"},
+        "suggested_fix": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": ["code", "field", "severity", "message", "suggested_fix", "confidence"],
+}
+
+DOCUMENT_REVIEW_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "ok": {"type": "boolean"},
+        "severity": {"type": "string", "enum": ["ok", "warning", "blocker"]},
+        "needs_regeneration": {"type": "boolean"},
+        "issues": {"type": "array", "items": DOCUMENT_REVIEW_ISSUE_SCHEMA},
+        "clean_fields": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {key: {"type": "string"} for key in DOCUMENT_REVIEW_CLEAN_FIELDS},
+            "required": list(DOCUMENT_REVIEW_CLEAN_FIELDS.keys()),
+        },
+    },
+    "required": ["ok", "severity", "needs_regeneration", "issues", "clean_fields"],
+}
+
 
 def _image_data_url(path: str | Path) -> str:
     data = Path(path).read_bytes()
@@ -191,6 +236,7 @@ async def record_openai_usage(
     result: LLMResult | None = None,
     success: bool,
     error_message: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     if session is None:
         return
@@ -219,7 +265,7 @@ async def record_openai_usage(
         output_cost_usd=output_cost,
         total_cost_usd=input_cost + cached_cost + output_cost,
         request_id=(result.request_id if result and result.request_id else None),
-        raw_usage_json=json.dumps(usage, ensure_ascii=False),
+        raw_usage_json=json.dumps({"usage": usage, "metadata": metadata or {}}, ensure_ascii=False),
         raw_response_model=result.model if result else model,
         success=success,
         error_message=error_message,
@@ -246,6 +292,7 @@ async def _responses_json(
     image_paths: list[str | Path] | None = None,
     schema_name: str,
     schema: dict[str, Any],
+    model: str | None = None,
 ) -> LLMResult:
     if not settings.openai_api_key:
         raise RuntimeError("OPENAI_API_KEY is not configured")
@@ -261,7 +308,7 @@ async def _responses_json(
 
     start = time.perf_counter()
     body = {
-        "model": settings.vision_model,
+        "model": model or settings.vision_model,
         "instructions": instructions,
         "input": [{"role": "user", "content": content}],
         "text": {
@@ -288,7 +335,7 @@ async def _responses_json(
     return LLMResult(
         data=json.loads(answer),
         usage=_parse_usage(data),
-        model=str(data.get("model") or settings.vision_model),
+        model=str(data.get("model") or model or settings.vision_model),
         request_id=str(data.get("id") or ""),
         latency_ms=int((time.perf_counter() - start) * 1000),
     )
@@ -531,4 +578,93 @@ async def extract_envelope_date(
     latest = parse_russian_date(str(result.data.get("latest_date") or ""))
     data = dict(result.data)
     data["latest_date_normalized"] = latest.isoformat() if latest else ""
+    return data
+
+
+async def review_generated_document(
+    settings: Settings,
+    session: AsyncSession | None,
+    *,
+    case_id: int | None,
+    user_id: int | None,
+    document_text: str,
+    source_data: dict[str, Any],
+    visual_summary: dict[str, Any] | None = None,
+    regeneration_happened: bool = False,
+) -> dict[str, Any]:
+    """Semantic review of the final client-visible statement text."""
+    if not settings.openai_api_key:
+        return {
+            "ok": True,
+            "severity": "ok",
+            "needs_regeneration": False,
+            "issues": [],
+            "clean_fields": dict(DOCUMENT_REVIEW_CLEAN_FIELDS),
+            "skipped": "OPENAI_API_KEY is not configured",
+        }
+
+    instructions = (
+        "You are a legal QA reviewer for a final Russian court-order cancellation statement. "
+        "Review the final client-visible text, not only OCR input. Return strict JSON only. "
+        "Check the header for OCR garbage, passport data, birthplace used as debtor address, multiple creditor addresses, "
+        "non-nominative debtor full name, bad court-address wrapping, missing space after the numero sign, unsupported legal claims, "
+        "empty required fields, signature/page-two layout problems, weird spaces, and obvious OCR garbage. "
+        "Do not flag feminine nominative Russian names such as \"\u041a\u0430\u0440\u0438\u043c\u043e\u0432\u0430 \u0415\u043b\u0435\u043d\u0430 \u0412\u0438\u043a\u0442\u043e\u0440\u043e\u0432\u043d\u0430\". "
+        "Flag debtor block tokens including \"\u0443\u0440\u043e\u0436\u0435\u043d\", \"\u043f\u0430\u0441\u043f\u043e\u0440\u0442\", \"\u0432\u044b\u0434\u0430\u043d\", \"\u0423\u0424\u041c\u0421\", \"\u041e\u0423\u0424\u041c\u0421\", \"\u041c\u0412\u0414\", "
+        "and registration markers left in raw grammatical form. In clean_fields, provide only safe text-field fixes. "
+        "Never suggest changing amounts, received date, case number, or UID unless confirmed by source_data. "
+        "If a fix is unsafe or uncertain, keep suggested_fix empty and mark the issue as blocker."
+    )
+    payload_text = (
+        "FINAL STATEMENT TEXT:\n"
+        f"{document_text[:18000]}\n\n"
+        "SOURCE OCR/CASE FIELDS:\n"
+        f"{json.dumps(source_data, ensure_ascii=False, indent=2)[:8000]}\n\n"
+        "DETERMINISTIC/VISUAL QA SUMMARY:\n"
+        f"{json.dumps(visual_summary or {}, ensure_ascii=False, indent=2)[:4000]}"
+    )
+    result: LLMResult | None = None
+    try:
+        result = await _responses_json(
+            settings,
+            instructions=instructions,
+            text=payload_text,
+            schema_name="document_ai_review",
+            schema=DOCUMENT_REVIEW_SCHEMA,
+            model=settings.text_model,
+        )
+    except Exception as exc:
+        await record_openai_usage(
+            settings,
+            session,
+            case_id=case_id,
+            user_id=user_id,
+            operation="document_ai_review",
+            model=settings.text_model,
+            success=False,
+            error_message=str(exc),
+            metadata={"regeneration_happened": regeneration_happened},
+        )
+        raise
+
+    data = dict(result.data)
+    clean_fields = data.get("clean_fields") if isinstance(data.get("clean_fields"), dict) else {}
+    data["clean_fields"] = {key: str(clean_fields.get(key) or "").strip() for key in DOCUMENT_REVIEW_CLEAN_FIELDS}
+    issues = data.get("issues") if isinstance(data.get("issues"), list) else []
+    severity = str(data.get("severity") or "ok")
+    await record_openai_usage(
+        settings,
+        session,
+        case_id=case_id,
+        user_id=user_id,
+        operation="document_ai_review",
+        model=result.model,
+        result=result,
+        success=True,
+        metadata={
+            "issues_count": len(issues),
+            "severity": severity,
+            "regeneration_happened": regeneration_happened,
+        },
+    )
     return data

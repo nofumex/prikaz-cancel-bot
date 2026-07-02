@@ -64,6 +64,7 @@ class Settings:
     vision_model: str
     text_model: str
     llm_timeout_seconds: int
+    max_ai_review_regenerations: int
 
     document_price_rub: int
     document_preview_mode: str
@@ -104,6 +105,8 @@ class Settings:
     amocrm_auto_create_pipeline: bool
     amocrm_auto_create_statuses: bool
     amocrm_attach_files: bool
+    amocrm_file_upload_enabled: bool
+    amocrm_file_upload_timeout_seconds: int
     amocrm_debug: bool
     amocrm_rps_limit: int
     amocrm_pipeline_id: int | None
@@ -157,6 +160,7 @@ def get_settings() -> Settings:
         vision_model=(getenv("VISION_MODEL") or "gpt-5.4-mini").strip(),
         text_model=(getenv("TEXT_MODEL") or getenv("VISION_MODEL") or "gpt-5.4-mini").strip(),
         llm_timeout_seconds=_parse_int(getenv("LLM_TIMEOUT_SECONDS"), 90),
+        max_ai_review_regenerations=_parse_int(getenv("MAX_AI_REVIEW_REGENERATIONS"), 1),
         document_price_rub=_parse_int(getenv("DOCUMENT_PRICE_RUB"), 990),
         document_preview_mode=(getenv("DOCUMENT_PREVIEW_MODE") or "pdf").strip().lower(),
         enable_pdf_preview=_parse_bool(getenv("ENABLE_PDF_PREVIEW"), True),
@@ -197,6 +201,8 @@ def get_settings() -> Settings:
         amocrm_auto_create_pipeline=_parse_bool(getenv("AMOCRM_AUTO_CREATE_PIPELINE"), False),
         amocrm_auto_create_statuses=_parse_bool(getenv("AMOCRM_AUTO_CREATE_STATUSES"), True),
         amocrm_attach_files=_parse_bool(getenv("AMOCRM_ATTACH_FILES"), True),
+        amocrm_file_upload_enabled=_parse_bool(getenv("AMOCRM_FILE_UPLOAD_ENABLED"), True),
+        amocrm_file_upload_timeout_seconds=_parse_int(getenv("AMOCRM_FILE_UPLOAD_TIMEOUT_SECONDS"), 30),
         amocrm_debug=_parse_bool(getenv("AMOCRM_DEBUG"), False),
         amocrm_rps_limit=_parse_int(getenv("AMOCRM_RPS_LIMIT"), 5),
         amocrm_pipeline_id=_parse_int(getenv("AMOCRM_PIPELINE_ID"), 0) or None,
