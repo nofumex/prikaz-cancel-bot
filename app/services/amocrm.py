@@ -565,24 +565,78 @@ class AmoCrmService:
         _, error = await self.request("PUT", f"/leads/{int(lead_id)}/files", json_body=[{"file_uuid": file_uuid}], retries=1)
         return error is None, error
 
+    async def list_lead_files(self, lead_id: int) -> tuple[list[dict[str, Any]], str | None]:
+        data, error = await self.request("GET", f"/leads/{int(lead_id)}/files", retries=2)
+        if error:
+            return [], error
+        if not isinstance(data, dict):
+            return [], "lead files response is empty"
+        embedded = data.get("_embedded") if isinstance(data.get("_embedded"), dict) else {}
+        files = embedded.get("files") or data.get("files") or []
+        if isinstance(files, list):
+            return [item for item in files if isinstance(item, dict)], None
+        return [], "lead files response has no files list"
+
+    def _payload_contains_file_uuid(self, payload: Any, file_uuid: str) -> bool:
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if key in {"uuid", "file_uuid"} and str(value) == str(file_uuid):
+                    return True
+                if self._payload_contains_file_uuid(value, file_uuid):
+                    return True
+        if isinstance(payload, list):
+            return any(self._payload_contains_file_uuid(item, file_uuid) for item in payload)
+        return False
+
+    async def verify_file_linked_to_lead(self, lead_id: int, file_uuid: str) -> tuple[bool, str | None, dict[str, Any] | None]:
+        files, error = await self.list_lead_files(lead_id)
+        if error:
+            return False, error, None
+        for item in files:
+            if self._payload_contains_file_uuid(item, file_uuid):
+                return True, None, item
+        return False, f"file uuid {file_uuid} is not present in lead {lead_id} files", None
+
     async def attach_file_to_lead(self, case: Case, file_path: str | Path, caption: str) -> bool:
         path = Path(file_path)
         lead_id = case.amocrm_lead_id or case.amo_lead_id
-        if not lead_id or not path.exists():
+        not_attached = "\u0444\u0430\u0439\u043b \u043d\u0435 \u043f\u0440\u0438\u043a\u0440\u0435\u043f\u043b\u0435\u043d \u043a \u0441\u0434\u0435\u043b\u043a\u0435"
+        reason_label = "\u041f\u0440\u0438\u0447\u0438\u043d\u0430"
+        attached_label = "\u0424\u0430\u0439\u043b \u043f\u0440\u0438\u043a\u0440\u0435\u043f\u043b\u0435\u043d \u043a \u0441\u0434\u0435\u043b\u043a\u0435"
+        link_label = "\u0421\u0441\u044b\u043b\u043a\u0430"
+        if not lead_id:
+            return False
+        if not path.exists() or not path.is_file():
+            await self.add_lead_note(case, f"{caption}: {not_attached}\n{reason_label}: file not found: {path}")
             return False
         if not getattr(self.settings, "amocrm_file_upload_enabled", True):
             reason = "AMOCRM_FILE_UPLOAD_ENABLED=false"
-            note = f"{caption}: {path.resolve()}\nФайл не загружен в amoCRM, fallback path\nПричина: {reason}"
-            return await self.add_lead_note(case, note)
+            await self.add_lead_note(case, f"{caption}: {not_attached}\n{reason_label}: {reason}")
+            return False
         file_uuid, error = await self.upload_file_to_drive(path)
-        if not error and file_uuid:
-            linked, link_error = await self.link_file_to_lead(int(lead_id), file_uuid)
-            if linked:
-                await self.add_lead_note(case, f"{caption}: файл загружен в amoCRM (uuid: {file_uuid})")
-                return True
-            error = link_error or "file uploaded but link failed"
-        note = f"{caption}: {path.resolve()}\nФайл не загружен в amoCRM, fallback path\nПричина: {error or 'unknown amoCRM file upload error'}"
-        return await self.add_lead_note(case, note)
+        if error or not file_uuid:
+            await self.add_lead_note(case, f"{caption}: {not_attached}\n{reason_label}: {error or 'empty file uuid'}")
+            return False
+        linked, link_error = await self.link_file_to_lead(int(lead_id), file_uuid)
+        if not linked:
+            await self.add_lead_note(case, f"{caption}: {not_attached}\n{reason_label}: {link_error or 'file uploaded but link failed'}")
+            return False
+        verified, verify_error, file_info = await self.verify_file_linked_to_lead(int(lead_id), file_uuid)
+        if not verified:
+            await self.add_lead_note(case, f"{caption}: {not_attached}\n{reason_label}: {verify_error or 'file link verification failed'}")
+            return False
+        drive_url, _ = await self.get_drive_url()
+        link = ""
+        if file_info:
+            links = file_info.get("_links") if isinstance(file_info.get("_links"), dict) else {}
+            download = links.get("download") if isinstance(links, dict) else None
+            href = download.get("href") if isinstance(download, dict) else None
+            if href:
+                link = f"\n{link_label}: {href}"
+        if not link and drive_url:
+            link = f"\nDrive: {drive_url}"
+        await self.add_lead_note(case, f"{caption}: {attached_label} (uuid: {file_uuid}){link}")
+        return True
 
     async def sync_case_event(
         self,
@@ -667,11 +721,18 @@ class AmoCrmService:
                 note_parts.append(f"Срок до: {payload['deadline']}")
             if payload.get("payment"):
                 note_parts.append(f"Платеж: {payload['payment']}")
-            await self.add_lead_note(case, "\n".join(note_parts))
-
+            attached_files: list[dict[str, Any]] = []
             if self.settings.amocrm_attach_files and payload.get("files"):
                 for item in payload["files"]:
-                    await self.attach_file_to_lead(case, item.get("path", ""), item.get("caption", "Файл"))
+                    caption = item.get("caption", "\u0424\u0430\u0439\u043b")
+                    ok = await self.attach_file_to_lead(case, item.get("path", ""), caption)
+                    if not ok:
+                        raise RuntimeError(f"amoCRM file attach failed: {caption}")
+                    attached_files.append({"path": item.get("path", ""), "caption": caption})
+            if attached_files:
+                response_payload["attached_files"] = attached_files
+
+            await self.add_lead_note(case, "\n".join(note_parts))
 
             if session:
                 await self._log_sync(
@@ -703,6 +764,7 @@ class AmoCrmService:
                     error_message=str(exc),
                     dedupe_key=dedupe_key,
                 )
+            raise
 
     async def sync_case_current_state(self, session: AsyncSession, case: Case, user: User) -> None:
         status_event = {

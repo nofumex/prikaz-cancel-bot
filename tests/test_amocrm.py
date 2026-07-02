@@ -120,6 +120,8 @@ async def test_attach_file_to_lead_uploads_and_links_file(tmp_path):
             return {"drive_url": "https://drive.example.amocrm.ru"}, None
         if method == "PUT" and path == "/leads/123/files":
             return {}, None
+        if method == "GET" and path == "/leads/123/files":
+            return {"_embedded": {"files": [{"file_uuid": "file-uuid-1", "name": "statement.pdf"}]}}, None
         return {}, None
 
     raw_calls = []
@@ -149,7 +151,8 @@ async def test_attach_file_to_lead_uploads_and_links_file(tmp_path):
     assert raw_calls[0][2]["file_name"] == "statement.pdf"
     assert raw_calls[0][2]["content_type"] == "application/pdf"
     assert raw_calls[1][3] == b"pdf data"
-    assert notes == ["Превью PDF: файл загружен в amoCRM (uuid: file-uuid-1)"]
+    assert "\u0424\u0430\u0439\u043b \u043f\u0440\u0438\u043a\u0440\u0435\u043f\u043b\u0435\u043d \u043a \u0441\u0434\u0435\u043b\u043a\u0435" in notes[0]
+    assert "file-uuid-1" in notes[0]
     assert all("fallback path" not in note for note in notes)
 
 
@@ -172,10 +175,11 @@ async def test_attach_file_to_lead_fallback_note_includes_api_error(tmp_path):
     file_path.write_bytes(b"jpg")
     case = Case(id=1, user_id=1, amocrm_lead_id=123)
 
-    assert await service.attach_file_to_lead(case, file_path, "Фото приказа") is True
+    assert await service.attach_file_to_lead(case, file_path, "\u0424\u043e\u0442\u043e \u043f\u0440\u0438\u043a\u0430\u0437\u0430") is False
 
-    assert "Файл не загружен в amoCRM, fallback path" in notes[0]
-    assert "Причина: HTTP 403: access denied" in notes[0]
+    assert "\u0444\u0430\u0439\u043b \u043d\u0435 \u043f\u0440\u0438\u043a\u0440\u0435\u043f\u043b\u0435\u043d \u043a \u0441\u0434\u0435\u043b\u043a\u0435" in notes[0]
+    assert "\u041f\u0440\u0438\u0447\u0438\u043d\u0430: HTTP 403: access denied" in notes[0]
+    assert "fallback path" not in notes[0]
 
 
 
@@ -276,3 +280,77 @@ async def test_update_lead_status_allows_reset_for_new_cycle():
     assert await service.update_lead_status(case, "\u041f\u043e\u0434\u043f\u0438\u0441\u0430\u043b\u0441\u044f \u043d\u0430 \u0431\u043e\u0442\u0430", current_case_id=63, event_case_id=64) is True
     assert calls == [("PATCH", "/leads", [{"id": 123, "pipeline_id": 1, "status_id": 10}])]
     assert case.amocrm_status_name == "\u041f\u043e\u0434\u043f\u0438\u0441\u0430\u043b\u0441\u044f \u043d\u0430 \u0431\u043e\u0442\u0430"
+
+
+
+@pytest.mark.asyncio
+async def test_attach_file_to_lead_requires_verified_link(tmp_path):
+    service = AmoCrmService(_settings(amocrm_enabled=True))
+
+    async def fake_upload(path):
+        return "file-uuid-1", None
+
+    async def fake_link(lead_id, file_uuid):
+        return True, None
+
+    async def fake_verify(lead_id, file_uuid):
+        return False, "not visible on lead", None
+
+    notes = []
+
+    async def fake_note(case, text):
+        notes.append(text)
+        return True
+
+    service.upload_file_to_drive = fake_upload
+    service.link_file_to_lead = fake_link
+    service.verify_file_linked_to_lead = fake_verify
+    service.add_lead_note = fake_note
+    file_path = tmp_path / "statement.pdf"
+    file_path.write_bytes(b"pdf")
+    case = Case(id=1, user_id=1, amocrm_lead_id=123)
+
+    assert await service.attach_file_to_lead(case, file_path, "Preview PDF") is False
+    assert "not visible on lead" in notes[0]
+    assert "fallback path" not in notes[0]
+
+
+@pytest.mark.asyncio
+async def test_sync_case_event_with_file_fails_until_attach_verified():
+    service = AmoCrmService(_settings(amocrm_enabled=True))
+    case = Case(id=1, user_id=1, amocrm_lead_id=123)
+    user = User(id=1, platform="telegram", platform_user_id="1", amocrm_current_case_id=1)
+    logs = []
+    notes = []
+
+    async def fake_update(case, status_name, **kwargs):
+        return True
+
+    async def fake_attach(case, path, caption):
+        return False
+
+    async def fake_note(case, text):
+        notes.append(text)
+        return True
+
+    async def fake_log_sync(session, **kwargs):
+        logs.append(kwargs)
+
+    service.update_lead_status = fake_update
+    service.attach_file_to_lead = fake_attach
+    service.add_lead_note = fake_note
+    service._log_sync = fake_log_sync
+
+    class NoDuplicateSession:
+        async def execute(self, stmt):
+            class Result:
+                def scalar_one_or_none(self):
+                    return None
+            return Result()
+
+    with pytest.raises(RuntimeError, match="amoCRM file attach failed"):
+        await service.sync_case_event(NoDuplicateSession(), case, user, "preview_generated", {"files": [{"path": "preview.pdf", "caption": "Preview"}]})
+
+    assert logs[-1]["success"] is False
+    assert "amoCRM file attach failed" in logs[-1]["error_message"]
+    assert notes == []

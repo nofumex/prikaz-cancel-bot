@@ -147,6 +147,7 @@ DOCUMENT_REVIEW_SCHEMA = {
         "ok": {"type": "boolean"},
         "severity": {"type": "string", "enum": ["ok", "warning", "blocker"]},
         "needs_regeneration": {"type": "boolean"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "issues": {"type": "array", "items": DOCUMENT_REVIEW_ISSUE_SCHEMA},
         "clean_fields": {
             "type": "object",
@@ -155,7 +156,7 @@ DOCUMENT_REVIEW_SCHEMA = {
             "required": list(DOCUMENT_REVIEW_CLEAN_FIELDS.keys()),
         },
     },
-    "required": ["ok", "severity", "needs_regeneration", "issues", "clean_fields"],
+    "required": ["ok", "severity", "needs_regeneration", "confidence", "issues", "clean_fields"],
 }
 
 
@@ -598,6 +599,7 @@ async def review_generated_document(
             "ok": True,
             "severity": "ok",
             "needs_regeneration": False,
+            "confidence": 1.0,
             "issues": [],
             "clean_fields": dict(DOCUMENT_REVIEW_CLEAN_FIELDS),
             "skipped": "OPENAI_API_KEY is not configured",
@@ -609,7 +611,8 @@ async def review_generated_document(
         "Only issues present in FINAL STATEMENT TEXT may block delivery. SOURCE OCR/CASE FIELDS is reference-only and must not be treated as client-visible text. "
         "Check the header for OCR garbage, passport data, birthplace used as debtor address, multiple creditor addresses, "
         "non-nominative debtor full name, bad court-address wrapping, missing space after the numero sign, unsupported legal claims, "
-        "empty required fields, signature/page-two layout problems, weird spaces, and obvious OCR garbage. "
+        "empty required fields, signature/page-two layout problems, weird spaces, wrong short name in signature, and obvious OCR garbage. "
+        "Prefer safe clean_fields corrections over blockers for universal field-cleaning cases: nominative debtor full name, debtor address without passport/birthplace/registration garbage, one normalized creditor address, clean court header, and correct signature source name. "
         "Do not flag feminine nominative Russian names such as \"\u041a\u0430\u0440\u0438\u043c\u043e\u0432\u0430 \u0415\u043b\u0435\u043d\u0430 \u0412\u0438\u043a\u0442\u043e\u0440\u043e\u0432\u043d\u0430\". "
         "Flag debtor block tokens including \"\u0443\u0440\u043e\u0436\u0435\u043d\", \"\u043f\u0430\u0441\u043f\u043e\u0440\u0442\", \"\u0432\u044b\u0434\u0430\u043d\", \"\u0423\u0424\u041c\u0421\", \"\u041e\u0423\u0424\u041c\u0421\", \"\u041c\u0412\u0414\", "
         "and registration markers left in raw grammatical form. In clean_fields, provide only safe text-field fixes. "
@@ -619,7 +622,7 @@ async def review_generated_document(
     payload_text = (
         "FINAL STATEMENT TEXT:\n"
         f"{document_text[:18000]}\n\n"
-        "SOURCE OCR/CASE FIELDS:\n"
+        "SOURCE OCR/CASE FIELDS AND CURRENT NORMALIZED FIELDS:\n"
         f"{json.dumps(source_data, ensure_ascii=False, indent=2)[:8000]}\n\n"
         "DETERMINISTIC/VISUAL QA SUMMARY:\n"
         f"{json.dumps(visual_summary or {}, ensure_ascii=False, indent=2)[:4000]}"

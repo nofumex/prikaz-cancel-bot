@@ -42,7 +42,7 @@ SAFE_AI_REVIEW_FIELDS = {
     "debt_contract",
     "debt_period",
 }
-VALID_DOCUMENT_AI_REVIEW_MODES = {"off", "shadow", "blocking"}
+VALID_DOCUMENT_AI_REVIEW_MODES = {"off", "shadow", "autofix", "blocking"}
 SOURCE_ONLY_HINTS = {
     "passport",
     "паспорт",
@@ -269,7 +269,7 @@ async def create_case_documents_reviewed(
     mode = document_ai_review_mode(settings)
     if mode in {"off", "shadow"}:
         artifacts = create_case_documents_with_qa(case, user, settings, restore_reason=restore_reason)
-        review = {"ok": True, "severity": "ok", "needs_regeneration": False, "issues": [], "clean_fields": {}, "mode": mode}
+        review = {"ok": True, "severity": "ok", "needs_regeneration": False, "confidence": 1.0, "issues": [], "clean_fields": {}, "mode": mode}
         if mode == "shadow":
             data = normalize_order_data(json.loads(case.extracted_json or "{}"))
             final_text = docx_text(str(artifacts.full_docx_path))
@@ -306,9 +306,11 @@ async def create_case_documents_reviewed(
             regeneration_happened=regeneration_count > 0,
         )
         review = _review_scoped_to_final_text(raw_review, final_text)
+        review["mode"] = mode
         last_review = review
         fixes = _safe_review_fixes(data, review)
-        if fixes and regeneration_count < max_regenerations:
+        should_regenerate = bool(fixes) and regeneration_count < max_regenerations
+        if should_regenerate:
             updated = dict(data)
             updated.update(fixes)
             updated = normalize_order_data(updated)
@@ -318,6 +320,7 @@ async def create_case_documents_reviewed(
             applied_all.update(fixes)
             regeneration_count += 1
             continue
+
         blocks = _review_blocks_delivery(review, fixes)
         report_lines = _review_issue_lines(
             review,
@@ -327,13 +330,12 @@ async def create_case_documents_reviewed(
         )
         return DocumentReviewOutcome(
             ok=not blocks,
-            artifacts=artifacts,
+            artifacts=artifacts if not blocks else last_artifacts,
             review=last_review,
             applied_fixes=applied_all,
             regeneration_count=regeneration_count,
             admin_report="\n".join(report_lines),
         )
-
 
 def build_statement_paragraphs(data: dict, received_date: date, deadline_date: date | None, restore_reason: str | None = None) -> list[str]:
     from app.services.document_templates.statement_templates import StatementContext, build_statement_paragraphs as _build

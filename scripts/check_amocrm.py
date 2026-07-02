@@ -38,7 +38,7 @@ async def _check_file_upload(service, lead_id: int | None = None) -> bool:
         return True
 
 
-async def main(create_test_lead: bool, check_file_upload: bool, attach_test_file_to_lead: int | None) -> int:
+async def main(create_test_lead: bool, check_file_upload: bool, attach_test_file_to_lead: int | None, list_lead_files: int | None, attach_local_file_to_lead: list[str] | None) -> int:
     settings = get_settings()
     required = {
         "AMOCRM_ENABLED": settings.amocrm_enabled,
@@ -95,6 +95,29 @@ async def main(create_test_lead: bool, check_file_upload: bool, attach_test_file
         upload_ok = await _check_file_upload(service, int(test_lead_id) if test_lead_id else None)
         if not upload_ok:
             return 4
+
+    if list_lead_files:
+        files, error = await service.list_lead_files(int(list_lead_files))
+        if error:
+            print(f"Lead files ERROR: {error}")
+            return 5
+        print(f"Lead files for lead_id={list_lead_files}: {len(files)}")
+        for item in files:
+            file_uuid = item.get("file_uuid") or item.get("uuid") or item.get("id") or ""
+            name = item.get("name") or item.get("file_name") or item.get("filename") or ""
+            print(f"- uuid={file_uuid} name={name} raw={item}")
+
+    if attach_local_file_to_lead:
+        lead_id = int(attach_local_file_to_lead[0])
+        file_path = Path(attach_local_file_to_lead[1])
+        caption = attach_local_file_to_lead[2]
+        case = Case(id=0, user_id=0, amocrm_lead_id=lead_id, amo_lead_id=lead_id)
+        ok = await service.attach_file_to_lead(case, file_path, caption)
+        if not ok:
+            print(f"Attach local file ERROR: lead_id={lead_id}, path={file_path}")
+            return 6
+        files, error = await service.list_lead_files(lead_id)
+        print(f"Attach local file OK: lead_id={lead_id}, files_now={len(files) if not error else 'unknown'}")
     return 0
 
 
@@ -103,5 +126,7 @@ if __name__ == "__main__":
     parser.add_argument("--create-test-lead", action="store_true")
     parser.add_argument("--skip-file-upload-check", action="store_true")
     parser.add_argument("--attach-test-file-to-lead", type=int, default=None)
+    parser.add_argument("--list-lead-files", type=int, default=None, metavar="LEAD_ID")
+    parser.add_argument("--attach-local-file-to-lead", nargs=3, metavar=("LEAD_ID", "PATH", "CAPTION"))
     args = parser.parse_args()
-    raise SystemExit(asyncio.run(main(args.create_test_lead, not args.skip_file_upload_check, args.attach_test_file_to_lead)))
+    raise SystemExit(asyncio.run(main(args.create_test_lead, not args.skip_file_upload_check, args.attach_test_file_to_lead, args.list_lead_files, args.attach_local_file_to_lead)))

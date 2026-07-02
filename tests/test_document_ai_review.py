@@ -73,7 +73,7 @@ def test_source_data_passport_with_clean_final_text_is_not_blocker():
         ],
     }
 
-    scoped = _review_scoped_to_final_text(review, "????????? ?? ?????? ????????? ???????. ?????????? ?????? ???.")
+    scoped = _review_scoped_to_final_text(review, "Clean final statement text without passport data.")
 
     assert _review_blocks_delivery(scoped, {}) is False
     assert scoped["issues"][0]["severity"] == "warning"
@@ -104,16 +104,16 @@ def test_warning_without_blocker_does_not_need_manual_review():
         "clean_fields": {"creditor_address": FIXED_ADDRESS},
     }
 
-    scoped = _review_scoped_to_final_text(review, "????????? ????? ??? ????????? ??????.")
+    scoped = _review_scoped_to_final_text(review, "Clean final text without critical errors.")
 
     assert _review_blocks_delivery(scoped, {}) is False
 
 
-def test_document_ai_review_mode_defaults_to_shadow(monkeypatch):
+def test_document_ai_review_mode_defaults_to_autofix(monkeypatch):
     monkeypatch.delenv("DOCUMENT_AI_REVIEW_MODE", raising=False)
     get_settings.cache_clear()
     try:
-        assert document_ai_review_mode(get_settings()) == "shadow"
+        assert document_ai_review_mode(get_settings()) == "autofix"
     finally:
         get_settings.cache_clear()
 
@@ -153,3 +153,81 @@ async def test_admin_debug_false_does_not_send_ai_report_to_user_chat():
     await _notify_admin_qa_failure(bot, settings, case, "AI document review: case #1")
 
     bot.send_message.assert_not_awaited()
+
+
+
+@pytest.mark.asyncio
+async def test_autofix_mode_applies_clean_fields_and_rechecks_final_text(monkeypatch, tmp_path):
+    first_docx = tmp_path / "first.docx"
+    second_docx = tmp_path / "second.docx"
+    first_docx.write_bytes(b"first")
+    second_docx.write_bytes(b"second")
+    artifacts = [SimpleNamespace(full_docx_path=first_docx, qa_report={}), SimpleNamespace(full_docx_path=second_docx, qa_report={})]
+    review_calls = []
+    settings = get_settings()
+    settings = SimpleNamespace(**{**settings.__dict__, "document_ai_review_mode": "autofix", "max_ai_review_regenerations": 1})
+    case = Case(id=11, user_id=1, extracted_json='{"debtor_full_name":"\\u0418\\u0432\\u0430\\u043d\\u043e\\u0432\\u0443 \\u0418\\u0432\\u0430\\u043d\\u0443"}')
+    user = SimpleNamespace(id=1)
+    session = SimpleNamespace(commit=AsyncMock())
+
+    def fake_generate(*args, **kwargs):
+        return artifacts.pop(0)
+
+    def fake_docx_text(path):
+        return "bad final" if path.endswith("first.docx") else "clean final"
+
+    async def fake_review(settings, session, *, case_id, user_id, document_text, source_data, visual_summary, regeneration_happened):
+        review_calls.append((document_text, source_data, regeneration_happened))
+        if not regeneration_happened:
+            return {
+                "ok": False,
+                "severity": "blocker",
+                "needs_regeneration": True,
+                "confidence": 0.95,
+                "issues": [{"field": "debtor_full_name", "severity": "blocker", "confidence": 0.95, "suggested_fix": "\u0418\u0432\u0430\u043d\u043e\u0432 \u0418\u0432\u0430\u043d \u0418\u0432\u0430\u043d\u043e\u0432\u0438\u0447", "message": "case", "code": "NAME_CASE"}],
+                "clean_fields": {"debtor_full_name": "\u0418\u0432\u0430\u043d\u043e\u0432 \u0418\u0432\u0430\u043d \u0418\u0432\u0430\u043d\u043e\u0432\u0438\u0447"},
+            }
+        return {"ok": True, "severity": "ok", "needs_regeneration": False, "confidence": 1.0, "issues": [], "clean_fields": {}}
+
+    monkeypatch.setattr("app.services.documents.create_case_documents_with_qa", fake_generate)
+    monkeypatch.setattr("app.services.documents.docx_text", fake_docx_text)
+    monkeypatch.setattr("app.services.documents.review_generated_document", fake_review)
+
+    outcome = await create_case_documents_reviewed(case, user, settings, session)
+
+    assert outcome.ok is True
+    assert outcome.regeneration_count == 1
+    assert outcome.applied_fixes == {"debtor_full_name": "\u0418\u0432\u0430\u043d\u043e\u0432 \u0418\u0432\u0430\u043d \u0418\u0432\u0430\u043d\u043e\u0432\u0438\u0447"}
+    assert len(review_calls) == 2
+    assert review_calls[1][2] is True
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_autofix_mode_blocks_when_safe_fix_is_unavailable(monkeypatch, tmp_path):
+    full_docx = tmp_path / "full.docx"
+    full_docx.write_bytes(b"docx")
+    settings = get_settings()
+    settings = SimpleNamespace(**{**settings.__dict__, "document_ai_review_mode": "autofix", "max_ai_review_regenerations": 1})
+    case = Case(id=12, user_id=1, extracted_json="{}")
+    user = SimpleNamespace(id=1)
+
+    monkeypatch.setattr("app.services.documents.create_case_documents_with_qa", lambda *args, **kwargs: SimpleNamespace(full_docx_path=full_docx, qa_report={}))
+    monkeypatch.setattr("app.services.documents.docx_text", lambda path: "\u041f\u0430\u0441\u043f\u043e\u0440\u0442 1234 \u0432 \u0444\u0438\u043d\u0430\u043b\u044c\u043d\u043e\u043c \u0442\u0435\u043a\u0441\u0442\u0435")
+
+    async def fake_review(*args, **kwargs):
+        return {
+            "ok": False,
+            "severity": "blocker",
+            "needs_regeneration": False,
+            "confidence": 0.9,
+            "issues": [{"field": "statement", "severity": "blocker", "confidence": 0.9, "suggested_fix": "", "message": "passport", "code": "PASSPORT"}],
+            "clean_fields": {},
+        }
+
+    monkeypatch.setattr("app.services.documents.review_generated_document", fake_review)
+
+    outcome = await create_case_documents_reviewed(case, user, settings, None)
+
+    assert outcome.ok is False
+    assert outcome.regeneration_count == 0

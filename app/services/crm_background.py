@@ -11,6 +11,25 @@ from app.models import Case, CrmSyncLog, User
 from app.services.amocrm import get_amocrm_service
 
 logger = logging.getLogger(__name__)
+_CRM_SYNC_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+
+def _lock_key(case_id: int | None, user_id: int | None) -> str:
+    if case_id is not None:
+        return f"case:{case_id}"
+    if user_id is not None:
+        return f"user:{user_id}"
+    return "global"
+
+
+def _crm_timeout_seconds(settings: Settings, payload: dict | None) -> int:
+    payload = payload or {}
+    files = payload.get("files") if isinstance(payload.get("files"), list) else []
+    if not files:
+        return max(1, settings.crm_sync_timeout_seconds)
+    per_file = max(settings.crm_sync_timeout_seconds, getattr(settings, "amocrm_file_upload_timeout_seconds", 30) + 30)
+    return max(settings.crm_sync_timeout_seconds, per_file * max(1, len(files)))
 
 
 def _safe_error(exc: BaseException) -> str:
@@ -55,21 +74,24 @@ async def run_crm_sync_job(
     logger.info("CRM sync start event=%s case_id=%s", event_type, case_id)
     attempts = max(1, settings.crm_sync_max_attempts)
     last_error: str | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            await asyncio.wait_for(
-                _run_once(settings, case_id, user_id, event_type, payload or {}),
-                timeout=max(1, settings.crm_sync_timeout_seconds),
-            )
-            duration_ms = int((time.monotonic() - start) * 1000)
-            logger.info("CRM sync done event=%s case_id=%s duration_ms=%s", event_type, case_id, duration_ms)
-            return
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            last_error = _safe_error(exc)
-            if attempt < attempts:
-                await asyncio.sleep(max(0, settings.crm_sync_retry_base_seconds) * attempt)
+    lock_key = _lock_key(case_id, user_id)
+    lock = _CRM_SYNC_LOCKS.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        for attempt in range(1, attempts + 1):
+            try:
+                await asyncio.wait_for(
+                    _run_once(settings, case_id, user_id, event_type, payload or {}),
+                    timeout=_crm_timeout_seconds(settings, payload),
+                )
+                duration_ms = int((time.monotonic() - start) * 1000)
+                logger.info("CRM sync done event=%s case_id=%s duration_ms=%s", event_type, case_id, duration_ms)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = _safe_error(exc)
+                if attempt < attempts:
+                    await asyncio.sleep(max(0, settings.crm_sync_retry_base_seconds) * attempt)
     duration_ms = int((time.monotonic() - start) * 1000)
     logger.error("CRM sync failed event=%s case_id=%s duration_ms=%s error=%s", event_type, case_id, duration_ms, last_error)
     async with SessionLocal() as session:
