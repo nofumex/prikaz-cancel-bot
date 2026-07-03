@@ -20,24 +20,25 @@ async def _check_file_upload(service, lead_id: int | None = None) -> bool:
     with TemporaryDirectory() as tmpdir:
         path = Path(tmpdir) / "amocrm_upload_check.txt"
         path.write_text("amoCRM file upload check", encoding="utf-8")
-        file_uuid, error = await service.upload_file_to_drive(path)
-        if error or not file_uuid:
+        file_info, error = await service.upload_file_to_drive_info(path)
+        file_uuid = str((file_info or {}).get("file_uuid") or "").strip()
+        if error or not file_info or not file_uuid:
             print("Token cannot upload files to amoCRM")
             print(f"Files API error: {error or 'empty file uuid'}")
             return False
         print(f"Files API upload OK: file_uuid={file_uuid}")
         if lead_id:
-            linked, link_error = await service.link_file_to_lead(lead_id, file_uuid)
-            if not linked:
-                print("Token cannot upload files to amoCRM")
-                print(f"Files API link error: {link_error or 'unknown link error'}")
+            case = Case(id=0, user_id=0, amocrm_lead_id=int(lead_id), amo_lead_id=int(lead_id))
+            attached = await service.attach_uploaded_file_to_lead(case, file_info, "amoCRM upload check")
+            if not attached:
+                print("Token uploaded the file, but could not attach it as a visible lead attachment")
                 return False
-            verified, verify_error, _ = await service.verify_file_linked_to_lead(lead_id, file_uuid)
-            if not verified:
-                print("Token linked the file, but it is not visible in lead files")
-                print(f"Files API verify error: {verify_error or 'unknown verify error'}")
+            files, verify_error = await service.list_lead_files(int(lead_id))
+            if verify_error or not any(service._payload_contains_file_uuid(item, file_uuid) for item in files):
+                print("Attachment note was not visible in lead files")
+                print(f"Visible files verify error: {verify_error or 'uploaded uuid not found in attachment notes'}")
                 return False
-            print(f"Files API attach+verify OK: lead_id={lead_id}, file_uuid={file_uuid}")
+            print(f"Files API visible attachment OK: lead_id={lead_id}, file_uuid={file_uuid}")
         else:
             print("Files API attach skipped: use --create-test-lead or --attach-test-file-to-lead LEAD_ID")
         return True

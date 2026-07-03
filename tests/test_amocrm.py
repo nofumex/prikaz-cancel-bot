@@ -112,7 +112,7 @@ def test_event_status_map_contains_required_stages():
 
 
 @pytest.mark.asyncio
-async def test_attach_file_to_lead_uploads_and_links_file(tmp_path):
+async def test_attach_file_to_lead_uploads_and_creates_visible_attachment_note(tmp_path):
     service = AmoCrmService(_settings(amocrm_enabled=True))
     calls = []
 
@@ -124,6 +124,14 @@ async def test_attach_file_to_lead_uploads_and_links_file(tmp_path):
             return {}, None
         if method == "GET" and path == "/leads/123/files":
             return {"_embedded": {"files": [{"file_uuid": "file-uuid-1", "name": "statement.pdf"}]}}, None
+        if method == "POST" and path == "/leads/123/notes":
+            assert json_body[0]["note_type"] == "attachment"
+            assert json_body[0]["params"]["file_uuid"] == "file-uuid-1"
+            assert json_body[0]["params"]["file_name"] == "statement.pdf"
+            return {"_embedded": {"notes": [{"id": 777}]}}, None
+        if method == "GET" and path == "/leads/123/notes":
+            assert params == {"filter[note_type]": "attachment", "limit": 250}
+            return {"_embedded": {"notes": [{"id": 777, "note_type": "attachment", "params": {"file_uuid": "file-uuid-1", "file_name": "statement.pdf"}}]}}, None
         return {}, None
 
     raw_calls = []
@@ -132,7 +140,7 @@ async def test_attach_file_to_lead_uploads_and_links_file(tmp_path):
         raw_calls.append((method, url, json_body, data, content_type))
         if url.endswith("/v1.0/sessions"):
             return {"upload_url": "https://drive.example.amocrm.ru/v1.0/sessions/upload/token", "max_part_size": 100}, None
-        return {"uuid": "file-uuid-1"}, None
+        return {"uuid": "file-uuid-1", "file_name": "statement.pdf"}, None
 
     notes = []
 
@@ -147,15 +155,15 @@ async def test_attach_file_to_lead_uploads_and_links_file(tmp_path):
     file_path.write_bytes(b"pdf data")
     case = Case(id=1, user_id=1, amocrm_lead_id=123)
 
-    assert await service.attach_file_to_lead(case, file_path, "Превью PDF") is True
+    assert await service.attach_file_to_lead(case, file_path, "Preview PDF") is True
 
     assert ("PUT", "/leads/123/files", [{"file_uuid": "file-uuid-1"}], None) in calls
+    assert any(call[0] == "POST" and call[1] == "/leads/123/notes" and call[2][0]["note_type"] == "attachment" for call in calls)
     assert raw_calls[0][2]["file_name"] == "statement.pdf"
     assert raw_calls[0][2]["content_type"] == "application/pdf"
     assert raw_calls[1][3] == b"pdf data"
-    assert "\u0424\u0430\u0439\u043b \u043f\u0440\u0438\u043a\u0440\u0435\u043f\u043b\u0435\u043d \u043a \u0441\u0434\u0435\u043b\u043a\u0435" in notes[0]
-    assert "file-uuid-1" in notes[0]
-    assert all("fallback path" not in note for note in notes)
+    assert notes == []
+
 
 
 @pytest.mark.asyncio
@@ -171,7 +179,7 @@ async def test_attach_file_to_lead_fallback_note_includes_api_error(tmp_path):
         notes.append(text)
         return True
 
-    service.upload_file_to_drive = fake_upload
+    service.upload_file_to_drive_info = fake_upload
     service.add_lead_note = fake_note
     file_path = tmp_path / "order.jpg"
     file_path.write_bytes(b"jpg")
@@ -290,7 +298,7 @@ async def test_attach_file_to_lead_requires_verified_link(tmp_path):
     service = AmoCrmService(_settings(amocrm_enabled=True))
 
     async def fake_upload(path):
-        return "file-uuid-1", None
+        return {"file_uuid": "file-uuid-1", "file_name": "statement.pdf"}, None
 
     async def fake_link(lead_id, file_uuid):
         return True, None
@@ -304,7 +312,7 @@ async def test_attach_file_to_lead_requires_verified_link(tmp_path):
         notes.append(text)
         return True
 
-    service.upload_file_to_drive = fake_upload
+    service.upload_file_to_drive_info = fake_upload
     service.link_file_to_lead = fake_link
     service.verify_file_linked_to_lead = fake_verify
     service.add_lead_note = fake_note

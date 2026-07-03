@@ -524,7 +524,7 @@ class AmoCrmService:
         self._drive_url_cache = drive_url
         return drive_url, None
 
-    async def upload_file_to_drive(self, file_path: str | Path) -> tuple[str | None, str | None]:
+    async def upload_file_to_drive_info(self, file_path: str | Path) -> tuple[dict[str, Any] | None, str | None]:
         path = Path(file_path)
         if not path.exists() or not path.is_file():
             return None, f"file not found: {path}"
@@ -556,16 +556,33 @@ class AmoCrmService:
                     return None, error or "file upload response is empty"
                 file_uuid = upload_data.get("uuid") or upload_data.get("file_uuid")
                 if file_uuid:
-                    return str(file_uuid), None
+                    return {
+                        "file_uuid": str(file_uuid),
+                        "uuid": str(file_uuid),
+                        "version_uuid": upload_data.get("version_uuid") or session_data.get("version_uuid"),
+                        "file_name": path.name,
+                        "name": path.name,
+                        "drive_file_name": upload_data.get("file_name") or upload_data.get("name"),
+                        "content_type": content_type,
+                        "drive_url": drive_url,
+                        "raw_session": session_data,
+                        "raw_upload": upload_data,
+                    }, None
                 next_url = str(upload_data.get("next_url") or "").strip()
                 if not next_url:
                     return None, "file upload response has no next_url or uuid"
+
+    async def upload_file_to_drive(self, file_path: str | Path) -> tuple[str | None, str | None]:
+        info, error = await self.upload_file_to_drive_info(file_path)
+        if error or not info:
+            return None, error
+        return str(info.get("file_uuid") or info.get("uuid") or "") or None, None
 
     async def link_file_to_lead(self, lead_id: int, file_uuid: str) -> tuple[bool, str | None]:
         _, error = await self.request("PUT", f"/leads/{int(lead_id)}/files", json_body=[{"file_uuid": file_uuid}], retries=1)
         return error is None, error
 
-    async def list_lead_files(self, lead_id: int) -> tuple[list[dict[str, Any]], str | None]:
+    async def list_linked_lead_files(self, lead_id: int) -> tuple[list[dict[str, Any]], str | None]:
         data, error = await self.request("GET", f"/leads/{int(lead_id)}/files", retries=2)
         if error:
             return [], error
@@ -576,6 +593,64 @@ class AmoCrmService:
         if isinstance(files, list):
             return [item for item in files if isinstance(item, dict)], None
         return [], "lead files response has no files list"
+
+    async def add_lead_attachment_note(self, lead_id: int, file_info: dict[str, Any], caption: str) -> tuple[int | None, str | None]:
+        file_uuid = str(file_info.get("file_uuid") or file_info.get("uuid") or "").strip()
+        if not file_uuid:
+            return None, "attachment note has no file_uuid"
+        file_name = str(file_info.get("file_name") or file_info.get("name") or caption or file_uuid).strip()
+        params: dict[str, Any] = {"file_uuid": file_uuid, "file_name": file_name}
+        version_uuid = file_info.get("version_uuid")
+        if version_uuid:
+            params["version_uuid"] = str(version_uuid)
+        data, error = await self.request(
+            "POST",
+            f"/leads/{int(lead_id)}/notes",
+            json_body=[{"entity_id": int(lead_id), "note_type": "attachment", "params": params}],
+            retries=2,
+        )
+        if error:
+            return None, error
+        notes = []
+        if isinstance(data, dict):
+            embedded = data.get("_embedded") if isinstance(data.get("_embedded"), dict) else {}
+            notes = embedded.get("notes") or data.get("notes") or []
+        if isinstance(notes, list) and notes:
+            note_id = notes[0].get("id") if isinstance(notes[0], dict) else None
+            if note_id:
+                return int(note_id), None
+        return None, "attachment note response has no note id"
+
+    async def list_lead_attachment_notes(self, lead_id: int) -> tuple[list[dict[str, Any]], str | None]:
+        data, error = await self.request(
+            "GET",
+            f"/leads/{int(lead_id)}/notes",
+            params={"filter[note_type]": "attachment", "limit": 250},
+            retries=2,
+        )
+        if error:
+            return [], error
+        if not isinstance(data, dict):
+            return [], "lead attachment notes response is empty"
+        embedded = data.get("_embedded") if isinstance(data.get("_embedded"), dict) else {}
+        notes = embedded.get("notes") or data.get("notes") or []
+        if isinstance(notes, list):
+            return [item for item in notes if isinstance(item, dict)], None
+        return [], "lead attachment notes response has no notes list"
+
+    async def list_lead_files(self, lead_id: int) -> tuple[list[dict[str, Any]], str | None]:
+        notes, error = await self.list_lead_attachment_notes(lead_id)
+        if error:
+            return [], error
+        files: list[dict[str, Any]] = []
+        for note in notes:
+            params = note.get("params") if isinstance(note.get("params"), dict) else {}
+            item = dict(params)
+            item["note_id"] = note.get("id")
+            item["note_type"] = note.get("note_type")
+            item["source"] = "attachment_note"
+            files.append(item)
+        return files, None
 
     def _payload_contains_file_uuid(self, payload: Any, file_uuid: str) -> bool:
         if isinstance(payload, dict):
@@ -589,21 +664,53 @@ class AmoCrmService:
         return False
 
     async def verify_file_linked_to_lead(self, lead_id: int, file_uuid: str) -> tuple[bool, str | None, dict[str, Any] | None]:
-        files, error = await self.list_lead_files(lead_id)
+        files, error = await self.list_linked_lead_files(lead_id)
         if error:
             return False, error, None
         for item in files:
             if self._payload_contains_file_uuid(item, file_uuid):
                 return True, None, item
-        return False, f"file uuid {file_uuid} is not present in lead {lead_id} files", None
+        return False, f"file uuid {file_uuid} is not present in lead {lead_id} linked files"
+
+    async def verify_file_visible_on_lead(self, lead_id: int, file_uuid: str) -> tuple[bool, str | None, dict[str, Any] | None]:
+        notes, error = await self.list_lead_attachment_notes(lead_id)
+        if error:
+            return False, error, None
+        for item in notes:
+            if self._payload_contains_file_uuid(item, file_uuid):
+                return True, None, item
+        return False, f"file uuid {file_uuid} has no visible attachment note in lead {lead_id}"
+
+    async def attach_uploaded_file_to_lead(self, case: Case, file_info: dict[str, Any], caption: str) -> bool:
+        lead_id = case.amocrm_lead_id or case.amo_lead_id
+        not_attached = "\u0444\u0430\u0439\u043b \u043d\u0435 \u043f\u0440\u0438\u043a\u0440\u0435\u043f\u043b\u0435\u043d \u043a \u0441\u0434\u0435\u043b\u043a\u0435"
+        reason_label = "\u041f\u0440\u0438\u0447\u0438\u043d\u0430"
+        file_uuid = str((file_info or {}).get("file_uuid") or "").strip()
+        if not lead_id or not file_uuid:
+            return False
+        linked, link_error = await self.link_file_to_lead(int(lead_id), file_uuid)
+        if not linked:
+            await self.add_lead_note(case, f"{caption}: {not_attached}\n{reason_label}: {link_error or 'file uploaded but lead link failed'}")
+            return False
+        linked_verified, link_verify_error, _ = await self.verify_file_linked_to_lead(int(lead_id), file_uuid)
+        if not linked_verified:
+            await self.add_lead_note(case, f"{caption}: {not_attached}\n{reason_label}: {link_verify_error or 'file link verification failed'}")
+            return False
+        attachment_note_id, note_error = await self.add_lead_attachment_note(int(lead_id), file_info, caption)
+        if note_error or not attachment_note_id:
+            await self.add_lead_note(case, f"{caption}: {not_attached}\n{reason_label}: {note_error or 'attachment note creation failed'}")
+            return False
+        visible, visible_error, _ = await self.verify_file_visible_on_lead(int(lead_id), file_uuid)
+        if not visible:
+            await self.add_lead_note(case, f"{caption}: {not_attached}\n{reason_label}: {visible_error or 'attachment note verification failed'}")
+            return False
+        return True
 
     async def attach_file_to_lead(self, case: Case, file_path: str | Path, caption: str) -> bool:
         path = Path(file_path)
         lead_id = case.amocrm_lead_id or case.amo_lead_id
         not_attached = "\u0444\u0430\u0439\u043b \u043d\u0435 \u043f\u0440\u0438\u043a\u0440\u0435\u043f\u043b\u0435\u043d \u043a \u0441\u0434\u0435\u043b\u043a\u0435"
         reason_label = "\u041f\u0440\u0438\u0447\u0438\u043d\u0430"
-        attached_label = "\u0424\u0430\u0439\u043b \u043f\u0440\u0438\u043a\u0440\u0435\u043f\u043b\u0435\u043d \u043a \u0441\u0434\u0435\u043b\u043a\u0435"
-        link_label = "\u0421\u0441\u044b\u043b\u043a\u0430"
         if not lead_id:
             return False
         if not path.exists() or not path.is_file():
@@ -613,30 +720,11 @@ class AmoCrmService:
             reason = "AMOCRM_FILE_UPLOAD_ENABLED=false"
             await self.add_lead_note(case, f"{caption}: {not_attached}\n{reason_label}: {reason}")
             return False
-        file_uuid, error = await self.upload_file_to_drive(path)
-        if error or not file_uuid:
+        file_info, error = await self.upload_file_to_drive_info(path)
+        if error or not file_info or not str(file_info.get("file_uuid") or "").strip():
             await self.add_lead_note(case, f"{caption}: {not_attached}\n{reason_label}: {error or 'empty file uuid'}")
             return False
-        linked, link_error = await self.link_file_to_lead(int(lead_id), file_uuid)
-        if not linked:
-            await self.add_lead_note(case, f"{caption}: {not_attached}\n{reason_label}: {link_error or 'file uploaded but link failed'}")
-            return False
-        verified, verify_error, file_info = await self.verify_file_linked_to_lead(int(lead_id), file_uuid)
-        if not verified:
-            await self.add_lead_note(case, f"{caption}: {not_attached}\n{reason_label}: {verify_error or 'file link verification failed'}")
-            return False
-        drive_url, _ = await self.get_drive_url()
-        link = ""
-        if file_info:
-            links = file_info.get("_links") if isinstance(file_info.get("_links"), dict) else {}
-            download = links.get("download") if isinstance(links, dict) else None
-            href = download.get("href") if isinstance(download, dict) else None
-            if href:
-                link = f"\n{link_label}: {href}"
-        if not link and drive_url:
-            link = f"\nDrive: {drive_url}"
-        await self.add_lead_note(case, f"{caption}: {attached_label} (uuid: {file_uuid}){link}")
-        return True
+        return await self.attach_uploaded_file_to_lead(case, file_info, caption)
 
     async def sync_case_event(
         self,
