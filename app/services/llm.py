@@ -628,28 +628,40 @@ async def review_generated_document(
         f"{json.dumps(visual_summary or {}, ensure_ascii=False, indent=2)[:4000]}"
     )
     result: LLMResult | None = None
-    try:
-        result = await _responses_json(
-            settings,
-            instructions=instructions,
-            text=payload_text,
-            schema_name="document_ai_review",
-            schema=DOCUMENT_REVIEW_SCHEMA,
-            model=settings.text_model,
-        )
-    except Exception as exc:
-        await record_openai_usage(
-            settings,
-            session,
-            case_id=case_id,
-            user_id=user_id,
-            operation="document_ai_review",
-            model=settings.text_model,
-            success=False,
-            error_message=str(exc),
-            metadata={"regeneration_happened": regeneration_happened},
-        )
-        raise
+    attempts = [
+        (getattr(settings, "ai_review_model", settings.text_model), "primary"),
+        (getattr(settings, "ai_review_model", settings.text_model), "primary_retry"),
+    ]
+    fallback_model = getattr(settings, "ai_review_fallback_model", None)
+    if fallback_model:
+        attempts.append((fallback_model, "fallback"))
+    last_error: Exception | None = None
+    for model, attempt_name in attempts:
+        try:
+            result = await _responses_json(
+                settings,
+                instructions=instructions,
+                text=payload_text,
+                schema_name="document_ai_review",
+                schema=DOCUMENT_REVIEW_SCHEMA,
+                model=model,
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+            await record_openai_usage(
+                settings,
+                session,
+                case_id=case_id,
+                user_id=user_id,
+                operation="document_ai_review",
+                model=model,
+                success=False,
+                error_message=str(exc),
+                metadata={"regeneration_happened": regeneration_happened, "attempt": attempt_name},
+            )
+    if result is None:
+        raise RuntimeError(f"document_ai_review failed after retry/fallback: {last_error}")
 
     data = dict(result.data)
     clean_fields = data.get("clean_fields") if isinstance(data.get("clean_fields"), dict) else {}

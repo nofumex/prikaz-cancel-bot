@@ -231,3 +231,79 @@ async def test_autofix_mode_blocks_when_safe_fix_is_unavailable(monkeypatch, tmp
 
     assert outcome.ok is False
     assert outcome.regeneration_count == 0
+
+
+
+@pytest.mark.asyncio
+async def test_review_generated_document_retries_then_fallback_model(monkeypatch):
+    from app.services import llm
+
+    settings = SimpleNamespace(
+        openai_api_key="key",
+        ai_review_model="gpt-4.1",
+        ai_review_fallback_model="gpt-4.1-mini",
+        text_model="gpt-4.1",
+    )
+    calls = []
+
+    async def fake_responses_json(settings, **kwargs):
+        calls.append(kwargs["model"])
+        if len(calls) < 3:
+            raise RuntimeError("empty structured output")
+        return SimpleNamespace(
+            data={
+                "ok": True,
+                "severity": "ok",
+                "needs_regeneration": False,
+                "confidence": 1.0,
+                "issues": [],
+                "clean_fields": {},
+            },
+            model=kwargs["model"],
+        )
+
+    async def fake_record(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(llm, "_responses_json", fake_responses_json)
+    monkeypatch.setattr(llm, "record_openai_usage", fake_record)
+
+    review = await llm.review_generated_document(
+        settings,
+        None,
+        case_id=1,
+        user_id=1,
+        document_text="clean",
+        source_data={},
+        visual_summary={},
+    )
+
+    assert review["ok"] is True
+    assert calls == ["gpt-4.1", "gpt-4.1", "gpt-4.1-mini"]
+
+
+@pytest.mark.asyncio
+async def test_autofix_ai_failure_delivers_deterministic_artifacts_and_logs_crm(monkeypatch, tmp_path):
+    full_docx = tmp_path / "full.docx"
+    full_docx.write_bytes(b"docx")
+    artifacts = SimpleNamespace(full_docx_path=full_docx, qa_report={})
+    scheduled = []
+    settings = get_settings()
+    settings = SimpleNamespace(**{**settings.__dict__, "document_ai_review_mode": "autofix", "amocrm_enabled": True})
+    case = Case(id=13, user_id=1, extracted_json="{}")
+    user = SimpleNamespace(id=1)
+
+    async def broken_review(*args, **kwargs):
+        raise RuntimeError("document_ai_review failed after retry/fallback")
+
+    monkeypatch.setattr("app.services.documents.create_case_documents_with_qa", lambda *args, **kwargs: artifacts)
+    monkeypatch.setattr("app.services.documents.docx_text", lambda path: "clean final")
+    monkeypatch.setattr("app.services.documents.review_generated_document", broken_review)
+    monkeypatch.setattr("app.services.crm_background.schedule_crm_sync", lambda *args, **kwargs: scheduled.append((args, kwargs)))
+
+    outcome = await create_case_documents_reviewed(case, user, settings, None)
+
+    assert outcome.ok is True
+    assert outcome.artifacts is artifacts
+    assert outcome.review["ai_review_failed"] is True
+    assert scheduled[0][0][3] == "document_ai_review_failed"

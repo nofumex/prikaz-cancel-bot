@@ -43,6 +43,8 @@ def test_cost_not_double_counting_cached():
         openai_base_url="https://api.openai.com/v1",
         vision_model="gpt-5.4-mini",
         text_model="gpt-5.4-mini",
+        ai_review_model="gpt-4.1",
+        ai_review_fallback_model="gpt-4.1-mini",
         llm_timeout_seconds=90,
         max_ai_review_regenerations=1,
         document_ai_review_mode="shadow",

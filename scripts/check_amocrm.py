@@ -32,7 +32,12 @@ async def _check_file_upload(service, lead_id: int | None = None) -> bool:
                 print("Token cannot upload files to amoCRM")
                 print(f"Files API link error: {link_error or 'unknown link error'}")
                 return False
-            print(f"Files API attach OK: lead_id={lead_id}, file_uuid={file_uuid}")
+            verified, verify_error, _ = await service.verify_file_linked_to_lead(lead_id, file_uuid)
+            if not verified:
+                print("Token linked the file, but it is not visible in lead files")
+                print(f"Files API verify error: {verify_error or 'unknown verify error'}")
+                return False
+            print(f"Files API attach+verify OK: lead_id={lead_id}, file_uuid={file_uuid}")
         else:
             print("Files API attach skipped: use --create-test-lead or --attach-test-file-to-lead LEAD_ID")
         return True

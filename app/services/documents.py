@@ -258,6 +258,31 @@ async def _run_shadow_document_review(
         schedule_crm_sync(settings, case_id, user_id, "document_ai_review_shadow", {"note": report[:65000]})
 
 
+def _ai_review_failed_outcome(
+    settings: Settings,
+    *,
+    case: Case,
+    user: User,
+    artifacts: DocumentArtifacts,
+    error: Exception,
+) -> DocumentReviewOutcome:
+    from app.services.crm_background import schedule_crm_sync
+
+    review = {
+        "ok": True,
+        "severity": "warning",
+        "needs_regeneration": False,
+        "confidence": 0.0,
+        "issues": [],
+        "clean_fields": {},
+        "ai_review_failed": True,
+        "error": str(error)[:1000],
+    }
+    report = f"AI document review failed after retry/fallback: {error}"
+    schedule_crm_sync(settings, case.id, user.id, "document_ai_review_failed", {"note": report[:65000]})
+    return DocumentReviewOutcome(ok=True, artifacts=artifacts, review=review, admin_report=report)
+
+
 async def create_case_documents_reviewed(
     case: Case,
     user: User,
@@ -295,16 +320,22 @@ async def create_case_documents_reviewed(
         last_artifacts = artifacts
         data = normalize_order_data(json.loads(case.extracted_json or "{}"))
         final_text = docx_text(str(artifacts.full_docx_path))
-        raw_review = await review_generated_document(
-            settings,
-            session,
-            case_id=case.id,
-            user_id=user.id,
-            document_text=final_text,
-            source_data=data,
-            visual_summary=artifacts.qa_report,
-            regeneration_happened=regeneration_count > 0,
-        )
+        try:
+            raw_review = await review_generated_document(
+                settings,
+                session,
+                case_id=case.id,
+                user_id=user.id,
+                document_text=final_text,
+                source_data=data,
+                visual_summary=artifacts.qa_report,
+                regeneration_happened=regeneration_count > 0,
+            )
+        except Exception as exc:
+            if mode == "autofix":
+                logger.warning("Document AI autofix failed; delivering deterministic QA-passed artifacts case_id=%s error=%s", case.id, exc)
+                return _ai_review_failed_outcome(settings, case=case, user=user, artifacts=artifacts, error=exc)
+            raise
         review = _review_scoped_to_final_text(raw_review, final_text)
         review["mode"] = mode
         last_review = review

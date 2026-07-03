@@ -63,6 +63,8 @@ class Settings:
     openai_base_url: str
     vision_model: str
     text_model: str
+    ai_review_model: str
+    ai_review_fallback_model: str
     llm_timeout_seconds: int
     max_ai_review_regenerations: int
     document_ai_review_mode: str
@@ -158,8 +160,10 @@ def get_settings() -> Settings:
         drop_pending_updates=_parse_bool(getenv("DROP_PENDING_UPDATES"), True),
         openai_api_key=(getenv("OPENAI_API_KEY") or "").strip() or None,
         openai_base_url=(getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/"),
-        vision_model=(getenv("VISION_MODEL") or "gpt-5").strip(),
-        text_model=(getenv("TEXT_MODEL") or getenv("VISION_MODEL") or "gpt-5").strip(),
+        vision_model=(getenv("VISION_MODEL") or "gpt-4.1-mini").strip(),
+        text_model=(getenv("TEXT_MODEL") or getenv("VISION_MODEL") or "gpt-4.1").strip(),
+        ai_review_model=(getenv("AI_REVIEW_MODEL") or getenv("TEXT_MODEL") or "gpt-4.1").strip(),
+        ai_review_fallback_model=(getenv("AI_REVIEW_FALLBACK_MODEL") or "gpt-4.1-mini").strip(),
         llm_timeout_seconds=_parse_int(getenv("LLM_TIMEOUT_SECONDS"), 90),
         max_ai_review_regenerations=_parse_int(getenv("MAX_AI_REVIEW_REGENERATIONS"), 1),
         document_ai_review_mode=(getenv("DOCUMENT_AI_REVIEW_MODE") or "autofix").strip().lower(),
