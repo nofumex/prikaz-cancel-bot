@@ -24,7 +24,7 @@ from app.services.llm import extract_envelope_date, extract_order_data
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
 from app.services.yookassa import YooKassaReceiptContactRequired
 from app.services.users import get_or_create_platform_user
-from app.texts import case_summary, payment_text, profile_text, welcome_text
+from app.texts import case_summary, manual_received_date_prompt_text, payment_text, profile_text, welcome_text
 from app.utils import ensure_dir, h, normalize_receipt_contact, parse_russian_date
 
 logger = logging.getLogger(__name__)
@@ -303,7 +303,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 await _send(client, event, "Не нашел активное заявление.", keyboards.main_menu())
                 return
             await _set_state(session, event, STATE_MANUAL_DATE, {"case_id": case.id})
-            await _send(client, event, "Напишите дату получения копии приказа. Пример: <code>19.06.2026</code>")
+            await _send(client, event, manual_received_date_prompt_text())
             return
         if data == "case:envelope_photo":
             case = await latest_open_case(session, user.id)

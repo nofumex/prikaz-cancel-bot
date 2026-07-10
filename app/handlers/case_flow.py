@@ -43,7 +43,7 @@ from app.services.legal_data import (
 from app.services.llm import extract_envelope_date, extract_order_amounts, extract_order_data
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
 from app.services.yookassa import YooKassaError, YooKassaReceiptContactRequired
-from app.texts import case_summary, payment_text
+from app.texts import case_summary, manual_received_date_prompt_text, payment_text
 from app.utils import ensure_dir, h, normalize_receipt_contact, parse_russian_date
 
 router = Router(name="case_flow")
@@ -306,7 +306,7 @@ async def choose_manual_date(callback: CallbackQuery, state: FSMContext, session
         return
     await state.update_data(case_id=case.id)
     await state.set_state(CaseStates.waiting_manual_date)
-    await callback.message.answer("Напишите дату получения копии приказа. Пример: <code>19.06.2026</code>")
+    await callback.message.answer(manual_received_date_prompt_text())
     await callback.answer()
 
 
