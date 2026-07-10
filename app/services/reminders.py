@@ -11,18 +11,20 @@ from app.adapters.max.client import MaxBotClient
 from app.config import get_settings
 from app.database import SessionLocal
 from app.enums import CaseStatus
-from app.keyboards.common import case_menu
-from app.services.cases import due_unpaid_cases
+from app.keyboards.common import case_menu, consultation_menu, main_menu
+from app.models import Case, User
+from app.services.cases import (
+    due_case_consultation_reminders,
+    due_no_order_cases,
+    due_paid_followup_cases,
+    due_started_users_without_cases,
+    due_unpaid_cases,
+    due_user_consultation_reminders,
+)
 from app.services.crm_background import schedule_crm_sync
-from app.texts import deadline_warning
+from app.texts import consultation_offer_text, no_order_deadline_reminder_text, post_payment_court_followup_text, unpaid_document_reminder_text
 
 logger = logging.getLogger(__name__)
-
-REMINDER_CRM_NOTES = {
-    1: "Повторная отправка оплаты через 24 часа",
-    2: "Повторная отправка оплаты через двое суток",
-    3: "Повторная отправка оплаты через трое суток",
-}
 
 
 async def run_payment_reminders(bot: Bot | None = None) -> None:
@@ -30,27 +32,118 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
     while True:
         try:
             async with SessionLocal() as session:
+                now = datetime.utcnow()
+
+                for user in await due_started_users_without_cases(session):
+                    sent = await _send_user_message(
+                        settings,
+                        bot,
+                        user,
+                        no_order_deadline_reminder_text(),
+                        telegram_markup=main_menu(),
+                        max_keyboard=max_keyboards.main_menu(),
+                    )
+                    if sent:
+                        user.first_deadline_reminder_sent_at = now
+
+                for case in await due_no_order_cases(session):
+                    await session.refresh(case, ["user"])
+                    sent = await _send_case_message(
+                        settings,
+                        bot,
+                        case,
+                        no_order_deadline_reminder_text(),
+                        telegram_markup=main_menu(),
+                        max_keyboard=max_keyboards.main_menu(),
+                    )
+                    if sent:
+                        case.deadline_reminder_sent_at = now
+                        case.last_reminder_at = now
+                        case.reminders_sent = max(case.reminders_sent, 1)
+                        schedule_crm_sync(
+                            settings,
+                            case.id,
+                            case.user.id,
+                            "reminder_sent",
+                            {"note": "\u041d\u0430\u043f\u043e\u043c\u0438\u043d\u0430\u043d\u0438\u0435 \u0447\u0435\u0440\u0435\u0437 \u0441\u0443\u0442\u043a\u0438: \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c \u043d\u0435 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u043b \u0441\u0443\u0434\u0435\u0431\u043d\u044b\u0439 \u043f\u0440\u0438\u043a\u0430\u0437"},
+                        )
+
                 for case in await due_unpaid_cases(session):
                     await session.refresh(case, ["user"])
                     if case.status != CaseStatus.PAYMENT_PENDING.value:
                         continue
-                    reminder_no = case.reminders_sent + 1
-                    text = deadline_warning(case.deadline_date, reminder_no)
-                    if case.platform == "max":
-                        await _send_max_reminder(settings, case, text)
-                    elif bot is not None and case.user.telegram_id:
-                        await bot.send_message(
-                            case.user.telegram_id,
-                            text,
-                            reply_markup=case_menu(can_pay=True, payment_url=case.payment_url),
+                    sent = await _send_case_message(
+                        settings,
+                        bot,
+                        case,
+                        unpaid_document_reminder_text(),
+                        telegram_markup=case_menu(can_pay=True, payment_url=case.payment_url),
+                        max_keyboard=max_keyboards.case_menu(can_pay=True, payment_url=case.payment_url),
+                    )
+                    if sent:
+                        case.deadline_reminder_sent_at = now
+                        case.last_reminder_at = now
+                        case.reminders_sent = max(case.reminders_sent, 1)
+                        schedule_crm_sync(
+                            settings,
+                            case.id,
+                            case.user.id,
+                            "reminder_sent",
+                            {"note": "\u041d\u0430\u043f\u043e\u043c\u0438\u043d\u0430\u043d\u0438\u0435 \u0447\u0435\u0440\u0435\u0437 \u0441\u0443\u0442\u043a\u0438: \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c \u043d\u0435 \u043e\u043f\u043b\u0430\u0442\u0438\u043b \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u043b\u0435\u043d\u043d\u044b\u0439 \u0434\u043e\u043a\u0443\u043c\u0435\u043d\u0442"},
                         )
-                    else:
-                        continue
-                    case.reminders_sent = reminder_no
-                    case.last_reminder_at = datetime.utcnow()
-                    schedule_crm_sync(settings, case.id, case.user.id, "reminder_sent", {"note": REMINDER_CRM_NOTES.get(reminder_no, "Повторная отправка оплаты")})
-                    if reminder_no >= 3:
-                        schedule_crm_sync(settings, case.id, case.user.id, "payment_abandoned", {"note": "Пользователь не оплатил через трое суток после preview"})
+
+                for case in await due_paid_followup_cases(session):
+                    await session.refresh(case, ["user"])
+                    sent = await _send_case_message(
+                        settings,
+                        bot,
+                        case,
+                        post_payment_court_followup_text(),
+                        telegram_markup=consultation_menu(),
+                        max_keyboard=max_keyboards.consultation_menu(),
+                    )
+                    if sent:
+                        case.post_payment_followup_sent_at = now
+                        schedule_crm_sync(
+                            settings,
+                            case.id,
+                            case.user.id,
+                            "paid_court_followup_sent",
+                            {"note": "\u0412\u043e\u043f\u0440\u043e\u0441 \u0447\u0435\u0440\u0435\u0437 \u0434\u0432\u043e\u0435 \u0441\u0443\u0442\u043e\u043a \u043f\u043e\u0441\u043b\u0435 \u043e\u043f\u043b\u0430\u0442\u044b: \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043b\u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c \u0437\u0430\u044f\u0432\u043b\u0435\u043d\u0438\u0435 \u0432 \u0441\u0443\u0434"},
+                        )
+
+                for case in await due_case_consultation_reminders(session):
+                    await session.refresh(case, ["user"])
+                    sent = await _send_case_message(
+                        settings,
+                        bot,
+                        case,
+                        consultation_offer_text(),
+                        telegram_markup=consultation_menu(),
+                        max_keyboard=max_keyboards.consultation_menu(),
+                    )
+                    if sent:
+                        case.consultation_reminder_sent_at = now
+                        schedule_crm_sync(
+                            settings,
+                            case.id,
+                            case.user.id,
+                            "consultation_offer_sent",
+                            {"note": "\u041f\u0440\u0435\u0434\u043b\u043e\u0436\u0435\u043d\u0430 \u043a\u043e\u043d\u0441\u0443\u043b\u044c\u0442\u0430\u0446\u0438\u044f \u043f\u043e \u0441\u0438\u0442\u0443\u0430\u0446\u0438\u0438 \u0438 \u0431\u0430\u043d\u043a\u0440\u043e\u0442\u0441\u0442\u0432\u0443"},
+                        )
+
+                for user in await due_user_consultation_reminders(session):
+                    sent = await _send_user_message(
+                        settings,
+                        bot,
+                        user,
+                        consultation_offer_text(),
+                        telegram_markup=consultation_menu(),
+                        max_keyboard=max_keyboards.consultation_menu(),
+                    )
+                    if sent:
+                        user.first_consultation_reminder_sent_at = now
+
                 await session.commit()
         except asyncio.CancelledError:
             raise
@@ -59,12 +152,34 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
         await asyncio.sleep(300)
 
 
-async def _send_max_reminder(settings, case, text: str) -> None:
-    chat_id = case.platform_chat_id or case.platform_user_id or case.user.platform_user_id
+async def _send_case_message(settings, bot: Bot | None, case: Case, text: str, *, telegram_markup=None, max_keyboard=None) -> bool:
+    if case.platform == "max":
+        chat_id = case.platform_chat_id or case.platform_user_id or case.user.platform_user_id
+        if not chat_id:
+            return False
+        await _send_max_message(settings, text, max_keyboard, chat_id=chat_id)
+        return True
+    if bot is not None and case.user.telegram_id:
+        await bot.send_message(case.user.telegram_id, text, reply_markup=telegram_markup)
+        return True
+    return False
+
+
+async def _send_user_message(settings, bot: Bot | None, user: User, text: str, *, telegram_markup=None, max_keyboard=None) -> bool:
+    if user.platform == "max" and user.platform_user_id:
+        await _send_max_message(settings, text, max_keyboard, user_id=user.platform_user_id)
+        return True
+    if bot is not None and user.telegram_id:
+        await bot.send_message(user.telegram_id, text, reply_markup=telegram_markup)
+        return True
+    return False
+
+
+async def _send_max_message(settings, text: str, keyboard=None, *, chat_id: str | int | None = None, user_id: str | int | None = None) -> None:
     async with MaxBotClient(
         settings.max_bot_token,
         settings.max_api_base_url,
         upload_retry_attempts=settings.max_upload_retry_attempts,
         upload_retry_base_seconds=settings.max_upload_retry_base_seconds,
     ) as client:
-        await client.send_message(chat_id=chat_id, text=text, keyboard=max_keyboards.case_menu(can_pay=True, payment_url=case.payment_url))
+        await client.send_message(chat_id=chat_id, user_id=user_id, text=text, keyboard=keyboard)

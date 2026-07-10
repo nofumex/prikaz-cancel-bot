@@ -24,15 +24,18 @@ async def _sqlite_columns(conn, table_name: str) -> set[str]:
     return {row[1] for row in rows}
 
 
-async def _sqlite_add_columns(conn, table_name: str, columns: list[tuple[str, str]]) -> None:
+async def _sqlite_add_columns(conn, table_name: str, columns: list[tuple[str, str]]) -> set[str]:
     existing = await _sqlite_columns(conn, table_name)
+    added: set[str] = set()
     for column_name, ddl in columns:
         if column_name not in existing:
             await conn.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {ddl}")
+            added.add(column_name)
+    return added
 
 
 async def _upgrade_sqlite_schema(conn) -> None:
-    await _sqlite_add_columns(
+    added_case_columns = await _sqlite_add_columns(
         conn,
         "cases",
         [
@@ -49,6 +52,9 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("amocrm_sync_error", "amocrm_sync_error TEXT"),
             ("amocrm_synced", "amocrm_synced BOOLEAN DEFAULT 0"),
             ("order_rephoto_attempts", "order_rephoto_attempts INTEGER NOT NULL DEFAULT 0"),
+            ("deadline_reminder_sent_at", "deadline_reminder_sent_at DATETIME"),
+            ("post_payment_followup_sent_at", "post_payment_followup_sent_at DATETIME"),
+            ("consultation_reminder_sent_at", "consultation_reminder_sent_at DATETIME"),
         ],
     )
     await _sqlite_add_columns(
@@ -60,7 +66,7 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("confirmation_url", "confirmation_url TEXT"),
         ],
     )
-    await _sqlite_add_columns(
+    added_user_columns = await _sqlite_add_columns(
         conn,
         "users",
         [
@@ -68,8 +74,31 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("amocrm_current_case_id", "amocrm_current_case_id INTEGER"),
             ("telegram_username", "telegram_username TEXT"),
             ("email", "email TEXT"),
+            ("first_deadline_reminder_sent_at", "first_deadline_reminder_sent_at DATETIME"),
+            ("first_consultation_reminder_sent_at", "first_consultation_reminder_sent_at DATETIME"),
         ],
     )
+    if "deadline_reminder_sent_at" in added_case_columns:
+        await conn.exec_driver_sql(
+            "UPDATE cases SET deadline_reminder_sent_at = CURRENT_TIMESTAMP WHERE deadline_reminder_sent_at IS NULL"
+        )
+    if "post_payment_followup_sent_at" in added_case_columns:
+        await conn.exec_driver_sql(
+            "UPDATE cases SET post_payment_followup_sent_at = CURRENT_TIMESTAMP WHERE post_payment_followup_sent_at IS NULL AND paid_at IS NOT NULL"
+        )
+    if "consultation_reminder_sent_at" in added_case_columns:
+        await conn.exec_driver_sql(
+            "UPDATE cases SET consultation_reminder_sent_at = CURRENT_TIMESTAMP WHERE consultation_reminder_sent_at IS NULL"
+        )
+    if "first_deadline_reminder_sent_at" in added_user_columns:
+        await conn.exec_driver_sql(
+            "UPDATE users SET first_deadline_reminder_sent_at = CURRENT_TIMESTAMP WHERE first_deadline_reminder_sent_at IS NULL"
+        )
+    if "first_consultation_reminder_sent_at" in added_user_columns:
+        await conn.exec_driver_sql(
+            "UPDATE users SET first_consultation_reminder_sent_at = CURRENT_TIMESTAMP WHERE first_consultation_reminder_sent_at IS NULL"
+        )
+
     await conn.exec_driver_sql(
         """
         CREATE TABLE IF NOT EXISTS openai_usages (

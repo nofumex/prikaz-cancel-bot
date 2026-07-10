@@ -110,6 +110,14 @@ def debtor_name_fix_menu() -> InlineKeyboardMarkup:
     )
 
 
+def consultation_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn("\U0001f4ac \u0421\u0432\u044f\u0437\u0430\u0442\u044c\u0441\u044f \u0441 \u043c\u0435\u043d\u0435\u0434\u0436\u0435\u0440\u043e\u043c", "chat:start")],
+        ]
+    )
+
+
 def chat_end_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[btn("Завершить чат", "chat:end")]])
 

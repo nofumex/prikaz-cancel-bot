@@ -106,9 +106,33 @@ def test_event_status_map_contains_required_stages():
     assert EVENT_STATUS_MAP["user_started_bot"] == "Подписался на бота"
     assert EVENT_STATUS_MAP["order_photo_uploaded"] == "Отправил приказ"
     assert EVENT_STATUS_MAP["received_date_entered"] == "Указал дату"
+    assert EVENT_STATUS_MAP["document_qa_failed"] == "Указал дату"
+    assert EVENT_STATUS_MAP["reminder_sent"] == "Получил напоминание"
+    assert EVENT_STATUS_MAP["payment_abandoned"] == "Получил напоминание"
     assert EVENT_STATUS_MAP["payment_paid"] == "Оплатил"
     assert EVENT_STATUS_MAP["documents_delivered"] == "Оплатил"
-    assert EVENT_STATUS_MAP["document_qa_failed"] == "Указал дату"
+    assert EVENT_STATUS_MAP["paid_court_followup_sent"] == "Получил предложение о консультации"
+    assert EVENT_STATUS_MAP["consultation_offer_sent"] == "Получил предложение о консультации"
+
+
+def test_notification_stages_are_right_of_bot_stages_and_paid_after_reminder_still_allowed():
+    from app.services.amocrm import STAGE_RANK
+
+    assert STAGE_RANK["Оплатил"] < STAGE_RANK["Получил напоминание"]
+    assert STAGE_RANK["Оплатил"] < STAGE_RANK["Получил предложение о консультации"]
+    assert _stage_can_move(
+        1,
+        1,
+        "Получил напоминание",
+        "Оплатил",
+    ) is True
+    assert _stage_can_move(
+        1,
+        1,
+        "Оплатил",
+        "Получил предложение о консультации",
+    ) is True
+
 
 
 @pytest.mark.asyncio

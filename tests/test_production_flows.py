@@ -570,7 +570,7 @@ def test_crm_updates_stage_on_latest_case():
 def test_paid_after_reminder_moves_to_paid():
     from app.services.amocrm import EVENT_STATUS_MAP
 
-    assert EVENT_STATUS_MAP["reminder_sent"] == "Получил напоминание (не оплатил)"
+    assert EVENT_STATUS_MAP["reminder_sent"] == "Получил напоминание"
     assert EVENT_STATUS_MAP["payment_paid"] == "Оплатил"
 
 

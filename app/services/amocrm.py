@@ -25,7 +25,8 @@ PIPELINE_STATUSES = [
     "Отправил приказ",
     "Указал дату",
     "Оплатил",
-    "Получил напоминание (не оплатил)",
+    "Получил напоминание",
+    "Получил предложение о консультации",
 ]
 
 
@@ -70,6 +71,8 @@ def _stage_can_move(
         return True
     if current_case_id is None or event_case_id is None or current_case_id != event_case_id:
         return True
+    if current_status == "Получил напоминание" and target_status == "Оплатил":
+        return True
     current_rank = STAGE_RANK.get(current_status)
     target_rank = STAGE_RANK.get(target_status)
     if current_rank is None or target_rank is None:
@@ -88,10 +91,12 @@ EVENT_STATUS_MAP = {
     "payment_created": "Указал дату",
     "document_qa_failed": "Указал дату",
     "manager_requested": "Указал дату",
+    "reminder_sent": "Получил напоминание",
+    "payment_abandoned": "Получил напоминание",
     "payment_paid": "Оплатил",
     "documents_delivered": "Оплатил",
-    "reminder_sent": "Получил напоминание (не оплатил)",
-    "payment_abandoned": "Получил напоминание (не оплатил)",
+    "paid_court_followup_sent": "Получил предложение о консультации",
+    "consultation_offer_sent": "Получил предложение о консультации",
 }
 
 
@@ -258,18 +263,27 @@ class AmoCrmService:
         self._pipeline_cache = created
         return created
 
-    async def get_statuses(self, pipeline_id: int) -> dict[str, int]:
+    async def get_statuses_info(self, pipeline_id: int) -> dict[str, dict[str, int]]:
         data, error = await self.request("GET", f"/leads/pipelines/{pipeline_id}")
         if error or not isinstance(data, dict):
             logger.error("Failed to get statuses for pipeline %s: %s", pipeline_id, error)
             return {}
         statuses = data.get("_embedded", {}).get("statuses", [])
-        return {str(item["name"]): int(item["id"]) for item in statuses if item.get("name") and item.get("id")}
+        return {
+            str(item["name"]): {"id": int(item["id"]), "sort": int(item.get("sort") or 0)}
+            for item in statuses
+            if item.get("name") and item.get("id")
+        }
+
+    async def get_statuses(self, pipeline_id: int) -> dict[str, int]:
+        statuses = await self.get_statuses_info(pipeline_id)
+        return {name: item["id"] for name, item in statuses.items()}
 
     async def ensure_statuses(self, pipeline_id: int) -> dict[str, int]:
         if self._statuses_cache:
             return self._statuses_cache
-        existing = await self.get_statuses(pipeline_id)
+        existing_info = await self.get_statuses_info(pipeline_id)
+        existing = {name: item["id"] for name, item in existing_info.items()}
         missing = [name for name in PIPELINE_STATUSES if name not in existing]
         created_count = 0
         if missing and self.settings.amocrm_auto_create_statuses:
@@ -287,6 +301,19 @@ class AmoCrmService:
                         if item.get("name") and item.get("id"):
                             existing[str(item["name"])] = int(item["id"])
                             created_count += 1
+        for idx, name in enumerate(PIPELINE_STATUSES, start=1):
+            status_id = existing.get(name)
+            desired_sort = idx * 10
+            current_sort = (existing_info.get(name) or {}).get("sort")
+            if not status_id or current_sort == desired_sort:
+                continue
+            _, reorder_error = await self.request(
+                "PATCH",
+                f"/leads/pipelines/{pipeline_id}/statuses/{status_id}",
+                json_body={"name": name, "sort": desired_sort},
+            )
+            if reorder_error:
+                logger.error("Failed reordering status '%s': %s", name, reorder_error)
         self._statuses_cache = existing
         if self.settings.amocrm_debug:
             logger.info("amoCRM statuses ensured pipeline=%s created=%s", pipeline_id, created_count)
