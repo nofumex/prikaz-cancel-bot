@@ -157,6 +157,22 @@ class MaxBotClient:
             return await self.send_image(chat_id, file_path, caption)
         return await self.send_file(chat_id, file_path, caption)
 
+    async def send_document_to_user(self, user_id: str | int, file_path: str, caption: str | None = None) -> dict[str, Any]:
+        suffix = Path(file_path).suffix.lower()
+        upload_type = 'image' if suffix in {'.jpg', '.jpeg', '.png', '.gif', '.tiff', '.bmp', '.heic', '.webp'} else 'file'
+        uploaded = await self.upload_file(file_path, upload_type)
+        attachment = {'type': upload_type, 'payload': uploaded}
+        last_error = None
+        for attempt in range(self.upload_retry_attempts):
+            try:
+                return await self.send_message(user_id=user_id, text=caption or '', attachments=[attachment])
+            except RuntimeError as exc:
+                last_error = exc
+                if 'attachment.not.ready' not in str(exc):
+                    raise
+                await asyncio.sleep(self.upload_retry_base_seconds * (attempt + 1))
+        raise last_error or RuntimeError('MAX send uploaded file failed')
+
 
     async def resolve_attachment_url(self, *, token: str | None = None, message_id: str | None = None) -> str | None:
         from app.adapters.max.mapper import parse_update
@@ -205,6 +221,9 @@ class MaxBotClient:
             except Exception:
                 logger.exception("Failed to download MAX attachment via token endpoint %s", path)
         return None
+
+    async def download_by_id(self, attachment_id: str) -> bytes | None:
+        return await self.download_by_token(str(attachment_id))
 
     async def download_external_url(self, url: str, destination: Path) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)

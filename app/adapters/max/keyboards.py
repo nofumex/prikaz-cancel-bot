@@ -51,7 +51,8 @@ def profile_menu() -> MaxKeyboard:
 
 def case_menu(can_pay: bool = False, payment_url: str | None = None) -> MaxKeyboard:
     rows: MaxKeyboard = [
-        [btn("📝 Новое заявление", "case:new")],
+        [btn('📝 Новое заявление', 'case:new')],
+        [btn('📅 Изменить дату получения', 'case:manual_date')],
         [btn("👤 Профиль", "profile:show"), btn("💬 Менеджер", "chat:start")],
         [btn("🏠 Главное меню", "menu:main")],
     ]

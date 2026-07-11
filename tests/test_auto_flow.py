@@ -52,6 +52,45 @@ def _case(**kwargs) -> Case:
     return Case(**base)
 
 
+def test_max_callback_inline_keyboard_is_not_attachment():
+    event = parse_update({
+        'update_type': 'message_callback',
+        'callback': {'payload': 'chat:end', 'user': {'user_id': 17572856}},
+        'message': {
+            'recipient': {'chat_id': 999},
+            'sender': {'is_bot': True},
+            'body': {'attachments': [{'type': 'inline_keyboard'}]},
+        },
+    })
+    assert event is not None
+    assert event.callback_data == 'chat:end'
+    assert event.platform_user_id == '17572856'
+    assert event.chat_id == '999'
+    assert event.has_raw_attachment is False
+    assert event.photo_url is None
+    assert event.document_url is None
+
+
+def test_max_file_attachment_reads_top_level_filename_and_camelcase_id():
+    event = parse_update({
+        'update_type': 'message_created',
+        'message': {
+            'recipient': {'chat_id': 999},
+            'sender': {'user_id': 17572856, 'is_bot': False},
+            'body': {'attachments': [{
+                'type': 'file',
+                'filename': 'IMG_20260711_125455.jpg',
+                'payload': {'url': 'https://example.test/file.jpg', 'token': 'secret', 'fileId': 4216717167},
+            }]},
+        },
+    })
+    assert event is not None
+    assert event.document_name == 'IMG_20260711_125455.jpg'
+    assert event.document_url == 'https://example.test/file.jpg'
+    assert event.document_token == 'secret'
+    assert event.attachment_id == '4216717167'
+
+
 @pytest.mark.asyncio
 async def test_after_manual_date_auto_generates_preview_and_payment(monkeypatch):
     settings = _make_settings(show_user_confirmation_step=False, amocrm_enabled=False)
@@ -176,24 +215,24 @@ async def test_max_manual_date_starts_order_processing(monkeypatch):
     settings = _make_settings(amocrm_enabled=False, admin_ids=[], max_admin_ids=[])
     case = _case(platform="max", platform_user_id="42", received_date=None, deadline_date=None)
     user = User(id=1, platform="max", platform_user_id="42")
-    session = SimpleNamespace(get=AsyncMock(return_value=case))
+    session = SimpleNamespace(get=AsyncMock(return_value=case), commit=AsyncMock())
     client = SimpleNamespace(send_message=AsyncMock())
     event = IncomingEvent(platform_user_id="42", chat_id="chat-1", text="19.06.2026")
-    extract = AsyncMock()
+    generate = AsyncMock()
 
-    async def fake_set_received_date(session_arg, case_arg, received):
+    async def fake_save_received_date(session_arg, settings_arg, case_arg, user_arg, received):
         case_arg.received_date = received
         case_arg.deadline_date = date(2026, 6, 29)
 
     monkeypatch.setattr(max_bot, "_state_data", AsyncMock(return_value={"case_id": 1}))
-    monkeypatch.setattr(max_bot, "set_received_date", fake_set_received_date)
+    monkeypatch.setattr(max_bot, 'save_received_date', fake_save_received_date)
     monkeypatch.setattr(max_bot, "schedule_crm_sync", lambda *args, **kwargs: None)
-    monkeypatch.setattr(max_bot, "_extract_and_process_order", extract)
+    monkeypatch.setattr(max_bot, '_generate_documents', generate)
 
     await max_bot._handle_manual_date(client, event, session, settings, user, "19.06.2026")
 
     assert case.received_date == date(2026, 6, 19)
-    assert extract.await_count == 1
+    assert generate.await_count == 1
 
 @pytest.mark.asyncio
 async def test_max_lost_state_photo_recovers_latest_waiting_case(monkeypatch):

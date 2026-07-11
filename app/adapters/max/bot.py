@@ -7,8 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from app.adapters.max import keyboards
+from app.adapters.max.admin import handle_admin_update
+from app.adapters.max.chat import handle_chat_update
 from app.adapters.max.client import MaxBotClient
-from app.adapters.max.mapper import IncomingEvent, TOKEN_KEYS, URL_KEYS, parse_update, sanitize_raw_update
+from app.adapters.max.mapper import ID_KEYS, IncomingEvent, TOKEN_KEYS, URL_KEYS, parse_update, sanitize_raw_update
 from app.adapters.max.state import max_state_manager
 from app.config import Settings
 from app.database import SessionLocal
@@ -19,12 +21,14 @@ from app.services.cases import get_or_create_active_case, latest_case, latest_op
 from app.services.crm_background import schedule_crm_sync
 from app.services.document_delivery import deliver_documents_to_case_platform
 from app.services.documents import MANUAL_REVIEW_USER_TEXT, create_case_documents_reviewed, extraction_preview
-from app.services.legal_data import FIELD_LABELS, missing_order_fields, normalize_debtor_name_fields, normalize_order_data, validate_before_generation
+from app.services.legal_data import FIELD_LABELS, is_deadline_missed, missing_order_fields, normalize_debtor_name_fields, normalize_order_data, suggest_nominative_full_name, validate_before_generation
 from app.services.llm import extract_envelope_date, extract_order_data
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
+from app.services.received_date import DATE_PROMPT, save_received_date, validate_received_date
+from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaReceiptContactRequired
 from app.services.users import get_or_create_platform_user
-from app.texts import case_summary, manual_received_date_prompt_text, payment_text, profile_text, welcome_text
+from app.texts import case_summary, help_text, manual_received_date_prompt_text, payment_text, profile_text, welcome_text
 from app.utils import ensure_dir, h, normalize_receipt_contact, parse_russian_date
 
 logger = logging.getLogger(__name__)
@@ -34,7 +38,8 @@ STATE_ORDER_REPHOTO = "max_waiting_order_rephoto"
 STATE_ENVELOPE = "max_waiting_envelope"
 STATE_MANUAL_DATE = "max_waiting_manual_date"
 STATE_FIELD_VALUE = "max_waiting_field_value"
-STATE_PAYMENT_CONTACT = "max_waiting_payment_contact"
+STATE_PAYMENT_CONTACT = 'max_waiting_payment_contact'
+STATE_RESTORE_REASON = 'max_waiting_restore_reason'
 
 
 async def _send(client: MaxBotClient, event: IncomingEvent, text: str, keyboard=None) -> None:
@@ -130,10 +135,21 @@ async def _download_event_image(client: MaxBotClient, event: IncomingEvent, case
     suffix = ".jpg"
     url = event.photo_url or event.document_url or _raw_update_attachment_value(event.raw_update, URL_KEYS)
     token = event.photo_token or event.document_token or _raw_update_attachment_value(event.raw_update, TOKEN_KEYS)
+    attachment_id = event.attachment_id or _raw_update_attachment_value(event.raw_update, ID_KEYS)
     if event.document_name:
         suffix = Path(event.document_name).suffix or suffix
     path = Path(settings.max_download_dir) / f"case_{case_id}_{kind}{suffix}"
     data: bytes | None = None
+    method = 'url' if url else 'token' if token else 'id' if attachment_id else 'message'
+    logger.info(
+        'MAX attachment resolver type=%s filename=%s has_url=%s has_token=%s has_id=%s method=%s',
+        event.attachment_type,
+        event.document_name,
+        bool(url),
+        bool(token),
+        bool(attachment_id),
+        method,
+    )
     if url:
         try:
             await client.download_external_url(url, path)
@@ -152,6 +168,8 @@ async def _download_event_image(client: MaxBotClient, event: IncomingEvent, case
             resolved = await client.resolve_attachment_url(token=token, message_id=event.message_id)
             if resolved:
                 data = await client.download_file(resolved)
+    elif attachment_id:
+        data = await client.download_by_id(attachment_id)
     else:
         resolved = await client.resolve_attachment_url(token=token, message_id=event.message_id)
         if resolved:
@@ -249,6 +267,29 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
         if not current_state and (has_attachment or is_date_text):
             current_state = await _recover_state_for_input(session, event, user, has_attachment=has_attachment, is_date_text=is_date_text)
 
+        async def generate_admin_documents(case: Case) -> None:
+            await _generate_documents(client, event, session, settings, case.user, case)
+
+        if await handle_admin_update(
+            client, event, settings, session, user, generate_documents=generate_admin_documents
+        ):
+            return
+        if await handle_chat_update(client, event, settings, session, user):
+            return
+
+        command = (event.text or '').strip().lower()
+        if command == '/help':
+            await _send(client, event, help_text(), keyboards.main_menu())
+            return
+        if command == '/cancel':
+            await _clear_state(session, event)
+            await _send(client, event, 'Текущее действие отменено.', keyboards.main_menu())
+            return
+        if command == '/profile':
+            data = 'profile:show'
+        elif command == '/new':
+            data = 'case:new'
+
         if data == "menu:main" or (data is None and event.text == "/start"):
             await _clear_state(session, event)
             await _send(client, event, welcome_text(settings.company_name), keyboards.main_menu())
@@ -337,7 +378,28 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             await _set_state(session, event, STATE_FIELD_VALUE, {"case_id": case.id if case else None, "field": field})
             await _send(client, event, f"Введите новое значение для поля <b>{FIELD_LABELS.get(field, field)}</b>.\n\nСейчас: <code>{h(current)}</code>")
             return
-        if data == "case:generate":
+        if data == 'case:fix_debtor_name':
+            if not user.is_admin:
+                await _send(client, event, 'Эта функция доступна только админу.')
+                return
+            case = await latest_open_case(session, user.id)
+            if not case:
+                await _send(client, event, 'Не нашел активное заявление.')
+                return
+            extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+            suggested = suggest_nominative_full_name(extracted.get('debtor_full_name'))
+            if not suggested:
+                await _send(client, event, 'Не смог предложить исправление.')
+                return
+            extracted['debtor_full_name'] = suggested
+            case.extracted_json = json.dumps(extracted, ensure_ascii=False)
+            case.missing_fields = json.dumps([], ensure_ascii=False)
+            case.status = CaseStatus.PROCESSING.value
+            await session.commit()
+            await _send(client, event, f'✅ Исправил ФИО должника на <b>{h(suggested)}</b>.')
+            await _send(client, event, extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.confirm_extraction())
+            return
+        if data == 'case:generate':
             if not (user.is_admin or settings.show_user_confirmation_step):
                 await _send(client, event, "Эта функция недоступна.")
                 return
@@ -348,7 +410,34 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             schedule_crm_sync(settings, case.id, user.id, "case_data_confirmed", {"note": "MAX: данные подтверждены"})
             await _generate_documents(client, event, session, settings, user, case)
             return
-        if data == "payment:check":
+        if data and data.startswith('case:restore_reason:'):
+            case = await latest_open_case(session, user.id)
+            if not case:
+                await _send(client, event, 'Не нашел активное заявление.', keyboards.main_menu())
+                return
+            code = data.split(':')[-1]
+            if code == 'custom':
+                await _set_state(session, event, STATE_RESTORE_REASON, {'case_id': case.id})
+                await _send(client, event, 'Напишите свою причину пропуска срока одним сообщением.')
+                return
+            reasons = {
+                'late': 'Причина пропуска срока: копия судебного приказа получена поздно.',
+                'illness': 'Причина пропуска срока: болезнь.',
+                'trip': 'Причина пропуска срока: командировка / отъезд.',
+                'not_living': 'Причина пропуска срока: по адресу регистрации фактически не проживал.',
+            }
+            reason = reasons.get(code)
+            if not reason:
+                await _send(client, event, 'Причина не распознана.')
+                return
+            extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+            extracted['restore_reason'] = reason
+            case.extracted_json = json.dumps(extracted, ensure_ascii=False)
+            await session.commit()
+            await _clear_state(session, event)
+            await _generate_documents(client, event, session, settings, user, case)
+            return
+        if data == 'payment:check':
             case = await latest_open_case(session, user.id)
             if case and settings.yookassa_enabled:
                 refreshed = await refresh_yookassa_payment_for_case(session, case, settings)
@@ -362,6 +451,10 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 return
             await deliver_documents_to_case_platform(case.id, settings)
             await _send(client, event, "Документы отправлены.", keyboards.case_menu())
+            return
+
+        if event.update_type == 'message_callback':
+            await _send(client, event, 'Эта кнопка больше неактуальна. Выберите действие в меню.', keyboards.main_menu())
             return
 
         if current_state == STATE_PAYMENT_CONTACT and event.text:
@@ -388,6 +481,20 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             return
         if current_state == STATE_FIELD_VALUE and event.text:
             await _handle_field_value(client, event, session, user, event.text)
+            return
+        if current_state == STATE_RESTORE_REASON and event.text:
+            state_data = await _state_data(session, event)
+            case = await session.get(Case, state_data['case_id'])
+            reason = event.text.strip()
+            if not reason:
+                await _send(client, event, 'Причина не должна быть пустой.')
+                return
+            extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+            extracted['restore_reason'] = f'Причина пропуска срока: {reason}'
+            case.extracted_json = json.dumps(extracted, ensure_ascii=False)
+            await session.commit()
+            await _clear_state(session, event)
+            await _generate_documents(client, event, session, settings, user, case)
             return
         if current_state in {STATE_ORDER_PHOTO, STATE_ORDER_REPHOTO}:
             await _send(client, event, "Нужно фото судебного приказа. Отправьте изображение целиком или файл-картинку без сжатия.", keyboards.order_rephoto_menu())
@@ -425,6 +532,12 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
 
 
 async def _handle_order_image(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User) -> None:
+    if event.document_name:
+        suffix = Path(event.document_name).suffix.lower()
+        allowed = {'.jpg', '.jpeg', '.png', '.webp', '.pdf', '.heic', '.heif'}
+        if suffix not in allowed:
+            await _send(client, event, 'Отправьте приказ в формате JPG, PNG, WEBP, PDF, HEIC или HEIF.')
+            return
     data = await _state_data(session, event)
     case = await session.get(Case, data["case_id"])
     try:
@@ -438,10 +551,19 @@ async def _handle_order_image(client: MaxBotClient, event: IncomingEvent, sessio
         await _send(client, event, text, keyboards.order_rephoto_menu())
         await _notify_admin_download_failure(client, event, settings, "order image has no downloadable URL")
         return
-    await save_photo_path(session, case, "order", path)
-    await _set_state(session, event, STATE_ENVELOPE, {"case_id": case.id})
-    await _send(client, event, "✅ Приказ принят. Теперь отправьте конверт со штампами или напишите дату получения.", keyboards.envelope_choice())
-    schedule_crm_sync(settings, case.id, user.id, "order_photo_uploaded", {"note": "MAX: загружен приказ", "files": [{"path": str(path), "caption": "Фото приказа"}]})
+    try:
+        path = normalize_order_upload(path)
+    except Exception as exc:
+        logger.exception('MAX order attachment conversion failed')
+        await _send(client, event, f'Не удалось открыть файл приказа: {h(exc)}. Отправьте JPG, PNG, WEBP, PDF, HEIC или HEIF.')
+        return
+    await save_photo_path(session, case, 'order', path)
+    schedule_crm_sync(settings, case.id, user.id, 'order_photo_uploaded', {
+        'note': 'MAX: загружен приказ',
+        'files': [{'path': str(path), 'caption': 'Фото приказа'}],
+    })
+    await _extract_and_process_order(client, event, session, settings, user, case)
+    return
 
 
 async def _handle_envelope_image(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User) -> None:
@@ -492,15 +614,25 @@ async def _notify_admin_document_review_failure(client: MaxBotClient, settings: 
 
 
 async def _handle_manual_date(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User, text: str) -> None:
-    received = parse_russian_date(text)
-    if not received:
-        await _send(client, event, "Не смог распознать дату. Напишите в формате <code>ДД.ММ.ГГГГ</code>.", keyboards.envelope_choice())
+    state_data = await _state_data(session, event)
+    case = await session.get(Case, state_data['case_id'])
+    received, error = validate_received_date(case, text)
+    if error:
+        await _send(client, event, error)
         return
-    data = await _state_data(session, event)
-    case = await session.get(Case, data["case_id"])
-    await set_received_date(session, case, received)
-    schedule_crm_sync(settings, case.id, user.id, "received_date_entered", {"received_date": received.strftime("%d.%m.%Y")})
-    await _extract_and_process_order(client, event, session, settings, user, case)
+    await save_received_date(session, settings, case, user, received)
+    extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    missing = missing_order_fields(extracted, case.received_date)
+    if missing:
+        await _set_state(session, event, STATE_ORDER_REPHOTO, {'case_id': case.id})
+        await _send_order_rephoto_prompt(client, event, missing, attempts=case.order_rephoto_attempts)
+        return
+    if settings.show_user_confirmation_step:
+        await _clear_state(session, event)
+        await _send(client, event, extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.confirm_extraction())
+        return
+    await _generate_documents(client, event, session, settings, user, case)
+    return
 
 
 async def _extract_and_process_order(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User, case: Case) -> None:
@@ -513,7 +645,7 @@ async def _extract_and_process_order(client: MaxBotClient, event: IncomingEvent,
         extracted = {}
     extracted = normalize_order_data(extracted)
     extracted, _ = normalize_debtor_name_fields(extracted)
-    missing = missing_order_fields(extracted, case.received_date)
+    missing = [field for field in missing_order_fields(extracted, case.received_date) if field != 'received_date']
     case.extracted_json = json.dumps(extracted, ensure_ascii=False)
     case.missing_fields = json.dumps(missing, ensure_ascii=False)
     if missing:
@@ -539,6 +671,10 @@ async def _extract_and_process_order(client: MaxBotClient, event: IncomingEvent,
                 except Exception:
                     logger.exception("Failed to notify MAX admin %s about repeated rephoto", admin_id)
         return
+    if not case.received_date:
+        await _set_state(session, event, STATE_MANUAL_DATE, {'case_id': case.id})
+        await _send(client, event, '✅ Приказ распознан.\n\n' + DATE_PROMPT)
+        return
     if settings.show_user_confirmation_step:
         await _send(client, event, extraction_preview(extracted, case.received_date, missing, case.deadline_date), keyboards.confirm_extraction())
         return
@@ -550,7 +686,16 @@ async def _send_review(client: MaxBotClient, event: IncomingEvent, session, user
     if not case:
         await _send(client, event, "Не нашел активное заявление.", keyboards.main_menu())
         return
-    data = normalize_order_data(json.loads(case.extracted_json or "{}"))
+    data = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    if is_deadline_missed(case.deadline_date) and not data.get('restore_reason'):
+        await _set_state(session, event, STATE_RESTORE_REASON, {'case_id': case.id})
+        await _send(
+            client,
+            event,
+            'Срок подачи уже пропущен. Выберите причину, чтобы подготовить ходатайство о восстановлении срока.',
+            keyboards.restore_reason_menu(),
+        )
+        return
     missing = missing_order_fields(data, case.received_date)
     await _send(client, event, extraction_preview(data, case.received_date, missing, case.deadline_date), keyboards.confirm_extraction())
 
@@ -573,7 +718,11 @@ async def _handle_field_value(client: MaxBotClient, event: IncomingEvent, sessio
 
 
 async def _generate_documents(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User, case: Case) -> None:
-    data = normalize_order_data(json.loads(case.extracted_json or "{}"))
+    data = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    if is_deadline_missed(case.deadline_date) and not data.get('restore_reason'):
+        await _set_state(session, event, STATE_RESTORE_REASON, {'case_id': case.id})
+        await _send(client, event, 'Срок подачи уже пропущен. Выберите причину для восстановления срока.', keyboards.restore_reason_menu())
+        return
     validation = validate_before_generation(data, case.received_date)
     if not validation.ok:
         case.status = CaseStatus.NEEDS_REVIEW.value

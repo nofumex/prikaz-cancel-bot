@@ -6,6 +6,7 @@ from typing import Any
 IMAGE_ATTACHMENT_TYPES = {"image", "photo"}
 FILE_ATTACHMENT_TYPES = {"file", "document"}
 ATTACHMENT_TYPES = IMAGE_ATTACHMENT_TYPES | FILE_ATTACHMENT_TYPES
+ID_KEYS = ('fileId', 'file_id', 'photoId', 'photo_id', 'imageId', 'image_id', 'mediaId', 'media_id')
 URL_KEYS = ("url", "download_url", "file_url", "photo_url", "image_url", "media_url")
 TOKEN_KEYS = ("token", "file_token", "photo_token", "image_token", "media_token", "file_id", "photo_id", "image_id", "media_id")
 
@@ -141,6 +142,20 @@ def _payload_token(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _payload_id(payload: dict[str, Any]) -> str | None:
+    for key in ID_KEYS:
+        value = payload.get(key)
+        if value:
+            return str(value)
+    for key in ('photo', 'image', 'file', 'media'):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            value = _payload_id(nested)
+            if value:
+                return value
+    return None
+
+
 def sanitize_raw_update(value: Any) -> Any:
     if isinstance(value, dict):
         cleaned: dict[str, Any] = {}
@@ -173,6 +188,10 @@ class IncomingEvent:
     document_token: str | None = None
     document_name: str | None = None
     document_mime: str | None = None
+    attachment_type: str | None = None
+    attachment_id: str | None = None
+    update_type: str | None = None
+    sender_is_bot: bool = False
     has_raw_attachment: bool = False
     raw_update: dict[str, Any] | None = None
 
@@ -186,7 +205,8 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
     chat_id = _dig(message, "recipient", "chat_id") or message.get("chat_id") or update.get("chat_id") or platform_user_id
     if update_type == "message_callback":
         chat_id = _dig(message, "recipient", "chat_id") or chat_id
-    raw_attachments = _attachment_candidates(update, message)
+    sender_is_bot = bool(_as_dict(message.get('sender')).get('is_bot'))
+    raw_attachments = [] if update_type == 'message_callback' or sender_is_bot else _attachment_candidates(update, message)
     if not platform_user_id and raw_attachments:
         platform_user_id = str(message.get("message_id") or update.get("message_id") or "unknown")
     if not chat_id and raw_attachments:
@@ -200,8 +220,14 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
     document_token = None
     document_name = None
     document_mime = None
+    attachment_type = None
+    attachment_id = None
 
     for att in _normalized_attachments(update, message):
+        if update_type == 'message_callback' or sender_is_bot:
+            break
+        attachment_type = str(att.get('type') or att.get('attachment_type') or '').lower()
+        attachment_id = attachment_id or _payload_id(_as_dict(att.get('payload')) or att)
         att_type = str(att.get("type") or att.get("attachment_type") or "").lower()
         payload = _as_dict(att.get("payload")) or att
         payload_nodes = _walk_attachment_nodes(payload)
@@ -236,6 +262,13 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
             if not document_url:
                 document_url = _payload_url(payload)
 
+    if not document_name:
+        for candidate in raw_attachments:
+            if isinstance(candidate, dict):
+                document_name = candidate.get('filename') or candidate.get('file_name') or candidate.get('name')
+                if document_name:
+                    break
+
     return IncomingEvent(
         platform_user_id=str(platform_user_id),
         chat_id=str(chat_id),
@@ -252,6 +285,10 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
         document_token=document_token,
         document_name=document_name,
         document_mime=document_mime,
+        attachment_type=attachment_type,
+        attachment_id=attachment_id,
+        update_type=update_type,
+        sender_is_bot=sender_is_bot,
         has_raw_attachment=bool(raw_attachments),
         raw_update=update,
     )

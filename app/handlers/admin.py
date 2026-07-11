@@ -7,7 +7,7 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardMarkup, Message
 import json
 import math
 
@@ -16,9 +16,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 
-from app.enums import CaseStatus
-from app.keyboards.common import admin_case_actions, admin_cases_page, admin_panel, manager_panel
-from app.models import Case, CrmSyncLog, OpenAIUsage, User
+from app.enums import CaseStatus, PaymentStatus
+from app.keyboards.common import admin_case_actions, admin_cases_page, admin_panel, btn, manager_panel
+from app.models import Case, CrmSyncLog, OpenAIUsage, Payment, User
+from app.services.admin_reporting import client_path_text
 from app.services.amocrm import get_amocrm_service
 from app.services.app_settings import payments_enabled, toggle_payments
 from app.services.document_delivery import schedule_document_delivery
@@ -227,11 +228,56 @@ async def cb_case_detail(callback: CallbackQuery, session: AsyncSession, current
         + ("\n".join(usage_lines) if usages else "")
     )
     paid = case.status in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}
+    path_text = await client_path_text(session, case.id)
+    file_rows = [
+        [btn('📎 Фото приказа', f'admin:file:{case.id}:order'), btn('📄 Preview', f'admin:file:{case.id}:preview')],
+        [btn('📝 DOCX заявления', f'admin:file:{case.id}:docx'), btn('📕 PDF заявления', f'admin:file:{case.id}:pdf')],
+        [btn('🧾 Все файлы заявки', f'admin:file:{case.id}:all')],
+    ]
+    await callback.message.answer(
+        '<b>Путь клиента:</b>\n' + path_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=file_rows),
+    )
     await callback.message.answer(text, reply_markup=admin_case_actions(case.id, paid=paid, back=f"admin:{prefix}:{page}"))
     await callback.answer()
 
 
-@router.callback_query(F.data == "admin:stats")
+@router.callback_query(F.data.startswith('admin:file:'))
+async def cb_admin_file(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    _, _, case_id, kind = callback.data.split(':')
+    case = await session.get(Case, int(case_id))
+    if not case:
+        await callback.message.answer('Заявка не найдена.')
+        await callback.answer()
+        return
+    paths = {
+        'order': [('Фото приказа', case.order_photo_path)],
+        'preview': [('Preview заявления', case.preview_pdf_path or case.preview_doc_path)],
+        'docx': [('DOCX заявления', case.full_doc_path)],
+        'pdf': [('PDF заявления', case.full_pdf_path)],
+    }
+    selected = sum(paths.values(), []) if kind == 'all' else paths.get(kind, [])
+    sent = 0
+    for caption, raw_path in selected:
+        if raw_path and Path(raw_path).exists():
+            await callback.message.answer_document(FSInputFile(raw_path), caption=caption)
+            sent += 1
+    if not sent:
+        if kind == 'order':
+            reason = 'Приказ еще не загружен.'
+        elif not case.extracted_json:
+            reason = 'OCR еще не завершен.'
+        elif kind == 'preview':
+            reason = 'Preview еще не сгенерирован.'
+        else:
+            reason = 'Полный документ еще не сгенерирован. Используйте кнопку «Сгенерировать документы».'
+        await callback.message.answer(reason)
+    await callback.answer()
+
+
+@router.callback_query(F.data == 'admin:stats')
 async def cb_stats(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
     if not await _ensure_admin_callback(callback, current_user):
         return
@@ -253,6 +299,17 @@ async def cb_stats(callback: CallbackQuery, session: AsyncSession, current_user:
         await session.scalar(select(func.count(Case.id)).where(Case.amocrm_sync_error.is_not(None), Case.amocrm_synced.is_(False)))
         or 0
     )
+    telegram_users = int(await session.scalar(select(func.count(User.id)).where(User.platform == 'telegram')) or 0)
+    max_users = int(await session.scalar(select(func.count(User.id)).where(User.platform == 'max')) or 0)
+    platform_total = telegram_users + max_users
+    telegram_percent = round(telegram_users * 100 / platform_total) if platform_total else 0
+    max_percent = round(max_users * 100 / platform_total) if platform_total else 0
+    paid_filter = Payment.status == PaymentStatus.PAID.value
+    payment_count = int(await session.scalar(select(func.count(Payment.id)).where(paid_filter)) or 0)
+    payment_sum = int(await session.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).where(paid_filter)) or 0)
+    yookassa_count = int(await session.scalar(select(func.count(Payment.id)).where(paid_filter, Payment.provider == 'yookassa')) or 0)
+    yookassa_sum = int(await session.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).where(paid_filter, Payment.provider == 'yookassa')) or 0)
+    payments_text = f'<b>Оплаты</b>\nYooKassa: {yookassa_count} оплат, {yookassa_sum:,} ₽\nВсего успешных: {payment_count} оплат, {payment_sum:,} ₽\n\n'.replace(',', ' ')
     await callback.message.answer(
         "<b>Статистика</b>\n\n"
         f"Пользователей: {users_total}\n"
@@ -263,7 +320,9 @@ async def cb_stats(callback: CallbackQuery, session: AsyncSession, current_user:
         f"Синхронизировано сделок: {crm_synced}\n"
         f"Ошибки синхронизации: {crm_errors}\n"
         f"Ожидают повторной синхронизации: {crm_pending}\n\n"
-        "<b>OpenAI API</b>\n"
+        f'<b>Пользователи по платформам</b>\nTelegram: {telegram_users} ({telegram_percent}%)\nMAX: {max_users} ({max_percent}%)\nВсего: {platform_total} (100%)\n\n'
+        + payments_text
+        + '<b>OpenAI API</b>\n'
         f"Всего потрачено: {_money_usd(total_cost)}\n"
         f"Всего токенов: {total_tokens}\n"
         f"Input: {input_tokens}\n"
@@ -321,6 +380,7 @@ async def cb_retry_amounts(callback: CallbackQuery, session: AsyncSession, setti
     await session.refresh(case, ["user"])
     from app.handlers.case_flow import _resolve_amount_mismatch
     from app.services.amount_recovery import format_amount_mismatch_admin_report
+    data = normalize_order_data(safe_json_loads(case.extracted_json, {}))
     data, amount_check, recovery, retry_amounts = await _resolve_amount_mismatch(
         settings, session, case, case.user, data, bot=bot, force_retry=True
     )
@@ -496,7 +556,26 @@ async def cb_mark_paid(callback: CallbackQuery, bot: Bot, session: AsyncSession,
     await callback.answer()
 
 
-@router.callback_query(F.data == "admin:managers")
+@router.callback_query(F.data.startswith('admin:user:'))
+async def cb_admin_user(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    case = await session.get(Case, int(callback.data.split(':')[-1]))
+    if not case:
+        await callback.message.answer('Заявка не найдена.')
+    else:
+        await session.refresh(case, ['user'])
+        client = case.user
+        dash = '—'
+        await callback.message.answer(
+            f'<b>Профиль клиента</b>\nИмя: {full_name(client)}\nПлатформа: {h(client.platform)}\n'
+            f'Username: {username_text(client)}\nID: <code>{h(client.platform_user_id)}</code>\n'
+            f'Телефон: {h(client.phone or dash)}\nEmail: {h(client.email or dash)}'
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == 'admin:managers')
 async def cb_managers(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
     if not await _ensure_admin_callback(callback, current_user):
         return

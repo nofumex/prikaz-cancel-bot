@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -326,7 +326,7 @@ def test_creditor_header_uses_first_normalized_address():
 def test_in_time_long_creditor_address_compacts_to_one_page(tmp_path, monkeypatch):
     monkeypatch.setattr("app.services.document_templates.renderer.DOCUMENT_DIR", tmp_path / "documents")
     case, user = _make_case({**BELSKY_DATA, "creditor_address": LONG_POST_BANK_ADDRESS})
-    case.deadline_date = date(2026, 7, 10)
+    case.deadline_date = date.today() + timedelta(days=1)
 
     artifacts = create_case_documents(case, user, _settings(), restore_reason=None)
 

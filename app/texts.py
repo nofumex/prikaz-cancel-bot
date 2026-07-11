@@ -98,7 +98,10 @@ def payment_text(case, price: int) -> str:
 
 
 def manual_received_date_prompt_text() -> str:
-    return f"Напишите дату получения копии приказа. Пример: <code>{date.today().strftime('%d.%m.%Y')}</code>"
+    return (
+        'Введите дату получения судебного приказа в формате ДД.ММ.ГГГГ, например: 10.07.2026\n\n'
+        'Можно написать через точку, пробел, слэш, запятую или дефис: 10.07.2026, 10 07 2026, 10/07/26.'
+    )
 
 
 def deadline_warning(deadline: date | None, reminder_no: int) -> str:

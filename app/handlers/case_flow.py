@@ -42,6 +42,8 @@ from app.services.legal_data import (
 )
 from app.services.llm import extract_envelope_date, extract_order_amounts, extract_order_data
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
+from app.services.received_date import DATE_PROMPT, save_received_date, validate_received_date
+from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaError, YooKassaReceiptContactRequired
 from app.texts import case_summary, manual_received_date_prompt_text, payment_text
 from app.utils import ensure_dir, h, normalize_receipt_contact, parse_russian_date
@@ -78,8 +80,8 @@ async def _download_document_image(bot: Bot, message: Message, case_id: int, kin
     doc = message.document
     file = await bot.get_file(doc.file_id)
     suffix = Path(doc.file_name or file.file_path or "").suffix or ".jpg"
-    if suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".heic"}:
-        suffix = ".jpg"
+    if suffix.lower() not in {'.jpg', '.jpeg', '.png', '.webp', '.pdf', '.heic', '.heif'}:
+        suffix = '.jpg'
     path = Path("storage/photos") / f"case_{case_id}_{kind}_{doc.file_unique_id}{suffix}"
     await bot.download_file(file.file_path, destination=path)
     return path
@@ -196,53 +198,36 @@ async def my_case(callback: CallbackQuery, session: AsyncSession, current_user: 
 @router.message(CaseStates.waiting_order_photo, F.photo)
 @router.message(CaseStates.waiting_order_rephoto, F.photo)
 async def receive_order_photo(message: Message, bot: Bot, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
-    start = time.monotonic()
     data = await state.get_data()
     case = await session.get(Case, data["case_id"])
-    path = await _download_photo(bot, message, case.id, "order")
-    await save_photo_path(session, case, "order", path)
-    await state.set_state(CaseStates.waiting_envelope_choice)
-    await message.answer(
-        "✅ Фото приказа принято.\n\n"
-        "Теперь отправьте фото конверта со штампами или сразу напишите дату получения в формате <code>ДД.ММ.ГГГГ</code>.\n\n"
-        "💡 Если текст на приказе мелкий, в следующий раз отправьте фото как файл без сжатия.",
-        reply_markup=envelope_choice(),
-    )
-    logger.info("handler order_photo_received answered_to_user duration_ms=%s", int((time.monotonic() - start) * 1000))
-    schedule_crm_sync(
-        settings,
-        case.id,
-        current_user.id,
-        "order_photo_uploaded",
-        {"note": "Пользователь отправил фото судебного приказа", "files": [{"path": str(path), "caption": "Фото приказа"}]},
-    )
+    path = await _download_photo(bot, message, case.id, 'order')
+    await save_photo_path(session, case, 'order', path)
+    schedule_crm_sync(settings, case.id, current_user.id, 'order_photo_uploaded', {
+        'note': 'Пользователь отправил фото судебного приказа',
+        'files': [{'path': str(path), 'caption': 'Фото приказа'}],
+    })
+    await _extract_and_process_order(message, state, session, settings, case, current_user)
+    return
 
 
 @router.message(CaseStates.waiting_order_photo, F.document)
 @router.message(CaseStates.waiting_order_rephoto, F.document)
 async def receive_order_document(message: Message, bot: Bot, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
-    if not message.document or not (message.document.mime_type or "").startswith("image/"):
-        await message.answer("Нужно изображение судебного приказа. Отправьте фото или файл-картинку (JPEG/PNG).")
+    suffix = Path(message.document.file_name or '').suffix.lower() if message.document else ''
+    allowed = {'.jpg', '.jpeg', '.png', '.webp', '.pdf', '.heic', '.heif'}
+    if not message.document or suffix not in allowed:
+        await message.answer('Отправьте приказ в формате JPG, PNG, WEBP, PDF, HEIC или HEIF.')
         return
-    start = time.monotonic()
     data = await state.get_data()
     case = await session.get(Case, data["case_id"])
-    path = await _download_document_image(bot, message, case.id, "order")
-    await save_photo_path(session, case, "order", path)
-    await state.set_state(CaseStates.waiting_envelope_choice)
-    await message.answer(
-        "✅ Файл приказа принят без сжатия.\n\n"
-        "Теперь отправьте фото конверта со штампами или сразу напишите дату получения в формате <code>ДД.ММ.ГГГГ</code>.",
-        reply_markup=envelope_choice(),
-    )
-    logger.info("handler order_photo_received answered_to_user duration_ms=%s", int((time.monotonic() - start) * 1000))
-    schedule_crm_sync(
-        settings,
-        case.id,
-        current_user.id,
-        "order_photo_uploaded",
-        {"note": "Пользователь отправил приказ как файл без сжатия", "files": [{"path": str(path), "caption": "Фото приказа (файл)"}]},
-    )
+    path = normalize_order_upload(await _download_document_image(bot, message, case.id, 'order'))
+    await save_photo_path(session, case, 'order', path)
+    schedule_crm_sync(settings, case.id, current_user.id, 'order_photo_uploaded', {
+        'note': 'Пользователь отправил приказ как файл',
+        'files': [{'path': str(path), 'caption': 'Приказ (файл)'}],
+    })
+    await _extract_and_process_order(message, state, session, settings, case, current_user)
+    return
 
 
 @router.message(CaseStates.waiting_order_photo)
@@ -312,21 +297,25 @@ async def choose_manual_date(callback: CallbackQuery, state: FSMContext, session
 
 @router.message(CaseStates.waiting_manual_date)
 async def receive_manual_date(message: Message, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
-    received = parse_russian_date(message.text)
-    if not received:
-        await message.answer("Не смог распознать дату. Напишите в формате <code>ДД.ММ.ГГГГ</code>, например <code>19.06.2026</code>.")
+    state_data = await state.get_data()
+    case = await session.get(Case, state_data['case_id'])
+    received, error = validate_received_date(case, message.text)
+    if error:
+        await message.answer(error)
         return
-    data = await state.get_data()
-    case = await session.get(Case, data["case_id"])
-    await set_received_date(session, case, received)
-    schedule_crm_sync(
-        settings,
-        case.id,
-        current_user.id,
-        "received_date_entered",
-        {"received_date": received.strftime("%d.%m.%Y"), "deadline": case.deadline_date.strftime("%d.%m.%Y") if case.deadline_date else ""},
-    )
-    await _extract_and_process_order(message, state, session, settings, case, current_user)
+    await save_received_date(session, settings, case, current_user, received)
+    extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    missing = missing_order_fields(extracted, case.received_date)
+    if missing:
+        await state.set_state(CaseStates.waiting_order_rephoto)
+        await _send_order_rephoto_prompt(message, missing, attempts=case.order_rephoto_attempts)
+        return
+    if settings.show_user_confirmation_step:
+        await state.clear()
+        await message.answer(extraction_preview(extracted, case.received_date, [], case.deadline_date), reply_markup=confirm_extraction())
+        return
+    await _generate_documents_flow(message, session, settings, current_user, case, state=state, bot=message.bot)
+    return
 
 
 @router.message(CaseStates.waiting_payment_contact, F.text)
@@ -411,7 +400,7 @@ async def _extract_and_process_order(
     if name_result and name_result.confidence >= 0.85 and name_result.normalized:
         extracted["debtor_full_name"] = name_result.normalized
 
-    missing = missing_order_fields(extracted, case.received_date)
+    missing = [field for field in missing_order_fields(extracted, case.received_date) if field != 'received_date']
     case.extracted_json = json.dumps(extracted, ensure_ascii=False)
     case.missing_fields = json.dumps(missing, ensure_ascii=False)
     if missing:
@@ -440,6 +429,12 @@ async def _extract_and_process_order(
                     )
                 except Exception:
                     logger.exception("Failed to notify admin %s about repeated rephoto", admin_id)
+        return
+
+    if not case.received_date:
+        await state.update_data(case_id=case.id)
+        await state.set_state(CaseStates.waiting_manual_date)
+        await message.answer('✅ Приказ распознан.\n\n' + DATE_PROMPT)
         return
 
     if settings.show_user_confirmation_step:
