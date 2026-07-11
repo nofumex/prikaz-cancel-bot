@@ -306,7 +306,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             return
         if data == "case:new":
             previous = await latest_open_case(session, user.id)
-            case = await get_or_create_active_case(session, user, chat_id=event.chat_id, force_new=False)
+            case = await get_or_create_active_case(session, user, chat_id=event.chat_id, force_new=True)
             is_new_case = previous is None or previous.id != case.id
             if is_new_case:
                 schedule_crm_sync(settings, case.id, user.id, "user_started_bot", {"note": "MAX: \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c \u043d\u0430\u0447\u0430\u043b \u043e\u0444\u043e\u0440\u043c\u043b\u0435\u043d\u0438\u0435"})

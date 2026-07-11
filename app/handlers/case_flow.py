@@ -165,7 +165,7 @@ async def start_case(event: Message | CallbackQuery, state: FSMContext, session:
     target = event.message if isinstance(event, CallbackQuery) else event
     chat_id = str(target.chat.id) if getattr(target, "chat", None) else current_user.platform_user_id
     previous = await latest_open_case(session, current_user.id)
-    case = await get_or_create_active_case(session, current_user, chat_id=chat_id, force_new=False)
+    case = await get_or_create_active_case(session, current_user, chat_id=chat_id, force_new=True)
     is_new_case = previous is None or previous.id != case.id
     await state.update_data(case_id=case.id)
     await state.set_state(CaseStates.waiting_order_photo)

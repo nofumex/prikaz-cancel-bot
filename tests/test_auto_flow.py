@@ -126,6 +126,45 @@ async def test_after_manual_date_auto_generates_preview_and_payment(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_telegram_order_without_received_date_prompts_for_date(monkeypatch):
+    from app.handlers.case_flow import CaseStates
+
+    settings = _make_settings(show_user_confirmation_step=False, amocrm_enabled=False)
+    case = _case(received_date=None, deadline_date=None)
+    user = User(id=1, platform="telegram", platform_user_id="1")
+    message = SimpleNamespace(answer=AsyncMock(), answer_document=AsyncMock(), bot=SimpleNamespace(send_message=AsyncMock()))
+    state = SimpleNamespace(clear=AsyncMock(), update_data=AsyncMock(), set_state=AsyncMock())
+    session = SimpleNamespace(commit=AsyncMock())
+    mock_generate = AsyncMock(return_value=True)
+    monkeypatch.setattr("app.handlers.case_flow._generate_documents_flow", mock_generate)
+    monkeypatch.setattr(
+        "app.handlers.case_flow.extract_order_data",
+        AsyncMock(
+            return_value={
+                "court_name": "судебный участок №5 города Ессентуки",
+                "debtor_full_name": "Иванов Иван Иванович",
+                "creditor_name": "АО «Почта Банк»",
+                "case_number": "2-146-09-434/2021",
+                "uid": "26MS0031-01-2021-000169-72",
+                "order_date": "18.01.2021",
+                "debt_amount": "78 472 руб. 87 коп.",
+                "state_duty": "1 277 руб. 00 коп.",
+                "total_amount": "79 749 руб. 87 коп.",
+            }
+        ),
+    )
+    monkeypatch.setattr("app.handlers.case_flow.get_amocrm_service", lambda settings: SimpleNamespace(build_ocr_note=AsyncMock(return_value="note")))
+
+    await _extract_and_process_order(message, state, session, settings, case, user)
+
+    assert mock_generate.await_count == 0
+    assert state.set_state.await_count == 1
+    assert state.set_state.await_args.args[0].state == CaseStates.waiting_manual_date.state
+    assert "Введите дату получения" in message.answer.await_args.args[0]
+    assert message.answer_document.await_count == 0
+
+
+@pytest.mark.asyncio
 async def test_missing_required_fields_asks_rephoto_not_manual_edit(monkeypatch):
     settings = _make_settings(show_user_confirmation_step=False, amocrm_enabled=False)
     case = _case(
@@ -142,6 +181,29 @@ async def test_missing_required_fields_asks_rephoto_not_manual_edit(monkeypatch)
 
     assert state.set_state.await_count == 1
     assert order_rephoto_menu().inline_keyboard[0][0].callback_data == "case:rephoto_order"
+
+
+@pytest.mark.asyncio
+async def test_telegram_case_new_starts_fresh_case(monkeypatch):
+    from app.handlers.case_flow import start_case
+
+    settings = _make_settings(amocrm_enabled=False)
+    previous = _case(received_date=date(2026, 7, 10), deadline_date=date(2026, 7, 20))
+    fresh = _case(id=2, received_date=None, deadline_date=None)
+    user = User(id=1, platform="telegram", platform_user_id="1")
+    event = SimpleNamespace(chat=SimpleNamespace(id="chat-1"), answer=AsyncMock())
+    state = SimpleNamespace(clear=AsyncMock(), update_data=AsyncMock(), set_state=AsyncMock())
+    session = SimpleNamespace()
+    get_or_create = AsyncMock(return_value=fresh)
+
+    monkeypatch.setattr("app.handlers.case_flow.latest_open_case", AsyncMock(return_value=previous))
+    monkeypatch.setattr("app.handlers.case_flow.get_or_create_active_case", get_or_create)
+    monkeypatch.setattr("app.handlers.case_flow.schedule_crm_sync", lambda *args, **kwargs: None)
+
+    await start_case(event, state, session, user, settings)
+
+    get_or_create.assert_awaited_once_with(session, user, chat_id="chat-1", force_new=True)
+    assert state.set_state.await_count == 1
 
 
 def test_user_confirmation_step_disabled_by_default():
@@ -351,7 +413,7 @@ async def test_max_lost_state_manual_date_recovers_after_order_photo(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_max_case_new_reuses_empty_waiting_case(monkeypatch):
+async def test_max_case_new_starts_fresh_case(monkeypatch):
     from app.adapters.max import bot as max_bot
     from app.adapters.max.mapper import IncomingEvent
 
@@ -381,7 +443,7 @@ async def test_max_case_new_reuses_empty_waiting_case(monkeypatch):
 
     await max_bot.handle_update(client, event, settings)
 
-    get_or_create.assert_awaited_once_with(session, user, chat_id="chat-1", force_new=False)
+    get_or_create.assert_awaited_once_with(session, user, chat_id="chat-1", force_new=True)
     assert client.send_message.await_count == 1
 
 def test_max_parse_update_accepts_photo_attachment_variants():
