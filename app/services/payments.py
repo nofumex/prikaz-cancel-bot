@@ -5,12 +5,12 @@ import hmac
 from datetime import datetime
 from urllib.parse import quote, urlencode
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.enums import CaseStatus, PaymentStatus
-from app.models import Case, Payment
+from app.models import Case, CrmSyncLog, Payment, User
 from app.services.cases import new_payment_label
 from app.services.yookassa import YooKassaClient, YooKassaReceiptContactRequired, raw_json
 from app.utils import normalize_receipt_contact
@@ -36,7 +36,7 @@ def build_yoomoney_url(settings: Settings, label: str, amount: int, target: str)
 async def ensure_payment(session: AsyncSession, case: Case, settings: Settings) -> Payment:
     result = await session.execute(
         select(Payment)
-        .where(Payment.case_id == case.id, Payment.status != PaymentStatus.CANCELED.value)
+        .where(Payment.case_id == case.id, Payment.status != PaymentStatus.CANCELED.value, Payment.refunded_at.is_(None))
         .order_by(Payment.id.desc())
         .limit(1)
     )
@@ -124,7 +124,7 @@ async def refresh_yookassa_payment(session: AsyncSession, payment: Payment, sett
 async def refresh_yookassa_payment_for_case(session: AsyncSession, case: Case, settings: Settings) -> Case | None:
     result = await session.execute(
         select(Payment)
-        .where(Payment.case_id == case.id, Payment.provider == "yookassa")
+        .where(Payment.case_id == case.id, Payment.provider == "yookassa", Payment.refunded_at.is_(None))
         .order_by(Payment.id.desc())
         .limit(1)
     )
@@ -196,3 +196,56 @@ async def _mark_payment_paid(session: AsyncSession, payment: Payment, raw: dict 
     if case:
         await session.refresh(case)
     return case
+
+
+async def net_payment_totals(session: AsyncSession) -> tuple[int, int, int, int]:
+    paid_filter = and_(Payment.status == PaymentStatus.PAID.value, Payment.refunded_at.is_(None))
+    payment_count = int(await session.scalar(select(func.count(Payment.id)).where(paid_filter)) or 0)
+    payment_sum = int(await session.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).where(paid_filter)) or 0)
+    yookassa_count = int(await session.scalar(select(func.count(Payment.id)).where(paid_filter, Payment.provider == "yookassa")) or 0)
+    yookassa_sum = int(await session.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).where(paid_filter, Payment.provider == "yookassa")) or 0)
+    return payment_count, payment_sum, yookassa_count, yookassa_sum
+
+
+async def record_manual_refund(session: AsyncSession, case: Case, admin: User) -> tuple[Payment | None, bool]:
+    result = await session.execute(
+        select(Payment)
+        .where(Payment.case_id == case.id, Payment.status == PaymentStatus.PAID.value)
+        .order_by(Payment.paid_at.desc().nullslast(), Payment.created_at.desc(), Payment.id.desc())
+        .limit(1)
+    )
+    payment = result.scalar_one_or_none()
+    if not payment:
+        return None, False
+    if payment.refunded_at:
+        return payment, False
+    payment.refunded_at = datetime.utcnow()
+    session.add(
+        CrmSyncLog(
+            case_id=case.id,
+            user_id=admin.id,
+            event_type="refund_recorded",
+            dedupe_key=f"refund:{payment.id}",
+            amo_entity_type="payment",
+            amo_entity_id=payment.id,
+            request_payload=raw_json(
+                {
+                    "event_type": "refund_recorded",
+                    "payload": {
+                        "payment_id": payment.id,
+                        "label": payment.label,
+                        "amount": payment.amount,
+                        "provider": payment.provider,
+                        "admin_id": admin.id,
+                        "note": "Возврат учтен админом",
+                    },
+                }
+            ),
+            response_payload=raw_json({"refunded_at": datetime.utcnow().isoformat()}),
+            success=True,
+            error_message=None,
+        )
+    )
+    await session.commit()
+    await session.refresh(payment)
+    return payment, True

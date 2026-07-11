@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
 
 from aiogram import Bot, F, Router
@@ -16,14 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 
-from app.enums import CaseStatus, PaymentStatus
+from app.enums import CaseStatus
 from app.keyboards.common import admin_case_actions, admin_cases_page, admin_panel, btn, manager_panel
-from app.models import Case, CrmSyncLog, OpenAIUsage, Payment, User
-from app.services.admin_reporting import client_path_text
+from app.models import Case, CrmSyncLog, OpenAIUsage, User
+from app.services.admin_reporting import client_path_text, problem_case_error_text, problem_cases_page
 from app.services.amocrm import get_amocrm_service
 from app.services.app_settings import payments_enabled, toggle_payments
 from app.services.document_delivery import schedule_document_delivery
-from app.services.payments import mark_paid_by_label
+from app.services.payments import mark_paid_by_label, net_payment_totals, record_manual_refund
 from app.texts import case_summary
 from app.services.legal_data import FIELD_LABELS, normalize_order_data
 from app.utils import full_name, h, safe_json_loads, username_text
@@ -38,6 +37,15 @@ class AdminAmountStates(StatesGroup):
 
 def _money_usd(value: float | None) -> str:
     return f"${(value or 0.0):.4f}"
+
+
+def _case_button_label(case: Case, error: str | None = None) -> str:
+    date = case.created_at.strftime("%d.%m") if case.created_at else ""
+    label = f"#{case.id} • {date} • {full_name(case.user)}"
+    if error:
+        trimmed = " ".join(error.split())
+        label = f"{label} • Ошибка: {trimmed[:60]}"
+    return label
 
 
 async def _usage_totals(session: AsyncSession, *, case_filter=None) -> tuple[float, int, int, int, int, int]:
@@ -102,6 +110,39 @@ async def cmd_admin(message: Message, current_user: User) -> None:
         await message.answer("<b>⚙️ Админ-панель</b>", reply_markup=admin_panel(payments_enabled()))
 
 
+@router.message(Command("refund"))
+async def cmd_refund(message: Message, session: AsyncSession, current_user: User) -> None:
+    if not await _ensure_admin_message(message, current_user):
+        return
+    parts = (message.text or "").strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /refund CASE_ID")
+        return
+    try:
+        case_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("Использование: /refund CASE_ID")
+        return
+    case = await session.get(Case, case_id)
+    if not case:
+        await message.answer("Заявка не найдена.")
+        return
+    payment, applied = await record_manual_refund(session, case, current_user)
+    if not payment:
+        await message.answer("По заявке нет успешной оплаты")
+        return
+    if not applied:
+        await message.answer("Возврат по этой заявке уже учтен")
+        return
+    await session.refresh(case, ["user"])
+    amount_text = f"{payment.amount:,}".replace(",", " ")
+    await message.answer(
+        f"Возврат по заявке #{case.id} учтен.\n"
+        f"Платеж: <code>{h(payment.label)}</code>\n"
+        f"Сумма: {amount_text} ₽"
+    )
+
+
 @router.callback_query(F.data == "admin:panel")
 async def cb_admin(callback: CallbackQuery, current_user: User) -> None:
     if await _ensure_admin_callback(callback, current_user):
@@ -145,6 +186,29 @@ async def cb_cases(callback: CallbackQuery, session: AsyncSession, current_user:
     await callback.message.answer(
         f"<b>📋 Заявки</b>\n\nПоказано по {PAGE_SIZE} на странице. Выберите заявку:",
         reply_markup=admin_cases_page(items, page, total_pages, "admin:cases"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:problem_cases"))
+async def cb_problem_cases(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    page = int(callback.data.split(":")[-1]) if callback.data.startswith("admin:problem_cases:") else 0
+    cases, total, errors = await problem_cases_page(session, page, PAGE_SIZE)
+    total_pages = max(1, math.ceil(total / PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    if not cases:
+        await callback.message.answer("Проблемных заявок пока нет.", reply_markup=admin_panel(payments_enabled()))
+        await callback.answer()
+        return
+    items = []
+    for case in cases:
+        await session.refresh(case, ["user"])
+        items.append((case.id, _case_button_label(case, errors.get(case.id))))
+    await callback.message.answer(
+        f"<b>⚠️ Проблемные заявки</b>\n\nПоказано по {PAGE_SIZE} на странице. Выберите заявку:",
+        reply_markup=admin_cases_page(items, page, total_pages, "admin:problem_cases"),
     )
     await callback.answer()
 
@@ -227,6 +291,9 @@ async def cb_case_detail(callback: CallbackQuery, session: AsyncSession, current
         + "\n".join(crm_lines)
         + ("\n".join(usage_lines) if usages else "")
     )
+    problem_error = await problem_case_error_text(session, case.id)
+    if problem_error:
+        text += f"\n\n<b>Ошибка:</b> {h(problem_error)}"
     paid = case.status in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}
     path_text = await client_path_text(session, case.id)
     file_rows = [
@@ -304,11 +371,7 @@ async def cb_stats(callback: CallbackQuery, session: AsyncSession, current_user:
     platform_total = telegram_users + max_users
     telegram_percent = round(telegram_users * 100 / platform_total) if platform_total else 0
     max_percent = round(max_users * 100 / platform_total) if platform_total else 0
-    paid_filter = Payment.status == PaymentStatus.PAID.value
-    payment_count = int(await session.scalar(select(func.count(Payment.id)).where(paid_filter)) or 0)
-    payment_sum = int(await session.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).where(paid_filter)) or 0)
-    yookassa_count = int(await session.scalar(select(func.count(Payment.id)).where(paid_filter, Payment.provider == 'yookassa')) or 0)
-    yookassa_sum = int(await session.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).where(paid_filter, Payment.provider == 'yookassa')) or 0)
+    payment_count, payment_sum, yookassa_count, yookassa_sum = await net_payment_totals(session)
     payments_text = f'<b>Оплаты</b>\nYooKassa: {yookassa_count} оплат, {yookassa_sum:,} ₽\nВсего успешных: {payment_count} оплат, {payment_sum:,} ₽\n\n'.replace(',', ' ')
     await callback.message.answer(
         "<b>Статистика</b>\n\n"

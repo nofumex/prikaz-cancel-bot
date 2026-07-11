@@ -7,12 +7,18 @@ from app.services.cases import set_received_date
 from app.services.crm_background import schedule_crm_sync
 from app.utils import parse_russian_date
 
-DATE_PROMPT = (
-    'Введите дату получения судебного приказа в формате ДД.ММ.ГГГГ, например: 10.07.2026\n\n'
-    'Можно написать через точку, пробел, слэш, запятую или дефис: '
-    '10.07.2026, 10 07 2026, 10/07/26.'
-)
 DATE_PARSE_ERROR = 'Не удалось понять дату. Введите дату в формате ДД.ММ.ГГГГ, например 10.07.2026'
+
+
+def received_date_prompt_text(today: date | None = None) -> str:
+    current = (today or date.today()).strftime('%d.%m.%Y')
+    return (
+        '<b>✅ Приказ распознан.</b>\n\n'
+        'Укажите дату получения судебного приказа.\n\n'
+        'Например, если получили сегодня, отправьте:\n\n'
+        f'<code>{current}</code>\n\n'
+        'После этого я посчитаю срок и подготовлю preview заявления.'
+    )
 
 
 def validate_received_date(case, raw: str | None, *, today: date | None = None) -> tuple[date | None, str | None]:

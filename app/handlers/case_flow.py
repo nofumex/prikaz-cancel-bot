@@ -42,7 +42,7 @@ from app.services.legal_data import (
 )
 from app.services.llm import extract_envelope_date, extract_order_amounts, extract_order_data
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
-from app.services.received_date import DATE_PROMPT, save_received_date, validate_received_date
+from app.services.received_date import received_date_prompt_text, save_received_date, validate_received_date
 from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaError, YooKassaReceiptContactRequired
 from app.texts import case_summary, manual_received_date_prompt_text, payment_text
@@ -434,7 +434,7 @@ async def _extract_and_process_order(
     if not case.received_date:
         await state.update_data(case_id=case.id)
         await state.set_state(CaseStates.waiting_manual_date)
-        await message.answer('✅ Приказ распознан.\n\n' + DATE_PROMPT)
+        await message.answer(received_date_prompt_text())
         return
 
     if settings.show_user_confirmation_step:

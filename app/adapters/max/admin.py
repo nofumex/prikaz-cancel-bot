@@ -12,15 +12,15 @@ from app.adapters.max.client import MaxBotClient
 from app.adapters.max.mapper import IncomingEvent
 from app.adapters.max.state import max_state_manager
 from app.config import Settings
-from app.enums import CaseStatus, PaymentStatus
-from app.models import Case, CrmSyncLog, OpenAIUsage, Payment, User
+from app.enums import CaseStatus
+from app.models import Case, CrmSyncLog, OpenAIUsage, User
 from app.services.amocrm import get_amocrm_service
 from app.services.app_settings import payments_enabled, toggle_payments
-from app.services.admin_reporting import client_path_text
+from app.services.admin_reporting import client_path_text, problem_case_error_text, problem_cases_page
 from app.services.amount_recovery import format_amount_mismatch_admin_report
 from app.services.document_delivery import schedule_document_delivery
 from app.services.legal_data import FIELD_LABELS, normalize_order_data
-from app.services.payments import mark_paid_by_label
+from app.services.payments import mark_paid_by_label, net_payment_totals, record_manual_refund
 from app.texts import case_summary
 from app.utils import full_name, h, username_text
 
@@ -34,6 +34,15 @@ async def _send(client: MaxBotClient, event: IncomingEvent, text: str, keyboard=
 
 def _money(value: float | None) -> str:
     return chr(36) + f'{(value or 0.0):.4f}'
+
+
+def _case_button_label(case: Case, error: str | None = None) -> str:
+    date = case.created_at.strftime('%d.%m') if case.created_at else ''
+    label = f'#{case.id} • {date} • {full_name(case.user)}'
+    if error:
+        trimmed = ' '.join(error.split())
+        label = f'{label} • Ошибка: {trimmed[:60]}'
+    return label
 
 
 async def _deny(client: MaxBotClient, event: IncomingEvent, user: User, manager: bool = False) -> bool:
@@ -78,6 +87,20 @@ async def _show_cases(client, event, session, user: User, payments_only: bool, p
     await _send(client, event, text, keyboards.admin_cases_page(items, page, pages, prefix))
 
 
+async def _show_problem_cases(client, event, session, user: User, page: int) -> None:
+    cases, total, errors = await problem_cases_page(session, page, PAGE_SIZE)
+    pages = max(1, math.ceil(total / PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    if not cases:
+        await _send(client, event, 'Проблемных заявок пока нет.', keyboards.admin_panel(payments_enabled()))
+        return
+    items = []
+    for case in cases:
+        await session.refresh(case, ['user'])
+        items.append((case.id, _case_button_label(case, errors.get(case.id))))
+    await _send(client, event, f'<b>⚠️ Проблемные заявки</b>\n\nПоказано по {PAGE_SIZE} на странице. Выберите заявку:', keyboards.admin_cases_page(items, page, pages, 'admin:problem_cases'))
+
+
 async def _show_case(client, event, session, data: str) -> None:
     _, _, case_id, prefix, page = data.split(':')
     case = await session.get(Case, int(case_id))
@@ -107,6 +130,9 @@ async def _show_case(client, event, session, data: str) -> None:
         + ('\nОшибка: ' + h(case.amocrm_sync_error) if case.amocrm_sync_error else '')
         + usage_text
     )
+    problem_error = await problem_case_error_text(session, case.id)
+    if problem_error:
+        text += f'\n\n<b>Ошибка:</b> {h(problem_error)}'
     paid = case.status in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}
     path_text = await client_path_text(session, case.id)
     text += '\n\n<b>Путь клиента:</b>\n' + path_text
@@ -141,11 +167,7 @@ async def _show_stats(client, event, session) -> None:
     platform_total = telegram_users + max_users
     telegram_percent = round(telegram_users * 100 / platform_total) if platform_total else 0
     max_percent = round(max_users * 100 / platform_total) if platform_total else 0
-    paid_filter = Payment.status == PaymentStatus.PAID.value
-    payment_count = int(await session.scalar(select(func.count(Payment.id)).where(paid_filter)) or 0)
-    payment_sum = int(await session.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).where(paid_filter)) or 0)
-    yookassa_count = int(await session.scalar(select(func.count(Payment.id)).where(paid_filter, Payment.provider == 'yookassa')) or 0)
-    yookassa_sum = int(await session.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).where(paid_filter, Payment.provider == 'yookassa')) or 0)
+    payment_count, payment_sum, yookassa_count, yookassa_sum = await net_payment_totals(session)
     text = (
         '<b>Статистика</b>\n\n'
         + f'Пользователей: {users}\nЗаявлений всего: {cases}\nОжидают оплату: {pending}\nОплачено/выдано: {paid}\n\n'
@@ -187,7 +209,7 @@ async def handle_admin_update(
         return True
     data = event.callback_data
     command = (event.text or '').strip().lower()
-    admin_action = command == '/admin' or bool(data and data.startswith('admin:'))
+    admin_action = command in {'/admin', '/refund'} or bool(data and data.startswith('admin:'))
     manager_action = command == '/manager' or data == 'manager:cases'
     if not admin_action and not manager_action:
         return False
@@ -201,6 +223,30 @@ async def handle_admin_update(
         return True
     if await _deny(client, event, user):
         return True
+    if command == '/refund':
+        parts = (event.text or '').strip().split(maxsplit=1)
+        if len(parts) < 2:
+            await _send(client, event, 'Использование: /refund CASE_ID')
+            return True
+        try:
+            case_id = int(parts[1].strip())
+        except ValueError:
+            await _send(client, event, 'Использование: /refund CASE_ID')
+            return True
+        case = await session.get(Case, case_id)
+        if not case:
+            await _send(client, event, 'Заявка не найдена.')
+            return True
+        payment, applied = await record_manual_refund(session, case, user)
+        if not payment:
+            await _send(client, event, 'По заявке нет успешной оплаты')
+            return True
+        if not applied:
+            await _send(client, event, 'Возврат по этой заявке уже учтен')
+            return True
+        amount_text = f'{payment.amount:,}'.replace(',', ' ')
+        await _send(client, event, f'Возврат по заявке #{case.id} учтен.\nПлатеж: <code>{h(payment.label)}</code>\nСумма: {amount_text} ₽')
+        return True
     if command == '/admin' or data == 'admin:panel':
         await _send(client, event, '<b>⚙️ Админ-панель</b>', keyboards.admin_panel(payments_enabled()))
     elif data == 'admin:noop':
@@ -211,6 +257,9 @@ async def handle_admin_update(
     elif data and data.startswith('admin:payments'):
         page = int(data.split(':')[-1]) if data.startswith('admin:payments:') else 0
         await _show_cases(client, event, session, user, True, page)
+    elif data and data.startswith('admin:problem_cases'):
+        page = int(data.split(':')[-1]) if data.startswith('admin:problem_cases:') else 0
+        await _show_problem_cases(client, event, session, user, page)
     elif data and data.startswith('admin:case:'):
         await _show_case(client, event, session, data)
     elif data == 'admin:stats':

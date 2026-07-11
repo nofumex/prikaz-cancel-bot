@@ -24,12 +24,14 @@ from app.services.documents import MANUAL_REVIEW_USER_TEXT, create_case_document
 from app.services.legal_data import FIELD_LABELS, is_deadline_missed, missing_order_fields, normalize_debtor_name_fields, normalize_order_data, suggest_nominative_full_name, validate_before_generation
 from app.services.llm import extract_envelope_date, extract_order_data
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
-from app.services.received_date import DATE_PROMPT, save_received_date, validate_received_date
+from app.services.received_date import received_date_prompt_text, save_received_date, validate_received_date
 from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaReceiptContactRequired
 from app.services.users import get_or_create_platform_user
 from app.texts import case_summary, help_text, manual_received_date_prompt_text, payment_text, profile_text, welcome_text
 from app.utils import ensure_dir, h, normalize_receipt_contact, parse_russian_date
+
+DATE_PROMPT = received_date_prompt_text()
 
 logger = logging.getLogger(__name__)
 
@@ -673,7 +675,7 @@ async def _extract_and_process_order(client: MaxBotClient, event: IncomingEvent,
         return
     if not case.received_date:
         await _set_state(session, event, STATE_MANUAL_DATE, {'case_id': case.id})
-        await _send(client, event, '✅ Приказ распознан.\n\n' + DATE_PROMPT)
+        await _send(client, event, received_date_prompt_text())
         return
     if settings.show_user_confirmation_step:
         await _send(client, event, extraction_preview(extracted, case.received_date, missing, case.deadline_date), keyboards.confirm_extraction())

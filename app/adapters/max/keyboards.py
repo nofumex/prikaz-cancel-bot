@@ -137,7 +137,7 @@ def admin_panel(payments_enabled: bool = True) -> MaxKeyboard:
         [btn(payment_text, "admin:toggle_payments")],
         [btn("📋 Заявки", "admin:cases:0"), btn("⏳ Ожидают оплату", "admin:payments:0")],
         [btn("📊 Статистика", "admin:stats"), btn("📊 CRM-статистика", "admin:crm_stats")],
-        [btn("🔧 Проверить amoCRM", "admin:check_crm"), btn("👥 Менеджеры", "admin:managers")],
+        [btn("⚠️ Проблемные заявки", "admin:problem_cases:0"), btn("👥 Менеджеры", "admin:managers")],
         [btn("🏠 Главное меню", "menu:main")],
     ]
 

@@ -160,7 +160,14 @@ async def test_telegram_order_without_received_date_prompts_for_date(monkeypatch
     assert mock_generate.await_count == 0
     assert state.set_state.await_count == 1
     assert state.set_state.await_args.args[0].state == CaseStates.waiting_manual_date.state
-    assert "Введите дату получения" in message.answer.await_args.args[0]
+
+    text = message.answer.await_args.args[0]
+    assert "<b>✅ Приказ распознан.</b>" in text
+    assert "Укажите дату получения судебного приказа." in text
+    assert "<code>" in text
+    assert "</code>" in text
+    assert "Введите дату получения" not in text
+    
     assert message.answer_document.await_count == 0
 
 

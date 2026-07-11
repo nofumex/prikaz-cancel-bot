@@ -143,6 +143,7 @@ class Payment(Base):
     raw_notification: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime)
+    refunded_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     case: Mapped[Case] = relationship(lazy="selectin")
 

@@ -64,6 +64,7 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("provider", "provider TEXT NOT NULL DEFAULT 'yoomoney'"),
             ("external_payment_id", "external_payment_id TEXT"),
             ("confirmation_url", "confirmation_url TEXT"),
+            ("refunded_at", "refunded_at DATETIME"),
         ],
     )
     added_user_columns = await _sqlite_add_columns(
