@@ -7,7 +7,15 @@ from app.utils import ensure_dir
 
 
 SETTINGS_PATH = Path("data/app_settings.json")
-DEFAULTS = {"payments_enabled": True}
+DEFAULTS = {
+    'payments_enabled': True,
+    'reminder_try_text': 'Вы начали знакомство с ботом, но еще не отправили судебный приказ. Нажмите кнопку ниже, чтобы попробовать подготовить заявление.',
+    'reminder_pay_text': 'Предпросмотр заявления готов, но оплата еще не завершена. Не откладывайте: срок подачи заявления ограничен.',
+    'reminder_consultation_text': 'Документы готовы. Если нужна помощь с дальнейшими действиями, можно связаться с менеджером и получить консультацию.',
+    'reminder_try_hours': 24,
+    'reminder_pay_hours': 24,
+    'reminder_consultation_hours': 24,
+}
 
 
 def load_app_settings() -> dict:
@@ -38,3 +46,15 @@ def toggle_payments() -> bool:
     data["payments_enabled"] = not bool(data.get("payments_enabled", True))
     save_app_settings(data)
     return bool(data["payments_enabled"])
+
+
+def reminder_settings() -> dict:
+    return load_app_settings()
+
+
+def update_reminder_setting(key: str, value) -> None:
+    if key not in DEFAULTS or not key.startswith('reminder_'):
+        raise ValueError('Unknown reminder setting')
+    data = load_app_settings()
+    data[key] = value
+    save_app_settings(data)

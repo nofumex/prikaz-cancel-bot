@@ -16,6 +16,8 @@ from app.enums import CaseStatus
 from app.models import Case, CrmSyncLog, OpenAIUsage, User
 from app.services.amocrm import get_amocrm_service
 from app.services.app_settings import payments_enabled, toggle_payments
+from app.services.app_settings import reminder_settings, update_reminder_setting
+from app.services.reminder_center import reminder_counts, reminder_dashboard_text, send_manual_reminders
 from app.services.admin_reporting import client_path_text, problem_case_error_text, problem_cases_page
 from app.services.amount_recovery import format_amount_mismatch_admin_report
 from app.services.document_delivery import schedule_document_delivery
@@ -207,9 +209,24 @@ async def handle_admin_update(
         await max_state_manager.clear(session, 'max', event.platform_user_id)
         await _send(client, event, f'✅ Поле {FIELD_LABELS.get(field, field)} обновлено: {value}')
         return True
+    if user.is_admin and admin_state == 'max_broadcast_setting' and event.text:
+        state_data = await max_state_manager.get_data(session, 'max', event.platform_user_id)
+        value = event.text.strip()
+        if state_data['value_type'] == 'hours':
+            if not value.isdigit() or not 1 <= int(value) <= 720:
+                await _send(client, event, 'Введите целое число часов от 1 до 720.')
+                return True
+            value = int(value)
+        elif not value:
+            await _send(client, event, 'Текст не должен быть пустым.')
+            return True
+        update_reminder_setting(state_data['key'], value)
+        await max_state_manager.clear(session, 'max', event.platform_user_id)
+        await _send(client, event, '✅ Настройка сохранена.', keyboards.broadcast_settings_menu())
+        return True
     data = event.callback_data
     command = (event.text or '').strip().lower()
-    admin_action = command in {'/admin', '/refund'} or bool(data and data.startswith('admin:'))
+    admin_action = command in {'/admin', '/refund'} or bool(data and (data.startswith('admin:') or data.startswith('broadcast:')))
     manager_action = command == '/manager' or data == 'manager:cases'
     if not admin_action and not manager_action:
         return False
@@ -274,6 +291,42 @@ async def handle_admin_update(
 
 
 async def _handle_admin_action(client, event, settings, session, user, data, generate_documents) -> bool:
+    if data == 'admin:broadcasts':
+        await _send(client, event, reminder_dashboard_text(await reminder_counts(session)), keyboards.broadcast_menu())
+        return True
+    if data and data.startswith('broadcast:ask:'):
+        kind = data.split(':')[-1]
+        count = (await reminder_counts(session))[kind]['pending']
+        labels = {'try': 'напоминание попробовать', 'pay': 'напоминание оплатить', 'consultation': 'предложение консультации'}
+        await _send(client, event, f'Отправить «{labels[kind]}» пользователям: <b>{count}</b>?', keyboards.broadcast_confirm(kind))
+        return True
+    if data and data.startswith('broadcast:send:'):
+        kind = data.split(':')[-1]
+        await _send(client, event, '⏳ Рассылка началась...')
+        sent, failed = await send_manual_reminders(session, settings, None, kind)
+        await _send(client, event, f'✅ Рассылка завершена. Отправлено: {sent}. Ошибок: {failed}.', keyboards.broadcast_menu())
+        return True
+    if data == 'broadcast:settings':
+        cfg = reminder_settings()
+        try_hours = cfg['reminder_try_hours']
+        pay_hours = cfg['reminder_pay_hours']
+        consultation_hours = cfg['reminder_consultation_hours']
+        text = (
+            '<b>⚙️ Настройки напоминаний</b>\n\n'
+            f'Попробовать: через {try_hours} ч.\n'
+            f'Оплатить: через {pay_hours} ч.\n'
+            f'Консультация: через {consultation_hours} ч.'
+        )
+        await _send(client, event, text, keyboards.broadcast_settings_menu())
+        return True
+    if data and data.startswith('broadcast:edit:'):
+        _, _, value_type, kind = data.split(':')
+        key = f'reminder_{kind}_{value_type}' if value_type == 'text' else f'reminder_{kind}_hours'
+        current = reminder_settings()[key]
+        await max_state_manager.set_state(session, 'max', event.platform_user_id, 'max_broadcast_setting', {'key': key, 'value_type': value_type})
+        prompt = 'Введите новый текст напоминания:' if value_type == 'text' else 'Введите задержку в часах (1–720):'
+        await _send(client, event, f'{prompt}\n\nСейчас: <code>{h(current)}</code>')
+        return True
     if data and data.startswith('admin:user:'):
         case = await session.get(Case, int(data.split(':')[-1]))
         if not case:

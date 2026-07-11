@@ -16,11 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 
 from app.enums import CaseStatus
-from app.keyboards.common import admin_case_actions, admin_cases_page, admin_panel, btn, manager_panel
+from app.keyboards.common import admin_case_actions, admin_cases_page, admin_panel, broadcast_confirm, broadcast_menu, broadcast_settings_menu, btn, manager_panel
 from app.models import Case, CrmSyncLog, OpenAIUsage, User
 from app.services.admin_reporting import client_path_text, problem_case_error_text, problem_cases_page
 from app.services.amocrm import get_amocrm_service
 from app.services.app_settings import payments_enabled, toggle_payments
+from app.services.app_settings import reminder_settings, update_reminder_setting
+from app.services.reminder_center import reminder_counts, reminder_dashboard_text, send_manual_reminders
 from app.services.document_delivery import schedule_document_delivery
 from app.services.payments import mark_paid_by_label, net_payment_totals, record_manual_refund
 from app.texts import case_summary
@@ -33,6 +35,10 @@ PAGE_SIZE = 5
 
 class AdminAmountStates(StatesGroup):
     waiting_amount_value = State()
+
+
+class BroadcastStates(StatesGroup):
+    waiting_value = State()
 
 
 def _money_usd(value: float | None) -> str:
@@ -153,6 +159,88 @@ async def cb_admin(callback: CallbackQuery, current_user: User) -> None:
 @router.callback_query(F.data == "admin:noop")
 async def cb_admin_noop(callback: CallbackQuery) -> None:
     await callback.answer()
+
+
+@router.callback_query(F.data == 'admin:broadcasts')
+async def cb_broadcasts(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    counts = await reminder_counts(session)
+    await callback.message.answer(reminder_dashboard_text(counts), reply_markup=broadcast_menu())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith('broadcast:ask:'))
+async def cb_broadcast_ask(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    kind = callback.data.split(':')[-1]
+    count = (await reminder_counts(session))[kind]['pending']
+    labels = {'try': 'напоминание попробовать', 'pay': 'напоминание оплатить', 'consultation': 'предложение консультации'}
+    await callback.message.answer(f'Отправить «{labels[kind]}» пользователям: <b>{count}</b>?', reply_markup=broadcast_confirm(kind))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith('broadcast:send:'))
+async def cb_broadcast_send(callback: CallbackQuery, bot: Bot, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    kind = callback.data.split(':')[-1]
+    await callback.answer('Рассылка запущена')
+    await callback.message.answer('⏳ Рассылка началась...')
+    sent, failed = await send_manual_reminders(session, settings, bot, kind)
+    await callback.message.answer(f'✅ Рассылка завершена. Отправлено: {sent}. Ошибок: {failed}.', reply_markup=broadcast_menu())
+
+
+@router.callback_query(F.data == 'broadcast:settings')
+async def cb_broadcast_settings(callback: CallbackQuery, current_user: User) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    cfg = reminder_settings()
+    try_hours = cfg['reminder_try_hours']
+    pay_hours = cfg['reminder_pay_hours']
+    consultation_hours = cfg['reminder_consultation_hours']
+    text = (
+        '<b>⚙️ Настройки напоминаний</b>\n\n'
+        f'Попробовать: через {try_hours} ч.\n'
+        f'Оплатить: через {pay_hours} ч.\n'
+        f'Консультация: через {consultation_hours} ч.'
+    )
+    await callback.message.answer(text, reply_markup=broadcast_settings_menu())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith('broadcast:edit:'))
+async def cb_broadcast_edit(callback: CallbackQuery, state: FSMContext, current_user: User) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    _, _, value_type, kind = callback.data.split(':')
+    key = f'reminder_{kind}_{value_type}' if value_type == 'text' else f'reminder_{kind}_hours'
+    current = reminder_settings()[key]
+    await state.update_data(broadcast_setting_key=key, broadcast_value_type=value_type)
+    await state.set_state(BroadcastStates.waiting_value)
+    prompt = 'Введите новый текст напоминания:' if value_type == 'text' else 'Введите задержку в часах (1–720):'
+    await callback.message.answer(f'{prompt}\n\nСейчас: <code>{h(current)}</code>')
+    await callback.answer()
+
+
+@router.message(BroadcastStates.waiting_value)
+async def receive_broadcast_setting(message: Message, state: FSMContext, current_user: User) -> None:
+    if not await _ensure_admin_message(message, current_user):
+        return
+    data = await state.get_data()
+    value = (message.text or '').strip()
+    if data['broadcast_value_type'] == 'hours':
+        if not value.isdigit() or not 1 <= int(value) <= 720:
+            await message.answer('Введите целое число часов от 1 до 720.')
+            return
+        value = int(value)
+    elif not value:
+        await message.answer('Текст не должен быть пустым.')
+        return
+    update_reminder_setting(data['broadcast_setting_key'], value)
+    await state.clear()
+    await message.answer('✅ Настройка сохранена.', reply_markup=broadcast_settings_menu())
 
 
 @router.message(Command("manager"))

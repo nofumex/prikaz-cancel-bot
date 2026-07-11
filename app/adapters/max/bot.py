@@ -24,6 +24,7 @@ from app.services.documents import MANUAL_REVIEW_USER_TEXT, create_case_document
 from app.services.legal_data import FIELD_LABELS, is_deadline_missed, missing_order_fields, normalize_debtor_name_fields, normalize_order_data, suggest_nominative_full_name, validate_before_generation
 from app.services.llm import extract_envelope_date, extract_order_data
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
+from app.services.paid_correction import regenerate_paid_case
 from app.services.received_date import received_date_prompt_text, save_received_date, validate_received_date
 from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaReceiptContactRequired
@@ -42,6 +43,7 @@ STATE_MANUAL_DATE = "max_waiting_manual_date"
 STATE_FIELD_VALUE = "max_waiting_field_value"
 STATE_PAYMENT_CONTACT = 'max_waiting_payment_contact'
 STATE_RESTORE_REASON = 'max_waiting_restore_reason'
+STATE_PAID_FIELD = 'max_waiting_paid_field'
 
 
 async def _send(client: MaxBotClient, event: IncomingEvent, text: str, keyboard=None) -> None:
@@ -412,6 +414,44 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             schedule_crm_sync(settings, case.id, user.id, "case_data_confirmed", {"note": "MAX: данные подтверждены"})
             await _generate_documents(client, event, session, settings, user, case)
             return
+        if data == 'paid:correction:start':
+            case = await latest_case(session, user.id)
+            if not case or case.status not in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}:
+                await _send(client, event, 'Оплаченное заявление не найдено.')
+                return
+            schedule_crm_sync(settings, case.id, user.id, 'paid_document_correction_started', {'note': 'Пользователь сообщил: данные в заявлении неверные'})
+            await _send(client, event, '<b>✏️ Что нужно исправить?</b>\n\nВыберите поле и отправьте новое значение.', keyboards.paid_edit_fields_menu())
+            return
+        if data and data.startswith('paid:field:'):
+            case = await latest_case(session, user.id)
+            if not case or case.status not in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}:
+                await _send(client, event, 'Оплаченное заявление не найдено.')
+                return
+            field = data.split(':')[-1]
+            extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+            await _set_state(session, event, STATE_PAID_FIELD, {'case_id': case.id, 'field': field})
+            schedule_crm_sync(settings, case.id, user.id, 'paid_document_field_selected', {'note': f'Выбрано поле: {FIELD_LABELS.get(field, field)}'})
+            current = extracted.get(field) or 'не указано'
+            await _send(client, event, f'Текущее значение поля <b>{FIELD_LABELS.get(field, field)}</b>:\n<code>{h(current)}</code>\n\nНапишите верное значение.')
+            return
+        if data == 'paid:review':
+            case = await latest_case(session, user.id)
+            if not case:
+                await _send(client, event, 'Заявление не найдено.')
+                return
+            extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+            await _send(client, event, '<b>Проверьте данные</b>\n\n' + extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.paid_review_menu())
+            return
+        if data == 'paid:regenerate':
+            case = await latest_case(session, user.id)
+            if not case or case.status not in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}:
+                await _send(client, event, 'Оплаченное заявление не найдено.')
+                return
+            await _send(client, event, '🔄 Перегенерирую заявление с исправленными данными...')
+            artifacts = await regenerate_paid_case(session, settings, case, user)
+            await client.send_file(event.chat_id, artifacts.full_docx_path, caption='✅ Исправленное заявление готово.')
+            await _send(client, event, 'Проверьте исправленное заявление.', keyboards.paid_document_actions())
+            return
         if data and data.startswith('case:restore_reason:'):
             case = await latest_open_case(session, user.id)
             if not case:
@@ -483,6 +523,23 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             return
         if current_state == STATE_FIELD_VALUE and event.text:
             await _handle_field_value(client, event, session, user, event.text)
+            return
+        if current_state == STATE_PAID_FIELD and event.text:
+            state_data = await _state_data(session, event)
+            case = await session.get(Case, state_data['case_id'])
+            field = state_data['field']
+            value = event.text.strip()
+            if not value:
+                await _send(client, event, 'Значение не должно быть пустым.')
+                return
+            extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+            extracted[field] = value
+            extracted = normalize_order_data(extracted)
+            case.extracted_json = json.dumps(extracted, ensure_ascii=False)
+            await session.commit()
+            await _clear_state(session, event)
+            schedule_crm_sync(settings, case.id, user.id, 'paid_document_field_corrected', {'note': f'Исправил поле: {FIELD_LABELS.get(field, field)}'})
+            await _send(client, event, '<b>Проверьте данные</b>\n\n' + extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.paid_review_menu())
             return
         if current_state == STATE_RESTORE_REASON and event.text:
             state_data = await _state_data(session, event)

@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.enums import CaseStatus, PaymentStatus
-from app.keyboards.common import case_menu, confirm_extraction, debtor_name_fix_menu, edit_fields_menu, envelope_choice, main_menu, order_rephoto_menu, restore_reason_menu
+from app.keyboards.common import case_menu, confirm_extraction, debtor_name_fix_menu, edit_fields_menu, envelope_choice, main_menu, order_rephoto_menu, paid_document_actions, paid_edit_fields_menu, paid_review_menu, restore_reason_menu
 from app.models import Case, Payment, User
 from app.services.amocrm import get_amocrm_service
 from app.services.crm_background import schedule_crm_sync
@@ -42,6 +42,7 @@ from app.services.legal_data import (
 )
 from app.services.llm import extract_envelope_date, extract_order_amounts, extract_order_data
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
+from app.services.paid_correction import regenerate_paid_case
 from app.services.received_date import received_date_prompt_text, save_received_date, validate_received_date
 from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaError, YooKassaReceiptContactRequired
@@ -63,6 +64,7 @@ class CaseStates(StatesGroup):
     waiting_payment_contact = State()
     waiting_restore_reason = State()
     waiting_restore_reason_custom = State()
+    waiting_paid_field_value = State()
 
 
 async def _download_photo(bot: Bot, message: Message, case_id: int, kind: str) -> Path:
@@ -887,7 +889,77 @@ async def receive_restore_reason_custom(message: Message, state: FSMContext, ses
     await _generate_documents_flow(message, session, settings, current_user, case, state=state, restore_reason=extracted["restore_reason"])
 
 
-@router.callback_query(F.data == "payment:check")
+@router.callback_query(F.data == 'paid:correction:start')
+async def paid_correction_start(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    case = await latest_case(session, current_user.id)
+    if not case or case.status not in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}:
+        await callback.answer('Оплаченное заявление не найдено.', show_alert=True)
+        return
+    schedule_crm_sync(settings, case.id, current_user.id, 'paid_document_correction_started', {'note': 'Пользователь сообщил: данные в заявлении неверные'})
+    await callback.message.answer('<b>✏️ Что нужно исправить?</b>\n\nВыберите поле и отправьте новое значение.', reply_markup=paid_edit_fields_menu())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith('paid:field:'))
+async def paid_field_selected(callback: CallbackQuery, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    case = await latest_case(session, current_user.id)
+    if not case or case.status not in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}:
+        await callback.answer('Оплаченное заявление не найдено.', show_alert=True)
+        return
+    field = callback.data.split(':')[-1]
+    extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    await state.update_data(case_id=case.id, paid_field=field)
+    await state.set_state(CaseStates.waiting_paid_field_value)
+    schedule_crm_sync(settings, case.id, current_user.id, 'paid_document_field_selected', {'note': f'Выбрано поле: {FIELD_LABELS.get(field, field)}'})
+    current = extracted.get(field) or 'не указано'
+    await callback.message.answer(f'Текущее значение поля <b>{FIELD_LABELS.get(field, field)}</b>:\n<code>{h(current)}</code>\n\nНапишите верное значение.')
+    await callback.answer()
+
+
+@router.message(CaseStates.waiting_paid_field_value)
+async def paid_field_value(message: Message, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    state_data = await state.get_data()
+    case = await session.get(Case, state_data['case_id'])
+    field = state_data['paid_field']
+    value = (message.text or '').strip()
+    if not value:
+        await message.answer('Значение не должно быть пустым.')
+        return
+    extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    extracted[field] = value
+    extracted = normalize_order_data(extracted)
+    case.extracted_json = json.dumps(extracted, ensure_ascii=False)
+    await session.commit()
+    await state.clear()
+    schedule_crm_sync(settings, case.id, current_user.id, 'paid_document_field_corrected', {'note': f'Исправил поле: {FIELD_LABELS.get(field, field)}'})
+    await message.answer('<b>Проверьте данные</b>\n\n' + extraction_preview(extracted, case.received_date, [], case.deadline_date), reply_markup=paid_review_menu())
+
+
+@router.callback_query(F.data == 'paid:review')
+async def paid_review(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+    case = await latest_case(session, current_user.id)
+    if not case:
+        await callback.answer('Заявление не найдено.', show_alert=True)
+        return
+    extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    text = '<b>Проверьте данные</b>\n\n' + extraction_preview(extracted, case.received_date, [], case.deadline_date)
+    await callback.message.answer(text, reply_markup=paid_review_menu())
+    await callback.answer()
+
+
+@router.callback_query(F.data == 'paid:regenerate')
+async def paid_regenerate(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    case = await latest_case(session, current_user.id)
+    if not case or case.status not in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}:
+        await callback.answer('Оплаченное заявление не найдено.', show_alert=True)
+        return
+    await callback.message.answer('🔄 Перегенерирую заявление с исправленными данными...')
+    artifacts = await regenerate_paid_case(session, settings, case, current_user)
+    await callback.message.answer_document(FSInputFile(artifacts.full_docx_path), caption='✅ Исправленное заявление готово.', reply_markup=paid_document_actions())
+    await callback.answer()
+
+
+@router.callback_query(F.data == 'payment:check')
 async def payment_check(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User) -> None:
     case = await latest_open_case(session, current_user.id)
     if not case:

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.enums import CaseStatus, PaymentStatus
 from app.models import Case, Payment, User
 from app.services.legal_data import legal_deadline_from_received
+from app.services.app_settings import reminder_settings
 
 
 ACTIVE_FINAL_STATUSES = {CaseStatus.PAID.value, CaseStatus.DELIVERED.value, CaseStatus.CANCELED.value, CaseStatus.SUPERSEDED.value}
@@ -108,7 +109,7 @@ def new_payment_label(case_id: int) -> str:
 
 async def due_unpaid_cases(session: AsyncSession) -> list[Case]:
     now = datetime.utcnow()
-    due_24h = now - timedelta(hours=24)
+    due_24h = now - timedelta(hours=int(reminder_settings()['reminder_pay_hours']))
     latest_active_unpaid_ids = (
         select(func.max(Case.id))
         .join(Payment, Payment.case_id == Case.id)
@@ -136,7 +137,7 @@ async def due_unpaid_cases(session: AsyncSession) -> list[Case]:
 
 async def due_no_order_cases(session: AsyncSession) -> list[Case]:
     now = datetime.utcnow()
-    due_24h = now - timedelta(hours=24)
+    due_24h = now - timedelta(hours=int(reminder_settings()['reminder_try_hours']))
     waiting_statuses = [CaseStatus.WAITING_ORDER_PHOTO.value, CaseStatus.WAITING_ORDER_REPHOTO.value]
     latest_waiting_ids = (
         select(func.max(Case.id))
@@ -161,7 +162,7 @@ async def due_no_order_cases(session: AsyncSession) -> list[Case]:
 
 async def due_started_users_without_cases(session: AsyncSession) -> list[User]:
     now = datetime.utcnow()
-    due_24h = now - timedelta(hours=24)
+    due_24h = now - timedelta(hours=int(reminder_settings()['reminder_try_hours']))
     case_exists = select(Case.id).where(Case.user_id == User.id).exists()
     result = await session.execute(
         select(User)
@@ -197,15 +198,16 @@ async def due_paid_followup_cases(session: AsyncSession) -> list[Case]:
 
 async def due_case_consultation_reminders(session: AsyncSession) -> list[Case]:
     now = datetime.utcnow()
-    due_24h = now - timedelta(hours=24)
+    due_at = now - timedelta(hours=int(reminder_settings()['reminder_consultation_hours']))
     result = await session.execute(
         select(Case)
         .where(
             Case.status.not_in([CaseStatus.CANCELED.value, CaseStatus.SUPERSEDED.value]),
             Case.consultation_reminder_sent_at.is_(None),
             or_(
-                Case.deadline_reminder_sent_at <= due_24h,
-                Case.post_payment_followup_sent_at <= due_24h,
+                Case.deadline_reminder_sent_at <= due_at,
+                Case.post_payment_followup_sent_at <= due_at,
+                Case.paid_at <= due_at,
             ),
         )
         .order_by(Case.created_at.asc())

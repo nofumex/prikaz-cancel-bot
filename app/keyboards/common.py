@@ -131,6 +131,7 @@ def admin_panel(payments_enabled: bool = True) -> InlineKeyboardMarkup:
     payment_text = "💳 Оплата: ВКЛ" if payments_enabled else "🧪 Оплата: ВЫКЛ"
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [btn('📣 Рассылки', 'admin:broadcasts')],
             [btn(payment_text, "admin:toggle_payments")],
             [btn("📋 Заявки", "admin:cases:0"), btn("⏳ Ожидают оплату", "admin:payments:0")],
             [btn("📊 Статистика", "admin:stats"), btn("📊 CRM-статистика", "admin:crm_stats")],
@@ -138,6 +139,56 @@ def admin_panel(payments_enabled: bool = True) -> InlineKeyboardMarkup:
             [btn("🏠 Главное меню", "menu:main")],
         ]
     )
+
+
+def paid_document_actions() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[btn('❌ Данные в заявлении неверные', 'paid:correction:start')]])
+
+
+def paid_edit_fields_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn('⚖️ Суд', 'paid:field:court_name'), btn('📍 Адрес суда', 'paid:field:court_address')],
+        [btn('👤 Должник', 'paid:field:debtor_full_name'), btn('🏠 Адрес должника', 'paid:field:debtor_address')],
+        [btn('🏦 Взыскатель', 'paid:field:creditor_name'), btn('📍 Адрес взыскателя', 'paid:field:creditor_address')],
+        [btn('📄 Номер дела', 'paid:field:case_number'), btn('📅 Дата приказа', 'paid:field:order_date')],
+        [btn('🔖 УИД', 'paid:field:uid'), btn('🧾 Договор', 'paid:field:debt_contract')],
+        [btn('📆 Период', 'paid:field:debt_period'), btn('💰 Сумма долга', 'paid:field:debt_amount')],
+        [btn('⚖️ Госпошлина', 'paid:field:state_duty')],
+        [btn('↩️ Назад к проверке', 'paid:review')],
+    ])
+
+
+def paid_review_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn('✅ Все верно, пересоздать заявление', 'paid:regenerate')],
+        [btn('✏️ Исправить еще поле', 'paid:correction:start')],
+        [btn('💬 Связаться с менеджером', 'chat:start')],
+    ])
+
+
+def broadcast_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn('🚀 Напомнить попробовать', 'broadcast:ask:try')],
+        [btn('💳 Напомнить оплатить', 'broadcast:ask:pay')],
+        [btn('💬 Предложить консультацию', 'broadcast:ask:consultation')],
+        [btn('⚙️ Настройки', 'broadcast:settings')],
+        [btn('🔄 Обновить статистику', 'admin:broadcasts'), btn('↩️ Админка', 'admin:panel')],
+    ])
+
+
+def broadcast_confirm(kind: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn('✅ Да, отправить', f'broadcast:send:{kind}'), btn('❌ Нет', 'admin:broadcasts')],
+    ])
+
+
+def broadcast_settings_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn('✏️ Текст: попробовать', 'broadcast:edit:text:try'), btn('⏱ Задержка', 'broadcast:edit:hours:try')],
+        [btn('✏️ Текст: оплатить', 'broadcast:edit:text:pay'), btn('⏱ Задержка', 'broadcast:edit:hours:pay')],
+        [btn('✏️ Текст: консультация', 'broadcast:edit:text:consultation'), btn('⏱ Задержка', 'broadcast:edit:hours:consultation')],
+        [btn('↩️ К рассылкам', 'admin:broadcasts')],
+    ])
 
 
 def admin_case_actions(case_id: int, paid: bool = False, back: str = "admin:cases:0") -> InlineKeyboardMarkup:

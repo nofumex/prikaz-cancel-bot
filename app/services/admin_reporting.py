@@ -33,6 +33,10 @@ EVENT_LABELS = {
     'refund_recorded': 'Возврат учтен админом',
     'documents_invalidated': 'Документы пересоздаются после изменения даты',
     'documents_delivered': 'Получил документы',
+    'paid_document_correction_started': 'Пользователь сообщил: данные в заявлении неверные',
+    'paid_document_field_selected': 'Выбрал поле для исправления',
+    'paid_document_field_corrected': 'Исправил поле',
+    'paid_document_regenerated': 'Заявление перегенерировано после оплаты',
 }
 
 
@@ -77,6 +81,14 @@ async def client_path_text(session, case_id: int) -> str:
                 note = str(payload.get('note') or '').strip()
                 if note:
                     label = 'Проблема с OCR: ' + note[:180]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        if row.event_type == 'paid_document_field_corrected' and row.request_payload:
+            try:
+                payload = json.loads(row.request_payload).get('payload') or {}
+                note = str(payload.get('note') or '').strip()
+                if note:
+                    label = note
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
         if not label or label == previous:

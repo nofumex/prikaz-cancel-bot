@@ -22,6 +22,7 @@ from app.services.cases import (
     due_user_consultation_reminders,
 )
 from app.services.crm_background import schedule_crm_sync
+from app.services.app_settings import reminder_settings
 from app.texts import consultation_offer_text, no_order_deadline_reminder_text, post_payment_court_followup_text, unpaid_document_reminder_text
 
 logger = logging.getLogger(__name__)
@@ -33,13 +34,14 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
         try:
             async with SessionLocal() as session:
                 now = datetime.utcnow()
+                reminder_config = reminder_settings()
 
                 for user in await due_started_users_without_cases(session):
                     sent = await _send_user_message(
                         settings,
                         bot,
                         user,
-                        no_order_deadline_reminder_text(),
+                        reminder_config['reminder_try_text'],
                         telegram_markup=main_menu(),
                         max_keyboard=max_keyboards.main_menu(),
                     )
@@ -52,7 +54,7 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
                         settings,
                         bot,
                         case,
-                        no_order_deadline_reminder_text(),
+                        reminder_config['reminder_try_text'],
                         telegram_markup=main_menu(),
                         max_keyboard=max_keyboards.main_menu(),
                     )
@@ -76,7 +78,7 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
                         settings,
                         bot,
                         case,
-                        unpaid_document_reminder_text(),
+                        reminder_config['reminder_pay_text'],
                         telegram_markup=case_menu(can_pay=True, payment_url=case.payment_url),
                         max_keyboard=max_keyboards.case_menu(can_pay=True, payment_url=case.payment_url),
                     )
@@ -118,7 +120,7 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
                         settings,
                         bot,
                         case,
-                        consultation_offer_text(),
+                        reminder_config['reminder_consultation_text'],
                         telegram_markup=consultation_menu(),
                         max_keyboard=max_keyboards.consultation_menu(),
                     )
