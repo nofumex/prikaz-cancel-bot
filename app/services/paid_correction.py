@@ -4,6 +4,7 @@ import json
 
 from app.services.crm_background import schedule_crm_sync
 from app.services.documents import create_case_documents_reviewed
+from app.services.legal_data import is_deadline_missed
 
 PAID_EDITABLE_FIELDS = {
     'court_name', 'court_address', 'debtor_full_name', 'debtor_address',
@@ -28,6 +29,14 @@ def record_corrected_field(case, field: str) -> None:
     fields = corrected_fields(case)
     fields.add(field)
     case.paid_corrected_fields_json = json.dumps(sorted(fields), ensure_ascii=False)
+
+
+def paid_regeneration_requires_new_date(case) -> bool:
+    try:
+        data = json.loads(case.extracted_json or '{}')
+    except (TypeError, ValueError, json.JSONDecodeError):
+        data = {}
+    return is_deadline_missed(case.deadline_date) and not data.get('restore_reason')
 
 
 async def regenerate_paid_case(session, settings, case, user):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,7 @@ from app.services.documents import MANUAL_REVIEW_USER_TEXT, create_case_document
 from app.services.legal_data import FIELD_LABELS, is_deadline_missed, missing_order_fields, normalize_debtor_name_fields, normalize_order_data, suggest_nominative_full_name, validate_before_generation
 from app.services.llm import extract_envelope_date, extract_order_data
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
-from app.services.paid_correction import correction_allowed, record_corrected_field, regenerate_paid_case
+from app.services.paid_correction import correction_allowed, paid_regeneration_requires_new_date, record_corrected_field, regenerate_paid_case
 from app.services.received_date import received_date_prompt_text, save_received_date, validate_received_date
 from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaReceiptContactRequired
@@ -44,10 +45,25 @@ STATE_FIELD_VALUE = "max_waiting_field_value"
 STATE_PAYMENT_CONTACT = 'max_waiting_payment_contact'
 STATE_RESTORE_REASON = 'max_waiting_restore_reason'
 STATE_PAID_FIELD = 'max_waiting_paid_field'
+STATE_PAID_DATE = 'max_waiting_paid_date'
 
 
 async def _send(client: MaxBotClient, event: IncomingEvent, text: str, keyboard=None) -> None:
     await client.send_message(chat_id=event.chat_id, text=text, keyboard=keyboard)
+
+
+async def _edit_or_send(client: MaxBotClient, event: IncomingEvent, text: str, keyboard=None) -> None:
+    if event.message_id:
+        try:
+            await client.edit_message(event.message_id, text, keyboard)
+            return
+        except Exception:
+            logger.info('MAX message edit unavailable message_id=%s; replacing message', event.message_id)
+            try:
+                await client.delete_message(event.message_id)
+            except Exception:
+                logger.info('MAX message delete unavailable message_id=%s', event.message_id)
+    await _send(client, event, text, keyboard)
 
 
 async def _state(session, event: IncomingEvent) -> str | None:
@@ -301,12 +317,19 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
         if data == "profile:show":
             await _send(client, event, profile_text(user, await latest_case(session, user.id)), keyboards.profile_menu())
             return
-        if data == "case:my":
+        if data == 'case:my:noop':
+            return
+        if data == "case:my" or (data and data.startswith('case:my:')):
             cases = await generated_cases(session, user.id)
+            page_size = 5
+            requested_page = int(data.rsplit(':', 1)[-1]) if data.count(':') == 2 else 0
+            total_pages = max(1, math.ceil(len(cases) / page_size))
+            page = max(0, min(requested_page, total_pages - 1))
+            page_cases = cases[page * page_size:(page + 1) * page_size]
             if not cases:
-                await _send(client, event, "Сгенерированных заявлений пока нет. Начните с кнопки «Подготовить заявление».", keyboards.main_menu())
+                await _edit_or_send(client, event, "Сгенерированных заявлений пока нет. Начните с кнопки «Подготовить заявление».", keyboards.main_menu())
             else:
-                await _send(client, event, '<b>📄 Мои документы</b>\n\nВыберите заявление:', keyboards.documents_menu(cases))
+                await _edit_or_send(client, event, '<b>📄 Мои документы</b>\n\nВыберите заявление:', keyboards.documents_menu(page_cases, page, total_pages, page * page_size))
             return
         if data and data.startswith('case:document:'):
             case = await generated_case_for_user(session, user.id, int(data.rsplit(':', 1)[-1]))
@@ -315,7 +338,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 return
             await client.send_file(event.chat_id, case.full_doc_path, caption='📄 Ваше заявление')
             extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
-            await _send(client, event, '<b>Проверьте данные</b>\n\n' + extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.document_details_menu(case.id))
+            await _edit_or_send(client, event, extraction_preview(extracted, case.received_date, [], case.deadline_date, title='📄 <b>Данные в заявлении:</b>'), keyboards.document_details_menu(case.id))
             return
         if data == "case:new":
             previous = await latest_open_case(session, user.id)
@@ -430,7 +453,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 await _send(client, event, 'Оплаченное заявление не найдено.')
                 return
             schedule_crm_sync(settings, case.id, user.id, 'paid_document_correction_started', {'note': 'Пользователь сообщил: данные в заявлении неверные'})
-            await _send(client, event, '<b>✏️ Что нужно исправить?</b>\n\nВыберите поле и отправьте новое значение.', keyboards.paid_edit_fields_menu(case.id))
+            await _edit_or_send(client, event, '<b>✏️ Что нужно исправить?</b>\n\nВыберите поле и отправьте новое значение.', keyboards.paid_edit_fields_menu(case.id))
             return
         if data and data.startswith('paid:field:'):
             parts = data.split(':')
@@ -446,7 +469,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             await _set_state(session, event, STATE_PAID_FIELD, {'case_id': case.id, 'field': field})
             schedule_crm_sync(settings, case.id, user.id, 'paid_document_field_selected', {'note': f'Выбрано поле: {FIELD_LABELS.get(field, field)}'})
             current = extracted.get(field) or 'не указано'
-            await _send(client, event, f'Текущее значение поля <b>{FIELD_LABELS.get(field, field)}</b>:\n<code>{h(current)}</code>\n\nНапишите верное значение.')
+            await _edit_or_send(client, event, f'Текущее значение поля <b>{FIELD_LABELS.get(field, field)}</b>:\n<code>{h(current)}</code>\n\nНапишите верное значение.')
             return
         if data and data.startswith('paid:review'):
             parts = data.split(':')
@@ -455,7 +478,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 await _send(client, event, 'Заявление не найдено.')
                 return
             extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
-            await _send(client, event, '<b>Проверьте данные</b>\n\n' + extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.paid_review_menu(case.id))
+            await _edit_or_send(client, event, extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.paid_review_menu(case.id))
             return
         if data and data.startswith('paid:regenerate'):
             parts = data.split(':')
@@ -463,10 +486,26 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             if not case or case.status not in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}:
                 await _send(client, event, 'Оплаченное заявление не найдено.')
                 return
-            await _send(client, event, '🔄 Перегенерирую заявление с исправленными данными...')
-            artifacts = await regenerate_paid_case(session, settings, case, user)
+            if paid_regeneration_requires_new_date(case):
+                await _edit_or_send(client, event, 'Срок подачи по указанной дате уже истёк. Пересоздание невозможно, пока не будет указана актуальная дата получения.', keyboards.paid_date_required_menu(case.id))
+                return
+            await _edit_or_send(client, event, '🔄 Перегенерирую заявление с исправленными данными...')
+            try:
+                artifacts = await regenerate_paid_case(session, settings, case, user)
+            except ValueError as exc:
+                logger.warning('Paid document regeneration rejected case_id=%s: %s', case.id, exc)
+                await _edit_or_send(client, event, 'Не удалось пересоздать заявление: проверьте дату получения и исправленные данные.', keyboards.paid_review_menu(case.id))
+                return
             await client.send_file(event.chat_id, artifacts.full_docx_path, caption='✅ Исправленное заявление готово.')
             await _send(client, event, 'Проверьте исправленное заявление.', keyboards.paid_document_actions(case.id))
+            return
+        if data and data.startswith('paid:date:'):
+            case = await generated_case_for_user(session, user.id, int(data.rsplit(':', 1)[-1]))
+            if not case:
+                await _send(client, event, 'Заявление не найдено.')
+                return
+            await _set_state(session, event, STATE_PAID_DATE, {'case_id': case.id})
+            await _edit_or_send(client, event, manual_received_date_prompt_text())
             return
         if data and data.startswith('case:restore_reason:'):
             case = await latest_open_case(session, user.id)
@@ -491,7 +530,6 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
             extracted['restore_reason'] = reason
             case.extracted_json = json.dumps(extracted, ensure_ascii=False)
-            record_corrected_field(case, field)
             await session.commit()
             await _clear_state(session, event)
             await _generate_documents(client, event, session, settings, user, case)
@@ -553,10 +591,32 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             extracted[field] = value
             extracted = normalize_order_data(extracted)
             case.extracted_json = json.dumps(extracted, ensure_ascii=False)
+            record_corrected_field(case, field)
             await session.commit()
             await _clear_state(session, event)
             schedule_crm_sync(settings, case.id, user.id, 'paid_document_field_corrected', {'note': f'Исправил поле: {FIELD_LABELS.get(field, field)}'})
-            await _send(client, event, '<b>Проверьте данные</b>\n\n' + extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.paid_review_menu(case.id))
+            await _send(client, event, extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.paid_review_menu(case.id))
+            return
+        if current_state == STATE_PAID_DATE and event.text:
+            state_data = await _state_data(session, event)
+            case = await session.get(Case, state_data['case_id'])
+            received, error = validate_received_date(case, event.text)
+            if error:
+                await _send(client, event, error)
+                return
+            document_state = (
+                case.status, case.full_doc_path, case.full_pdf_path, case.preview_pdf_path,
+                case.preview_doc_path, case.instruction_path,
+            )
+            await save_received_date(session, settings, case, user, received)
+            (
+                case.status, case.full_doc_path, case.full_pdf_path, case.preview_pdf_path,
+                case.preview_doc_path, case.instruction_path,
+            ) = document_state
+            await session.commit()
+            await _clear_state(session, event)
+            extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+            await _send(client, event, extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.paid_review_menu(case.id))
             return
         if current_state == STATE_RESTORE_REASON and event.text:
             state_data = await _state_data(session, event)

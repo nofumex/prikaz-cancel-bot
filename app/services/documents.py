@@ -415,10 +415,11 @@ def extraction_preview(
     deadline_date: date | None = None,
     *,
     include_name_debug: bool = True,
+    title: str = "🔎 <b>Проверьте данные</b>",
 ) -> str:
     data = normalize_order_data(data)
     lines = [
-        "🔎 <b>Проверьте данные</b>",
+        title,
         "",
         f"<b>Суд:</b> {h(data.get('court_name') or 'не заполнено')}",
         f"<b>Адрес суда:</b> {h(data.get('court_address') or 'не заполнено')}",

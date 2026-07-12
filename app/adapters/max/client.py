@@ -98,6 +98,16 @@ class MaxBotClient:
         params: dict[str, Any] = {"chat_id": chat_id} if chat_id is not None else {"user_id": user_id}
         return await self.request("POST", "/messages", params=params, json=body)
 
+    async def edit_message(self, message_id: str | int, text: str, keyboard: MaxKeyboard | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {"text": text, "format": "html"}
+        attachments = to_attachments(keyboard) or []
+        if attachments:
+            body["attachments"] = attachments
+        return await self.request("PUT", "/messages", params={"message_id": message_id}, json=body)
+
+    async def delete_message(self, message_id: str | int) -> dict[str, Any]:
+        return await self.request("DELETE", "/messages", params={"message_id": message_id})
+
     async def answer_callback(self, callback_id: str | None, text: str | None = None) -> None:
         if not callback_id:
             return

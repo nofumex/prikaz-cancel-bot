@@ -141,8 +141,15 @@ def admin_panel(payments_enabled: bool = True) -> InlineKeyboardMarkup:
     )
 
 
-def documents_menu(cases) -> InlineKeyboardMarkup:
-    rows = [[btn(f'📄 Заявление {index}', f'case:document:{case.id}')] for index, case in enumerate(cases, 1)]
+def documents_menu(cases, page: int = 0, total_pages: int = 1, start_index: int = 0) -> InlineKeyboardMarkup:
+    rows = [[btn(f'📄 Заявление {start_index + index}', f'case:document:{case.id}')] for index, case in enumerate(cases, 1)]
+    nav = []
+    if page > 0:
+        nav.append(btn('⬅️', f'case:my:{page - 1}'))
+    nav.append(btn(f'{page + 1}/{max(total_pages, 1)}', 'case:my:noop'))
+    if page + 1 < total_pages:
+        nav.append(btn('➡️', f'case:my:{page + 1}'))
+    rows.append(nav)
     rows.append([btn('↩️ Профиль', 'profile:show')])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -183,6 +190,13 @@ def paid_review_menu(case_id: int | None = None) -> InlineKeyboardMarkup:
         [btn('✅ Все верно, пересоздать заявление', f'paid:regenerate{suffix}')],
         [btn('✏️ Исправить еще поле', f'paid:correction:start{suffix}')],
         [btn('💬 Связаться с менеджером', 'chat:start')],
+    ])
+
+
+def paid_date_required_menu(case_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn('📅 Изменить дату получения', f'paid:date:{case_id}')],
+        [btn('↩️ К данным заявления', f'paid:review:{case_id}')],
     ])
 
 

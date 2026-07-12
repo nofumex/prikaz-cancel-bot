@@ -34,6 +34,19 @@ async def _send(client: MaxBotClient, event: IncomingEvent, text: str, keyboard=
     await client.send_message(chat_id=event.chat_id, text=text, keyboard=keyboard)
 
 
+async def _edit_or_send(client: MaxBotClient, event: IncomingEvent, text: str, keyboard=None) -> None:
+    if event.message_id:
+        try:
+            await client.edit_message(event.message_id, text, keyboard)
+            return
+        except Exception:
+            try:
+                await client.delete_message(event.message_id)
+            except Exception:
+                pass
+    await _send(client, event, text, keyboard)
+
+
 def _money(value: float | None) -> str:
     return chr(36) + f'{(value or 0.0):.4f}'
 
@@ -86,14 +99,14 @@ async def _show_cases(client, event, session, user: User, payments_only: bool, p
         text = '<b>⏳ Ожидают оплату</b>\n\nВыберите заявку:'
     else:
         text = f'<b>📋 Заявки</b>\n\nПоказано по {PAGE_SIZE} на странице. Выберите заявку:'
-    await _send(client, event, text, keyboards.admin_cases_page(items, page, pages, prefix))
+    await _edit_or_send(client, event, text, keyboards.admin_cases_page(items, page, pages, prefix))
 
 
 async def _show_problem_cases(client, event, session, user: User, page: int) -> None:
     counts = await problem_category_counts(session)
     rows = [[keyboards.btn(f'{label} ({counts.get(key, 0)})', f'admin:problem_group_{key}:0')] for key, (label, _) in PROBLEM_CATEGORIES.items()]
     rows.append([keyboards.btn('↩️ Админка', 'admin:panel')])
-    await _send(client, event, '<b>⚠️ Проблемные заявки</b>\n\nВыберите тип проблемы:', rows)
+    await _edit_or_send(client, event, '<b>⚠️ Проблемные заявки</b>\n\nВыберите тип проблемы:', rows)
 
 
 async def _show_problem_group(client, event, session, category: str, page: int) -> None:
@@ -106,7 +119,7 @@ async def _show_problem_group(client, event, session, category: str, page: int) 
     if not items:
         await _send(client, event, 'В этой категории заявок нет.')
         return
-    await _send(client, event, f'<b>{PROBLEM_CATEGORIES[category][0]}</b>\n\nВыберите заявку:', keyboards.admin_cases_page(items, page, pages, f'admin:problem_group_{category}'))
+    await _edit_or_send(client, event, f'<b>{PROBLEM_CATEGORIES[category][0]}</b>\n\nВыберите заявку:', keyboards.admin_cases_page(items, page, pages, f'admin:problem_group_{category}'))
 
 
 async def _show_case(client, event, session, data: str) -> None:

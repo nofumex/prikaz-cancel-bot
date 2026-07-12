@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -31,6 +32,17 @@ from app.utils import full_name, h, safe_json_loads, username_text
 
 router = Router(name="admin")
 PAGE_SIZE = 5
+
+
+async def _edit_or_answer(callback: CallbackQuery, text: str, reply_markup=None) -> None:
+    try:
+        await callback.message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest:
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            pass
+        await callback.message.answer(text, reply_markup=reply_markup)
 
 
 class AdminAmountStates(StatesGroup):
@@ -271,9 +283,10 @@ async def cb_cases(callback: CallbackQuery, session: AsyncSession, current_user:
         name = full_name(case.user).replace("<", "").replace(">", "")
         date = case.created_at.strftime("%d.%m") if case.created_at else ""
         items.append((case.id, f"#{case.id} • {date} • {name}"))
-    await callback.message.answer(
+    await _edit_or_answer(
+        callback,
         f"<b>📋 Заявки</b>\n\nПоказано по {PAGE_SIZE} на странице. Выберите заявку:",
-        reply_markup=admin_cases_page(items, page, total_pages, "admin:cases"),
+        admin_cases_page(items, page, total_pages, "admin:cases"),
     )
     await callback.answer()
 
@@ -287,7 +300,7 @@ async def cb_problem_cases(callback: CallbackQuery, session: AsyncSession, curre
         counts = await problem_category_counts(session)
         rows = [[btn(f'{label} ({counts.get(key, 0)})', f'admin:problem_group_{key}:0')] for key, (label, _) in PROBLEM_CATEGORIES.items()]
         rows.append([btn('↩️ Админка', 'admin:panel')])
-        await callback.message.answer('<b>⚠️ Проблемные заявки</b>\n\nВыберите тип проблемы:', reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        await _edit_or_answer(callback, '<b>⚠️ Проблемные заявки</b>\n\nВыберите тип проблемы:', InlineKeyboardMarkup(inline_keyboard=rows))
         await callback.answer()
         return
     page = 0
@@ -325,9 +338,10 @@ async def cb_problem_group(callback: CallbackQuery, session: AsyncSession, curre
     if not items:
         await callback.message.answer('В этой категории заявок нет.')
     else:
-        await callback.message.answer(
+        await _edit_or_answer(
+            callback,
             f'<b>{PROBLEM_CATEGORIES[category][0]}</b>\n\nВыберите заявку:',
-            reply_markup=admin_cases_page(items, page, total_pages, f'admin:problem_group_{category}'),
+            admin_cases_page(items, page, total_pages, f'admin:problem_group_{category}'),
         )
     await callback.answer()
 
@@ -359,9 +373,10 @@ async def cb_payments(callback: CallbackQuery, session: AsyncSession, current_us
         name = full_name(case.user).replace("<", "").replace(">", "")
         date = case.created_at.strftime("%d.%m") if case.created_at else ""
         items.append((case.id, f"#{case.id} • {date} • {name}"))
-    await callback.message.answer(
+    await _edit_or_answer(
+        callback,
         "<b>⏳ Ожидают оплату</b>\n\nВыберите заявку:",
-        reply_markup=admin_cases_page(items, page, total_pages, "admin:payments"),
+        admin_cases_page(items, page, total_pages, "admin:payments"),
     )
     await callback.answer()
 
