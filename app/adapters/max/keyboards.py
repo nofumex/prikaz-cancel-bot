@@ -143,8 +143,11 @@ def admin_panel(payments_enabled: bool = True) -> MaxKeyboard:
     ]
 
 
-def documents_menu(cases, page: int = 0, total_pages: int = 1, start_index: int = 0) -> MaxKeyboard:
-    rows = [[btn(f'📄 Заявление {start_index + index}', f'case:document:{case.id}')] for index, case in enumerate(cases, 1)]
+def documents_menu(cases, page: int = 0, total_pages: int = 1, start_index: int = 0, *, descending: bool = False) -> MaxKeyboard:
+    def number(index: int) -> int:
+        return start_index - index + 1 if descending else start_index + index
+
+    rows = [[btn(f'📄 Заявление {number(index)}', f'case:document:{case.id}')] for index, case in enumerate(cases, 1)]
     nav = []
     if page > 0:
         nav.append(btn('⬅️', f'case:my:{page - 1}'))

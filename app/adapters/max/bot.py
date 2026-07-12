@@ -329,7 +329,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             if not cases:
                 await _edit_or_send(client, event, "Сгенерированных заявлений пока нет. Начните с кнопки «Подготовить заявление».", keyboards.main_menu())
             else:
-                await _edit_or_send(client, event, '<b>📄 Мои документы</b>\n\nВыберите заявление:', keyboards.documents_menu(page_cases, page, total_pages, page * page_size))
+                await _edit_or_send(client, event, '<b>📄 Мои документы</b>\n\nВыберите заявление:', keyboards.documents_menu(page_cases, page, total_pages, len(cases) - page * page_size, descending=True))
             return
         if data and data.startswith('case:document:'):
             case = await generated_case_for_user(session, user.id, int(data.rsplit(':', 1)[-1]))

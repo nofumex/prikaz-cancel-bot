@@ -73,7 +73,7 @@ async def generated_cases(session: AsyncSession, user_id: int) -> list[Case]:
             Case.full_doc_path.is_not(None),
             Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]),
         )
-        .order_by(Case.created_at.asc(), Case.id.asc())
+        .order_by(Case.created_at.desc(), Case.id.desc())
     )
     return list(result.scalars().all())
 

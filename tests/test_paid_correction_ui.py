@@ -44,6 +44,14 @@ def test_document_archive_paginates_five_items_with_stable_numbers():
     assert [button.callback_data for button in nav] == ['case:my:0', 'case:my:noop', 'case:my:2']
 
 
+def test_document_archive_shows_newest_user_number_first():
+    cases = [SimpleNamespace(id=value) for value in range(14, 9, -1)]
+    menu = documents_menu(cases, page=0, total_pages=3, start_index=14, descending=True)
+    assert [row[0].text for row in menu.inline_keyboard[:5]] == [f'📄 Заявление {value}' for value in range(14, 9, -1)]
+    max_menu = max_keyboards.documents_menu(cases, page=0, total_pages=3, start_index=14, descending=True)
+    assert [row[0].text for row in max_menu[:5]] == [f'📄 Заявление {value}' for value in range(14, 9, -1)]
+
+
 def test_archive_data_title_does_not_repeat_review_heading():
     text = extraction_preview({}, None, [], title='📄 <b>Данные в заявлении:</b>')
     assert text.count('Данные в заявлении:') == 1

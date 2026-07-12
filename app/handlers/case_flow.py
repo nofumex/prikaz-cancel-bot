@@ -218,7 +218,7 @@ async def my_case(callback: CallbackQuery, session: AsyncSession, current_user: 
         await _edit_or_answer(
             callback,
             '<b>📄 Мои документы</b>\n\nВыберите заявление:',
-            documents_menu(page_cases, page, total_pages, page * page_size),
+            documents_menu(page_cases, page, total_pages, len(cases) - page * page_size, descending=True),
         )
     await callback.answer()
 
