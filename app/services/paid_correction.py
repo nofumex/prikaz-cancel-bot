@@ -5,6 +5,7 @@ import json
 from app.services.crm_background import schedule_crm_sync
 from app.services.documents import create_case_documents_reviewed
 from app.services.legal_data import is_deadline_missed
+from app.services.legal_data import format_money_rub_kop, normalize_order_data, validate_amounts
 
 PAID_EDITABLE_FIELDS = {
     'court_name', 'court_address', 'debtor_full_name', 'debtor_address',
@@ -40,7 +41,27 @@ def paid_regeneration_requires_new_date(case) -> bool:
 
 
 async def regenerate_paid_case(session, settings, case, user):
-    data = json.loads(case.extracted_json or '{}')
+    data = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    amount_check = validate_amounts(data)
+    if (
+        not amount_check.ok
+        and amount_check.errors == ['amount_mismatch']
+        and amount_check.total_amount is not None
+        and amount_check.state_duty is not None
+        and amount_check.total_amount >= amount_check.state_duty
+    ):
+        recovered_debt = amount_check.total_amount - amount_check.state_duty
+        old_debt = data.get('debt_amount') or ''
+        data['debt_amount'] = format_money_rub_kop(recovered_debt)
+        case.extracted_json = json.dumps(normalize_order_data(data), ensure_ascii=False)
+        await session.commit()
+        schedule_crm_sync(
+            settings,
+            case.id,
+            user.id,
+            'paid_document_amount_reconciled',
+            {'note': f'Перед регенерацией сумма долга восстановлена по итогу и госпошлине: {old_debt} → {data["debt_amount"]}'},
+        )
     outcome = await create_case_documents_reviewed(case, user, settings, session, restore_reason=data.get('restore_reason'))
     if not outcome.ok or outcome.artifacts is None:
         raise ValueError(outcome.admin_report or 'Документ не прошел проверку после исправления.')

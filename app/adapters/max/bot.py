@@ -336,9 +336,14 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             if not case or not case.full_doc_path or not Path(case.full_doc_path).exists():
                 await _send(client, event, 'Документ не найден.')
                 return
+            if event.message_id:
+                try:
+                    await client.delete_message(event.message_id)
+                except Exception:
+                    logger.info('MAX archive list delete unavailable message_id=%s', event.message_id)
             await client.send_file(event.chat_id, case.full_doc_path, caption='📄 Ваше заявление')
             extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
-            await _edit_or_send(client, event, extraction_preview(extracted, case.received_date, [], case.deadline_date, title='📄 <b>Данные в заявлении:</b>'), keyboards.document_details_menu(case.id))
+            await _send(client, event, extraction_preview(extracted, case.received_date, [], case.deadline_date, title='📄 <b>Данные в заявлении:</b>'), keyboards.document_details_menu(case.id))
             return
         if data == "case:new":
             previous = await latest_open_case(session, user.id)

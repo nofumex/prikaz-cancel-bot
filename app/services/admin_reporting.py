@@ -46,6 +46,7 @@ EVENT_LABELS = {
     'paid_document_field_selected': 'Выбрал поле для исправления',
     'paid_document_field_corrected': 'Исправил поле',
     'paid_document_regenerated': 'Заявление перегенерировано после оплаты',
+    'paid_document_amount_reconciled': 'Сумма долга восстановлена перед регенерацией',
 }
 
 

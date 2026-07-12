@@ -230,12 +230,15 @@ async def my_document(callback: CallbackQuery, session: AsyncSession, current_us
     if not case or not case.full_doc_path or not Path(case.full_doc_path).exists():
         await callback.answer('Документ не найден.', show_alert=True)
         return
+    try:
+        await callback.message.delete()
+    except TelegramBadRequest:
+        pass
     await callback.message.answer_document(FSInputFile(case.full_doc_path), caption='📄 Ваше заявление')
     extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
-    await _edit_or_answer(
-        callback,
+    await callback.message.answer(
         extraction_preview(extracted, case.received_date, [], case.deadline_date, title='📄 <b>Данные в заявлении:</b>'),
-        document_details_menu(case.id),
+        reply_markup=document_details_menu(case.id),
     )
     await callback.answer()
 
