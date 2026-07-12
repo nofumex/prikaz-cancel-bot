@@ -55,6 +55,8 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("deadline_reminder_sent_at", "deadline_reminder_sent_at DATETIME"),
             ("post_payment_followup_sent_at", "post_payment_followup_sent_at DATETIME"),
             ("consultation_reminder_sent_at", "consultation_reminder_sent_at DATETIME"),
+            ("paid_regeneration_count", "paid_regeneration_count INTEGER NOT NULL DEFAULT 0"),
+            ("paid_corrected_fields_json", "paid_corrected_fields_json TEXT"),
         ],
     )
     await _sqlite_add_columns(

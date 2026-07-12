@@ -18,7 +18,7 @@ from app.services.amocrm import get_amocrm_service
 from app.services.app_settings import payments_enabled, toggle_payments
 from app.services.app_settings import reminder_settings, update_reminder_setting
 from app.services.reminder_center import reminder_counts, reminder_dashboard_text, send_manual_reminders
-from app.services.admin_reporting import client_path_text, problem_case_error_text, problem_cases_page
+from app.services.admin_reporting import PROBLEM_CATEGORIES, client_path_text, order_photo_paths, problem_case_error_text, problem_cases_by_category, problem_category_counts, problem_cases_page
 from app.services.amount_recovery import format_amount_mismatch_admin_report
 from app.services.document_delivery import schedule_document_delivery
 from app.services.legal_data import FIELD_LABELS, normalize_order_data
@@ -90,17 +90,23 @@ async def _show_cases(client, event, session, user: User, payments_only: bool, p
 
 
 async def _show_problem_cases(client, event, session, user: User, page: int) -> None:
-    cases, total, errors = await problem_cases_page(session, page, PAGE_SIZE)
+    counts = await problem_category_counts(session)
+    rows = [[keyboards.btn(f'{label} ({counts.get(key, 0)})', f'admin:problem_group_{key}:0')] for key, (label, _) in PROBLEM_CATEGORIES.items()]
+    rows.append([keyboards.btn('↩️ Админка', 'admin:panel')])
+    await _send(client, event, '<b>⚠️ Проблемные заявки</b>\n\nВыберите тип проблемы:', rows)
+
+
+async def _show_problem_group(client, event, session, category: str, page: int) -> None:
+    cases, total, errors = await problem_cases_by_category(session, category, page, PAGE_SIZE)
     pages = max(1, math.ceil(total / PAGE_SIZE))
-    page = max(0, min(page, pages - 1))
-    if not cases:
-        await _send(client, event, 'Проблемных заявок пока нет.', keyboards.admin_panel(payments_enabled()))
-        return
     items = []
     for case in cases:
         await session.refresh(case, ['user'])
         items.append((case.id, _case_button_label(case, errors.get(case.id))))
-    await _send(client, event, f'<b>⚠️ Проблемные заявки</b>\n\nПоказано по {PAGE_SIZE} на странице. Выберите заявку:', keyboards.admin_cases_page(items, page, pages, 'admin:problem_cases'))
+    if not items:
+        await _send(client, event, 'В этой категории заявок нет.')
+        return
+    await _send(client, event, f'<b>{PROBLEM_CATEGORIES[category][0]}</b>\n\nВыберите заявку:', keyboards.admin_cases_page(items, page, pages, f'admin:problem_group_{category}'))
 
 
 async def _show_case(client, event, session, data: str) -> None:
@@ -154,6 +160,9 @@ async def _show_stats(client, event, session) -> None:
     pending = int(await session.scalar(select(func.count(Case.id)).where(Case.status == CaseStatus.PAYMENT_PENDING.value)) or 0)
     paid_statuses = [CaseStatus.PAID.value, CaseStatus.DELIVERED.value]
     paid = int(await session.scalar(select(func.count(Case.id)).where(Case.status.in_(paid_statuses))) or 0)
+    regenerations = int(await session.scalar(
+        select(func.count(CrmSyncLog.id)).where(CrmSyncLog.event_type == 'paid_document_regenerated')
+    ) or 0)
     usage = (await session.execute(select(
         func.coalesce(func.sum(OpenAIUsage.total_cost_usd), 0.0),
         func.coalesce(func.sum(OpenAIUsage.total_tokens), 0),
@@ -172,7 +181,7 @@ async def _show_stats(client, event, session) -> None:
     payment_count, payment_sum, yookassa_count, yookassa_sum = await net_payment_totals(session)
     text = (
         '<b>Статистика</b>\n\n'
-        + f'Пользователей: {users}\nЗаявлений всего: {cases}\nОжидают оплату: {pending}\nОплачено/выдано: {paid}\n\n'
+        + f'Пользователей: {users}\nЗаявлений всего: {cases}\nОжидают оплату: {pending}\nОплачено/выдано: {paid}\nРегенераций заявлений: {regenerations}\n\n'
         + f'<b>CRM</b>\nСинхронизировано сделок: {synced}\nОшибки синхронизации: {errors}\n\n'
         + f'<b>Пользователи по платформам</b>\nTelegram: {telegram_users} ({telegram_percent}%)\nMAX: {max_users} ({max_percent}%)\nВсего: {platform_total} (100%)\n\n'
         + f'<b>Оплаты</b>\nYooKassa: {yookassa_count} оплат, {yookassa_sum:,} ₽\nВсего успешных: {payment_count} оплат, {payment_sum:,} ₽\n\n'.replace(',', ' ')
@@ -277,6 +286,10 @@ async def handle_admin_update(
     elif data and data.startswith('admin:problem_cases'):
         page = int(data.split(':')[-1]) if data.startswith('admin:problem_cases:') else 0
         await _show_problem_cases(client, event, session, user, page)
+    elif data and data.startswith('admin:problem_group_'):
+        prefix, raw_page = data.rsplit(':', 1)
+        category = prefix.removeprefix('admin:problem_group_')
+        await _show_problem_group(client, event, session, category, int(raw_page))
     elif data and data.startswith('admin:case:'):
         await _show_case(client, event, session, data)
     elif data == 'admin:stats':
@@ -394,8 +407,9 @@ async def _handle_admin_action(client, event, settings, session, user, data, gen
         if not case:
             await _send(client, event, 'Заявка не найдена.')
             return True
+        order_paths = await order_photo_paths(session, case)
         paths = {
-            'order': [('Фото приказа', case.order_photo_path)],
+            'order': [(f'Фото приказа {index}', path) for index, path in enumerate(order_paths, 1)],
             'preview': [('Preview заявления', case.preview_pdf_path or case.preview_doc_path)],
             'docx': [('DOCX заявления', case.full_doc_path)],
             'pdf': [('PDF заявления', case.full_pdf_path)],

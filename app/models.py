@@ -56,6 +56,8 @@ class Case(Base):
     preview_doc_path: Mapped[str | None] = mapped_column(Text)
     instruction_path: Mapped[str | None] = mapped_column(Text)
     order_rephoto_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    paid_regeneration_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    paid_corrected_fields_json: Mapped[str | None] = mapped_column(Text)
     payment_label: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
     payment_url: Mapped[str | None] = mapped_column(Text)
     reminders_sent: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

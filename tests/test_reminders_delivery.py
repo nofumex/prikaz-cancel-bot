@@ -273,7 +273,7 @@ async def test_deliver_full_documents_sends_only_docx_with_instruction(tmp_path)
     assert "Инструкция по подаче" in caption
     assert "Срок подачи: до 29.06.2026" in caption
     assert reply_markup.inline_keyboard[0][0].text == "❌ Данные в заявлении неверные"
-    assert reply_markup.inline_keyboard[0][0].callback_data == "paid:correction:start"
+    assert reply_markup.inline_keyboard[0][0].callback_data == "paid:correction:start:10"
     assert case.status == CaseStatus.DELIVERED.value
 
 

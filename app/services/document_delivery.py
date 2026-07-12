@@ -87,7 +87,7 @@ async def _deliver_to_telegram(case: Case, bot: Bot) -> None:
     if not case.user.telegram_id:
         raise RuntimeError("Telegram user id is empty")
     path = _full_docx_file(case)
-    await bot.send_document(case.user.telegram_id, FSInputFile(path), caption=delivery_instruction_text(case), reply_markup=paid_document_actions())
+    await bot.send_document(case.user.telegram_id, FSInputFile(path), caption=delivery_instruction_text(case), reply_markup=paid_document_actions(case.id))
 
 
 async def _deliver_to_max(case: Case, settings: Settings) -> None:
@@ -99,7 +99,7 @@ async def _deliver_to_max(case: Case, settings: Settings) -> None:
         upload_retry_base_seconds=settings.max_upload_retry_base_seconds,
     ) as client:
         await client.send_file(chat_id, _full_docx_file(case), caption=delivery_instruction_text(case))
-        await client.send_message(chat_id=chat_id, text='Проверьте данные в заявлении. Если нашли ошибку, нажмите кнопку ниже.', keyboard=max_keyboards.paid_document_actions())
+        await client.send_message(chat_id=chat_id, text='Проверьте данные в заявлении. Если нашли ошибку, нажмите кнопку ниже.', keyboard=max_keyboards.paid_document_actions(case.id))
 
 
 def _full_docx_file(case: Case) -> str:

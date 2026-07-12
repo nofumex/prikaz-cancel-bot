@@ -18,7 +18,7 @@ from app.config import Settings
 from app.enums import CaseStatus
 from app.keyboards.common import admin_case_actions, admin_cases_page, admin_panel, broadcast_confirm, broadcast_menu, broadcast_settings_menu, btn, manager_panel
 from app.models import Case, CrmSyncLog, OpenAIUsage, User
-from app.services.admin_reporting import client_path_text, problem_case_error_text, problem_cases_page
+from app.services.admin_reporting import PROBLEM_CATEGORIES, client_path_text, order_photo_paths, problem_case_error_text, problem_cases_by_category, problem_category_counts, problem_cases_page
 from app.services.amocrm import get_amocrm_service
 from app.services.app_settings import payments_enabled, toggle_payments
 from app.services.app_settings import reminder_settings, update_reminder_setting
@@ -282,7 +282,15 @@ async def cb_cases(callback: CallbackQuery, session: AsyncSession, current_user:
 async def cb_problem_cases(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
     if not await _ensure_admin_callback(callback, current_user):
         return
-    page = int(callback.data.split(":")[-1]) if callback.data.startswith("admin:problem_cases:") else 0
+    parts = callback.data.split(':')
+    if len(parts) == 3 and parts[2].isdigit():
+        counts = await problem_category_counts(session)
+        rows = [[btn(f'{label} ({counts.get(key, 0)})', f'admin:problem_group_{key}:0')] for key, (label, _) in PROBLEM_CATEGORIES.items()]
+        rows.append([btn('↩️ Админка', 'admin:panel')])
+        await callback.message.answer('<b>⚠️ Проблемные заявки</b>\n\nВыберите тип проблемы:', reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        await callback.answer()
+        return
+    page = 0
     cases, total, errors = await problem_cases_page(session, page, PAGE_SIZE)
     total_pages = max(1, math.ceil(total / PAGE_SIZE))
     page = max(0, min(page, total_pages - 1))
@@ -298,6 +306,29 @@ async def cb_problem_cases(callback: CallbackQuery, session: AsyncSession, curre
         f"<b>⚠️ Проблемные заявки</b>\n\nПоказано по {PAGE_SIZE} на странице. Выберите заявку:",
         reply_markup=admin_cases_page(items, page, total_pages, "admin:problem_cases"),
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith('admin:problem_group_'))
+async def cb_problem_group(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+    if not await _ensure_admin_callback(callback, current_user):
+        return
+    prefix, raw_page = callback.data.rsplit(':', 1)
+    category = prefix.removeprefix('admin:problem_group_')
+    page = int(raw_page)
+    cases, total, errors = await problem_cases_by_category(session, category, page, PAGE_SIZE)
+    total_pages = max(1, math.ceil(total / PAGE_SIZE))
+    items = []
+    for case in cases:
+        await session.refresh(case, ['user'])
+        items.append((case.id, _case_button_label(case, errors.get(case.id))))
+    if not items:
+        await callback.message.answer('В этой категории заявок нет.')
+    else:
+        await callback.message.answer(
+            f'<b>{PROBLEM_CATEGORIES[category][0]}</b>\n\nВыберите заявку:',
+            reply_markup=admin_cases_page(items, page, total_pages, f'admin:problem_group_{category}'),
+        )
     await callback.answer()
 
 
@@ -407,8 +438,9 @@ async def cb_admin_file(callback: CallbackQuery, session: AsyncSession, current_
         await callback.message.answer('Заявка не найдена.')
         await callback.answer()
         return
+    order_paths = await order_photo_paths(session, case)
     paths = {
-        'order': [('Фото приказа', case.order_photo_path)],
+        'order': [(f'Фото приказа {index}', path) for index, path in enumerate(order_paths, 1)],
         'preview': [('Preview заявления', case.preview_pdf_path or case.preview_doc_path)],
         'docx': [('DOCX заявления', case.full_doc_path)],
         'pdf': [('PDF заявления', case.full_pdf_path)],
@@ -440,6 +472,9 @@ async def cb_stats(callback: CallbackQuery, session: AsyncSession, current_user:
     cases_total = int(await session.scalar(select(func.count(Case.id))) or 0)
     pending = int(await session.scalar(select(func.count(Case.id)).where(Case.status == CaseStatus.PAYMENT_PENDING.value)) or 0)
     paid = int(await session.scalar(select(func.count(Case.id)).where(Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]))) or 0)
+    regenerations = int(await session.scalar(
+        select(func.count(CrmSyncLog.id)).where(CrmSyncLog.event_type == 'paid_document_regenerated')
+    ) or 0)
     total_cost, total_tokens, input_tokens, cached_tokens, output_tokens, reasoning_tokens = await _usage_totals(session)
     manual_cost, manual_tokens = await _avg_per_case(session, Case.envelope_photo_path.is_(None))
     envelope_cost, envelope_tokens = await _avg_per_case(session, Case.envelope_photo_path.is_not(None))
@@ -467,6 +502,7 @@ async def cb_stats(callback: CallbackQuery, session: AsyncSession, current_user:
         f"Заявлений всего: {cases_total}\n"
         f"Ожидают оплату: {pending}\n"
         f"Оплачено/выдано: {paid}\n\n"
+        f"Регенераций заявлений: {regenerations}\n\n"
         "<b>CRM</b>\n"
         f"Синхронизировано сделок: {crm_synced}\n"
         f"Ошибки синхронизации: {crm_errors}\n"

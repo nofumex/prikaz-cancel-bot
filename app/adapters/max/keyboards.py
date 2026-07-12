@@ -143,27 +143,47 @@ def admin_panel(payments_enabled: bool = True) -> MaxKeyboard:
     ]
 
 
-def paid_document_actions() -> MaxKeyboard:
-    return [[btn('❌ Данные в заявлении неверные', 'paid:correction:start')]]
+def documents_menu(cases) -> MaxKeyboard:
+    rows = [[btn(f'📄 Заявление {index}', f'case:document:{case.id}')] for index, case in enumerate(cases, 1)]
+    rows.append([btn('↩️ Профиль', 'profile:show')])
+    return rows
 
 
-def paid_edit_fields_menu() -> MaxKeyboard:
+def document_details_menu(case_id: int) -> MaxKeyboard:
     return [
-        [btn('⚖️ Суд', 'paid:field:court_name'), btn('📍 Адрес суда', 'paid:field:court_address')],
-        [btn('👤 Должник', 'paid:field:debtor_full_name'), btn('🏠 Адрес должника', 'paid:field:debtor_address')],
-        [btn('🏦 Взыскатель', 'paid:field:creditor_name'), btn('📍 Адрес взыскателя', 'paid:field:creditor_address')],
-        [btn('📄 Номер дела', 'paid:field:case_number'), btn('📅 Дата приказа', 'paid:field:order_date')],
-        [btn('🔖 УИД', 'paid:field:uid'), btn('🧾 Договор', 'paid:field:debt_contract')],
-        [btn('📆 Период', 'paid:field:debt_period'), btn('💰 Сумма долга', 'paid:field:debt_amount')],
-        [btn('⚖️ Госпошлина', 'paid:field:state_duty')],
-        [btn('↩️ Назад к проверке', 'paid:review')],
+        [btn('❌ Данные в заявлении неверные', f'paid:correction:start:{case_id}')],
+        [btn('📄 Мои документы', 'case:my')],
+        [btn('📝 Новое заявление', 'case:new')],
+        [btn('👤 Профиль', 'profile:show'), btn('💬 Менеджер', 'chat:start')],
+        [btn('🏠 Главное меню', 'menu:main')],
     ]
 
 
-def paid_review_menu() -> MaxKeyboard:
+def paid_document_actions(case_id: int | None = None) -> MaxKeyboard:
+    suffix = f':{case_id}' if case_id is not None else ''
+    return [[btn('❌ Данные в заявлении неверные', f'paid:correction:start{suffix}')]]
+
+
+def paid_edit_fields_menu(case_id: int | None = None) -> MaxKeyboard:
+    def action(field: str) -> str:
+        return f'paid:field:{case_id}:{field}' if case_id is not None else f'paid:field:{field}'
     return [
-        [btn('✅ Все верно, пересоздать заявление', 'paid:regenerate')],
-        [btn('✏️ Исправить еще поле', 'paid:correction:start')],
+        [btn('⚖️ Суд', action('court_name')), btn('📍 Адрес суда', action('court_address'))],
+        [btn('👤 Должник', action('debtor_full_name')), btn('🏠 Адрес должника', action('debtor_address'))],
+        [btn('🏦 Взыскатель', action('creditor_name')), btn('📍 Адрес взыскателя', action('creditor_address'))],
+        [btn('📄 Номер дела', action('case_number')), btn('📅 Дата приказа', action('order_date'))],
+        [btn('🔖 УИД', action('uid')), btn('🧾 Договор', action('debt_contract'))],
+        [btn('📆 Период', action('debt_period')), btn('💰 Сумма долга', action('debt_amount'))],
+        [btn('⚖️ Госпошлина', action('state_duty'))],
+        [btn('↩️ Назад к проверке', f'paid:review:{case_id}' if case_id is not None else 'paid:review')],
+    ]
+
+
+def paid_review_menu(case_id: int | None = None) -> MaxKeyboard:
+    suffix = f':{case_id}' if case_id is not None else ''
+    return [
+        [btn('✅ Все верно, пересоздать заявление', f'paid:regenerate{suffix}')],
+        [btn('✏️ Исправить еще поле', f'paid:correction:start{suffix}')],
         [btn('💬 Связаться с менеджером', 'chat:start')],
     ]
 

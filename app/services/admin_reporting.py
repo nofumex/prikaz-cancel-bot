@@ -16,6 +16,15 @@ PROBLEM_EVENT_TYPES = {
     'crm_sync_failed',
 }
 
+PROBLEM_CATEGORIES = {
+    'regenerations': ('Регенерации', {'paid_document_regenerated'}),
+    'missing_fields': ('Нет нужных полей', {'ocr_failed', 'document_qa_failed'}),
+    'document_qa': ('Проверка документа', {'document_qa_failed', 'generation_failed'}),
+    'downloads': ('Загрузка файлов', {'order_download_failed', 'wrong_document_type'}),
+    'payments': ('Оплата', {'payment_failed'}),
+    'crm': ('CRM', {'crm_sync_failed'}),
+}
+
 EVENT_LABELS = {
     'user_started_bot': 'Подписался на бота',
     'order_photo_uploaded': 'Отправил фото приказа',
@@ -143,3 +152,53 @@ async def problem_cases_page(session, page: int, page_size: int) -> tuple[list[C
     for case in cases:
         errors[case.id] = await problem_case_error_text(session, case.id)
     return cases, total, errors
+
+
+async def problem_category_counts(session) -> dict[str, int]:
+    counts = {}
+    for key, (_, event_types) in PROBLEM_CATEGORIES.items():
+        query = select(func.count(func.distinct(CrmSyncLog.case_id))).where(
+            CrmSyncLog.case_id.is_not(None), CrmSyncLog.event_type.in_(event_types)
+        )
+        if key == 'missing_fields':
+            query = query.where(CrmSyncLog.request_payload.ilike('%Не удалось прочитать обязательные поля%'))
+        counts[key] = int(await session.scalar(query) or 0)
+    return counts
+
+
+async def problem_cases_by_category(session, category: str, page: int, page_size: int):
+    event_types = PROBLEM_CATEGORIES.get(category, ('', set()))[1]
+    filters = [CrmSyncLog.case_id.is_not(None), CrmSyncLog.event_type.in_(event_types)]
+    if category == 'missing_fields':
+        filters.append(CrmSyncLog.request_payload.ilike('%Не удалось прочитать обязательные поля%'))
+    total = int(await session.scalar(
+        select(func.count(func.distinct(Case.id))).join(CrmSyncLog, CrmSyncLog.case_id == Case.id).where(*filters)
+    ) or 0)
+    ids = list((await session.execute(
+        select(Case.id).join(CrmSyncLog, CrmSyncLog.case_id == Case.id).where(*filters)
+        .distinct().order_by(Case.created_at.desc(), Case.id.desc()).offset(page * page_size).limit(page_size)
+    )).scalars())
+    cases_by_id = {row.id: row for row in (await session.execute(select(Case).where(Case.id.in_(ids)))).scalars()}
+    cases = [cases_by_id[item] for item in ids if item in cases_by_id]
+    errors = {case.id: await problem_case_error_text(session, case.id) for case in cases}
+    return cases, total, errors
+
+
+async def order_photo_paths(session, case: Case) -> list[str]:
+    paths = []
+    rows = list((await session.execute(
+        select(CrmSyncLog).where(CrmSyncLog.case_id == case.id, CrmSyncLog.event_type == 'order_photo_uploaded')
+        .order_by(CrmSyncLog.created_at.asc(), CrmSyncLog.id.asc())
+    )).scalars())
+    for row in rows:
+        try:
+            payload = json.loads(row.request_payload or '{}').get('payload') or {}
+            for item in payload.get('files') or []:
+                path = str(item.get('path') or '').strip()
+                if path and path not in paths:
+                    paths.append(path)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    if case.order_photo_path and case.order_photo_path not in paths:
+        paths.append(case.order_photo_path)
+    return paths
