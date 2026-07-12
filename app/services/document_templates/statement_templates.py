@@ -171,9 +171,9 @@ def _period_inline(value: str) -> str:
 
 
 def _money_body_phrase(data: dict) -> str:
-    debt = _required(data, "debt_amount").rstrip(".") + "."
     state_duty_raw = _optional(data, "state_duty")
     state_duty = state_duty_raw.rstrip(".") if state_duty_raw else ""
+    debt = _required(data, "debt_amount").rstrip(".") + ("." if state_duty else "")
     total = _optional(data, "total_amount").rstrip(".")
     contract = _optional(data, "debt_contract")
     period = _optional(data, "debt_period")

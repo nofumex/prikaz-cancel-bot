@@ -209,6 +209,22 @@ def test_statement_uses_correct_title():
     assert "всего" not in paragraphs[0].lower()
 
 
+def test_statement_without_state_duty_does_not_duplicate_money_period():
+    data = normalize_order_data({**BELSKY_DATA, "state_duty": "", "total_amount": "78 472 руб. 87 коп."})
+    ctx = StatementContext(
+        data=data,
+        received_date=date(2026, 7, 11),
+        deadline_date=date(2026, 7, 21),
+        document_date=date(2026, 7, 12),
+    )
+
+    first_paragraph = build_statement_paragraphs(ctx)[0]
+
+    assert "коп.." not in first_paragraph
+    assert first_paragraph.endswith("78 472 руб. 87 коп..") is False
+    assert first_paragraph.endswith("78 472 руб. 87 коп.")
+
+
 def test_statement_no_old_dispute_text():
     ctx = StatementContext(
         data=normalize_order_data(BELSKY_DATA),
