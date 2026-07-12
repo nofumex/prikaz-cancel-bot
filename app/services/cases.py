@@ -152,6 +152,8 @@ async def due_unpaid_cases(session: AsyncSession) -> list[Case]:
             Case.status == CaseStatus.PAYMENT_PENDING.value,
             Payment.status == PaymentStatus.PENDING.value,
             Case.deadline_reminder_sent_at.is_(None),
+            Case.reminder_delivery_blocked_at.is_(None),
+            Case.user.has(User.reminder_delivery_blocked_at.is_(None)),
             Payment.created_at <= due_24h,
         )
         .order_by(Case.created_at.asc())
@@ -178,6 +180,8 @@ async def due_no_order_cases(session: AsyncSession) -> list[Case]:
             Case.id.in_(latest_waiting_ids),
             Case.created_at <= due_24h,
             Case.deadline_reminder_sent_at.is_(None),
+            Case.reminder_delivery_blocked_at.is_(None),
+            Case.user.has(User.reminder_delivery_blocked_at.is_(None)),
         )
         .order_by(Case.created_at.asc())
         .limit(50)
@@ -194,6 +198,7 @@ async def due_started_users_without_cases(session: AsyncSession) -> list[User]:
         .where(
             User.created_at <= due_24h,
             User.first_deadline_reminder_sent_at.is_(None),
+            User.reminder_delivery_blocked_at.is_(None),
             User.is_admin.is_(False),
             User.is_manager.is_(False),
             ~case_exists,
@@ -214,6 +219,8 @@ async def due_paid_followup_cases(session: AsyncSession) -> list[Case]:
             Case.paid_at.is_not(None),
             Case.paid_at <= due_48h,
             Case.post_payment_followup_sent_at.is_(None),
+            Case.reminder_delivery_blocked_at.is_(None),
+            Case.user.has(User.reminder_delivery_blocked_at.is_(None)),
         )
         .order_by(Case.paid_at.asc(), Case.created_at.asc())
         .limit(50)
@@ -229,6 +236,8 @@ async def due_case_consultation_reminders(session: AsyncSession) -> list[Case]:
         .where(
             Case.status.not_in([CaseStatus.CANCELED.value, CaseStatus.SUPERSEDED.value]),
             Case.consultation_reminder_sent_at.is_(None),
+            Case.reminder_delivery_blocked_at.is_(None),
+            Case.user.has(User.reminder_delivery_blocked_at.is_(None)),
             or_(
                 Case.deadline_reminder_sent_at <= due_at,
                 Case.post_payment_followup_sent_at <= due_at,
@@ -251,6 +260,7 @@ async def due_user_consultation_reminders(session: AsyncSession) -> list[User]:
             User.first_deadline_reminder_sent_at.is_not(None),
             User.first_deadline_reminder_sent_at <= due_24h,
             User.first_consultation_reminder_sent_at.is_(None),
+            User.reminder_delivery_blocked_at.is_(None),
             User.is_admin.is_(False),
             User.is_manager.is_(False),
             ~case_exists,

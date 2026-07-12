@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from app.adapters.max.bot import _download_event_image
+from app.adapters.max.mapper import IncomingEvent
 from app.config import get_settings
 from app.enums import CaseStatus
 from app.models import Case, User
@@ -47,6 +49,25 @@ def _case(**kwargs) -> Case:
     )
     base.update(kwargs)
     return Case(**base)
+
+
+@pytest.mark.asyncio
+async def test_rephoto_downloads_use_unique_paths(tmp_path) -> None:
+    async def download(url, destination):
+        destination.write_bytes(url.encode())
+        return destination
+
+    client = SimpleNamespace(download_external_url=download)
+    settings = SimpleNamespace(max_download_dir=str(tmp_path))
+    first = IncomingEvent(platform_user_id='1', chat_id='1', message_id='mid.first', photo_url='first')
+    second = IncomingEvent(platform_user_id='1', chat_id='1', message_id='mid.second', photo_url='second')
+
+    first_path = await _download_event_image(client, first, 71, 'order', settings)
+    second_path = await _download_event_image(client, second, 71, 'order', settings)
+
+    assert first_path != second_path
+    assert first_path.read_bytes() == b'first'
+    assert second_path.read_bytes() == b'second'
 
 
 @pytest.mark.asyncio

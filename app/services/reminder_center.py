@@ -32,15 +32,15 @@ async def reminder_counts(session) -> dict[str, dict[str, int]]:
     regular = User.is_admin.is_(False), User.is_manager.is_(False)
     result = {
         'try': {
-            'pending': int(await session.scalar(select(func.count(User.id)).where(*regular, no_case, User.first_deadline_reminder_sent_at.is_(None))) or 0),
+            'pending': int(await session.scalar(select(func.count(User.id)).where(*regular, no_case, User.first_deadline_reminder_sent_at.is_(None), User.reminder_delivery_blocked_at.is_(None))) or 0),
             'sent': int(await session.scalar(select(func.count(User.id)).where(*regular, no_case, User.first_deadline_reminder_sent_at.is_not(None))) or 0),
         },
         'pay': {
-            'pending': int(await session.scalar(select(func.count(Case.id)).where(Case.status == CaseStatus.PAYMENT_PENDING.value, Case.deadline_reminder_sent_at.is_(None))) or 0),
+            'pending': int(await session.scalar(select(func.count(Case.id)).where(Case.status == CaseStatus.PAYMENT_PENDING.value, Case.deadline_reminder_sent_at.is_(None), Case.reminder_delivery_blocked_at.is_(None), Case.user.has(User.reminder_delivery_blocked_at.is_(None)))) or 0),
             'sent': int(await session.scalar(select(func.count(Case.id)).where(Case.status == CaseStatus.PAYMENT_PENDING.value, Case.deadline_reminder_sent_at.is_not(None))) or 0),
         },
         'consultation': {
-            'pending': int(await session.scalar(select(func.count(Case.id)).where(Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]), Case.consultation_reminder_sent_at.is_(None))) or 0),
+            'pending': int(await session.scalar(select(func.count(Case.id)).where(Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]), Case.consultation_reminder_sent_at.is_(None), Case.reminder_delivery_blocked_at.is_(None), Case.user.has(User.reminder_delivery_blocked_at.is_(None)))) or 0),
             'sent': int(await session.scalar(select(func.count(Case.id)).where(Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]), Case.consultation_reminder_sent_at.is_not(None))) or 0),
         },
     }
@@ -78,7 +78,7 @@ async def send_manual_reminders(session, settings, bot, kind: str) -> tuple[int,
     sent = failed = 0
     if kind == 'try':
         no_case = ~select(Case.id).where(Case.user_id == User.id).exists()
-        users = list((await session.execute(select(User).where(User.is_admin.is_(False), User.is_manager.is_(False), no_case, User.first_deadline_reminder_sent_at.is_(None)))).scalars())
+        users = list((await session.execute(select(User).where(User.is_admin.is_(False), User.is_manager.is_(False), no_case, User.first_deadline_reminder_sent_at.is_(None), User.reminder_delivery_blocked_at.is_(None)))).scalars())
         for user in users:
             ok = await _safe_send(_send_user_message(settings, bot, user, config['reminder_try_text'], telegram_markup=main_menu(), max_keyboard=max_keyboards.main_menu()))
             if ok:
@@ -88,9 +88,9 @@ async def send_manual_reminders(session, settings, bot, kind: str) -> tuple[int,
                 failed += 1
     else:
         if kind == 'pay':
-            query = select(Case).where(Case.status == CaseStatus.PAYMENT_PENDING.value, Case.deadline_reminder_sent_at.is_(None))
+            query = select(Case).where(Case.status == CaseStatus.PAYMENT_PENDING.value, Case.deadline_reminder_sent_at.is_(None), Case.reminder_delivery_blocked_at.is_(None), Case.user.has(User.reminder_delivery_blocked_at.is_(None)))
         else:
-            query = select(Case).where(Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]), Case.consultation_reminder_sent_at.is_(None))
+            query = select(Case).where(Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]), Case.consultation_reminder_sent_at.is_(None), Case.reminder_delivery_blocked_at.is_(None), Case.user.has(User.reminder_delivery_blocked_at.is_(None)))
         cases = list((await session.execute(query)).scalars())
         for case in cases:
             await session.refresh(case, ['user'])

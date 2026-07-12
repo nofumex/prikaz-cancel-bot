@@ -13,6 +13,14 @@ from app.adapters.max.keyboards import MaxKeyboard, to_attachments
 logger = logging.getLogger(__name__)
 
 
+class MaxApiError(RuntimeError):
+    def __init__(self, status: int, payload: Any) -> None:
+        self.status = status
+        self.payload = payload
+        self.code = str(payload.get('code') or '') if isinstance(payload, dict) else ''
+        super().__init__(f'MAX API error {status}: {payload}')
+
+
 class MaxBotClient:
     def __init__(
         self,
@@ -58,7 +66,7 @@ class MaxBotClient:
                     await asyncio.sleep(1.5 ** attempt)
                     continue
                 if response.status >= 400:
-                    raise RuntimeError(f"MAX API error {response.status}: {payload}")
+                    raise MaxApiError(response.status, payload)
                 return payload
         raise RuntimeError(f"MAX API error: {last_payload}")
 

@@ -31,6 +31,8 @@ class User(Base):
     admin_notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     first_deadline_reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime)
     first_consultation_reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime)
+    reminder_delivery_blocked_at: Mapped[datetime | None] = mapped_column(DateTime)
+    reminder_delivery_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -65,6 +67,8 @@ class Case(Base):
     deadline_reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime)
     post_payment_followup_sent_at: Mapped[datetime | None] = mapped_column(DateTime)
     consultation_reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime)
+    reminder_delivery_blocked_at: Mapped[datetime | None] = mapped_column(DateTime)
+    reminder_delivery_error: Mapped[str | None] = mapped_column(Text)
     amo_lead_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     amocrm_contact_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     amocrm_lead_id: Mapped[int | None] = mapped_column(BigInteger, index=True)

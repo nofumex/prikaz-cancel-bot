@@ -7,7 +7,7 @@ from datetime import datetime
 from aiogram import Bot
 
 from app.adapters.max import keyboards as max_keyboards
-from app.adapters.max.client import MaxBotClient
+from app.adapters.max.client import MaxApiError, MaxBotClient
 from app.config import get_settings
 from app.database import SessionLocal
 from app.enums import CaseStatus
@@ -155,26 +155,59 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
 
 
 async def _send_case_message(settings, bot: Bot | None, case: Case, text: str, *, telegram_markup=None, max_keyboard=None) -> bool:
-    if case.platform == "max":
-        chat_id = case.platform_chat_id or case.platform_user_id or case.user.platform_user_id
-        if not chat_id:
-            return False
-        await _send_max_message(settings, text, max_keyboard, chat_id=chat_id)
-        return True
-    if bot is not None and case.user.telegram_id:
-        await bot.send_message(case.user.telegram_id, text, reply_markup=telegram_markup)
-        return True
-    return False
+    try:
+        if case.platform == "max":
+            chat_id = case.platform_chat_id or case.platform_user_id or case.user.platform_user_id
+            if not chat_id:
+                return False
+            await _send_max_message(settings, text, max_keyboard, chat_id=chat_id)
+            return True
+        if bot is not None and case.user.telegram_id:
+            await bot.send_message(case.user.telegram_id, text, reply_markup=telegram_markup)
+            return True
+        return False
+    except MaxApiError as exc:
+        if _is_terminal_max_delivery_error(exc):
+            case.reminder_delivery_blocked_at = datetime.utcnow()
+            case.reminder_delivery_error = str(exc)[:1000]
+            case.user.reminder_delivery_blocked_at = case.reminder_delivery_blocked_at
+            case.user.reminder_delivery_error = case.reminder_delivery_error
+            schedule_crm_sync(settings, case.id, case.user.id, 'reminder_delivery_failed', {'note': str(exc)[:1000]})
+            logger.warning('MAX reminder disabled for case_id=%s user_id=%s: %s', case.id, case.user.platform_user_id, exc)
+        else:
+            logger.exception('MAX reminder delivery failed case_id=%s', case.id)
+        return False
+    except Exception:
+        logger.exception('Reminder delivery failed case_id=%s', case.id)
+        return False
 
 
 async def _send_user_message(settings, bot: Bot | None, user: User, text: str, *, telegram_markup=None, max_keyboard=None) -> bool:
-    if user.platform == "max" and user.platform_user_id:
-        await _send_max_message(settings, text, max_keyboard, user_id=user.platform_user_id)
-        return True
-    if bot is not None and user.telegram_id:
-        await bot.send_message(user.telegram_id, text, reply_markup=telegram_markup)
-        return True
-    return False
+    try:
+        if user.platform == "max" and user.platform_user_id:
+            await _send_max_message(settings, text, max_keyboard, user_id=user.platform_user_id)
+            return True
+        if bot is not None and user.telegram_id:
+            await bot.send_message(user.telegram_id, text, reply_markup=telegram_markup)
+            return True
+        return False
+    except MaxApiError as exc:
+        if _is_terminal_max_delivery_error(exc):
+            user.reminder_delivery_blocked_at = datetime.utcnow()
+            user.reminder_delivery_error = str(exc)[:1000]
+            schedule_crm_sync(settings, None, user.id, 'reminder_delivery_failed', {'note': str(exc)[:1000]})
+            logger.warning('MAX reminders disabled for user_id=%s: %s', user.platform_user_id, exc)
+        else:
+            logger.exception('MAX reminder delivery failed user_id=%s', user.platform_user_id)
+        return False
+    except Exception:
+        logger.exception('Reminder delivery failed user_id=%s', user.id)
+        return False
+
+
+def _is_terminal_max_delivery_error(exc: MaxApiError) -> bool:
+    text = str(exc).lower()
+    return exc.status == 403 and (exc.code == 'chat.denied' or 'dialog.suspended' in text)
 
 
 async def _send_max_message(settings, text: str, keyboard=None, *, chat_id: str | int | None = None, user_id: str | int | None = None) -> None:

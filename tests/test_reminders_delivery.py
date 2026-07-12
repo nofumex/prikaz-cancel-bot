@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.adapters.max import keyboards as max_keyboards
+from app.adapters.max.client import MaxApiError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.enums import CaseStatus, PaymentStatus
@@ -22,6 +23,7 @@ from app.services.cases import (
     due_user_consultation_reminders,
 )
 from app.services.document_delivery import delivery_instruction_text
+from app.services.reminders import _send_user_message
 from app.texts import consultation_offer_text, deadline_warning, no_order_deadline_reminder_text, payment_text, post_payment_court_followup_text, unpaid_document_reminder_text
 
 
@@ -283,3 +285,19 @@ def test_delivery_instruction_text_is_caption_sized() -> None:
     assert "Полный вариант заявления DOCX во вложении" in text
     assert "Инструкция по подаче" in text
     assert len(text) < 1024
+
+
+@pytest.mark.asyncio
+async def test_max_suspended_dialog_isolated_and_disabled(monkeypatch) -> None:
+    async def denied(*args, **kwargs):
+        raise MaxApiError(403, {'code': 'chat.denied', 'message': 'error.dialog.suspended'})
+
+    monkeypatch.setattr('app.services.reminders._send_max_message', denied)
+    monkeypatch.setattr('app.services.reminders.schedule_crm_sync', lambda *args, **kwargs: None)
+    user = User(id=7, platform='max', platform_user_id='98496219')
+
+    sent = await _send_user_message(SimpleNamespace(), None, user, 'test')
+
+    assert sent is False
+    assert user.reminder_delivery_blocked_at is not None
+    assert 'chat.denied' in user.reminder_delivery_error

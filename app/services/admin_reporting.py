@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 
@@ -14,6 +16,7 @@ PROBLEM_EVENT_TYPES = {
     'payment_failed',
     'generation_failed',
     'crm_sync_failed',
+    'reminder_delivery_failed',
 }
 
 PROBLEM_CATEGORIES = {
@@ -23,7 +26,17 @@ PROBLEM_CATEGORIES = {
     'downloads': ('Загрузка файлов', {'order_download_failed', 'wrong_document_type'}),
     'payments': ('Оплата', {'payment_failed'}),
     'crm': ('CRM', {'crm_sync_failed'}),
+    'reminders': ('Доставка уведомлений', {'reminder_delivery_failed'}),
 }
+
+CLIENT_PATH_TIMEZONE = ZoneInfo('Asia/Krasnoyarsk')
+
+
+def _event_time_text(value) -> str:
+    if value is None:
+        return 'время не записано'
+    aware = value.replace(tzinfo=UTC) if value.tzinfo is None else value
+    return aware.astimezone(CLIENT_PATH_TIMEZONE).strftime('%d.%m.%Y %H:%M:%S')
 
 EVENT_LABELS = {
     'user_started_bot': 'Подписался на бота',
@@ -47,6 +60,7 @@ EVENT_LABELS = {
     'paid_document_field_corrected': 'Исправил поле',
     'paid_document_regenerated': 'Заявление перегенерировано после оплаты',
     'paid_document_amount_reconciled': 'Сумма долга восстановлена перед регенерацией',
+    'reminder_delivery_failed': 'Не удалось доставить напоминание',
 }
 
 
@@ -103,14 +117,14 @@ async def client_path_text(session, case_id: int) -> str:
                 pass
         if not label or label == previous:
             continue
-        events.append(label)
+        events.append((label, _event_time_text(row.created_at)))
         previous = label
     if not events:
         return 'Путь клиента пока не записан.'
     lines = []
-    for index, label in enumerate(events):
+    for index, (label, event_time) in enumerate(events):
         prefix = '┌' if index == 0 else '└' if index == len(events) - 1 else '├'
-        lines.append(f'{prefix} {label}')
+        lines.append(f'{prefix} {label} — {event_time}')
     return '\n'.join(lines)
 
 

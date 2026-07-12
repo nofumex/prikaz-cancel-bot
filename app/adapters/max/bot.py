@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -158,7 +159,9 @@ async def _download_event_image(client: MaxBotClient, event: IncomingEvent, case
     attachment_id = event.attachment_id or _raw_update_attachment_value(event.raw_update, ID_KEYS)
     if event.document_name:
         suffix = Path(event.document_name).suffix or suffix
-    path = Path(settings.max_download_dir) / f"case_{case_id}_{kind}{suffix}"
+    source_id = event.message_id or str((event.raw_update or {}).get('timestamp') or '')
+    safe_id = re.sub(r'[^A-Za-z0-9_-]+', '_', source_id).strip('_')[-40:] or 'upload'
+    path = Path(settings.max_download_dir) / f"case_{case_id}_{kind}_{safe_id}{suffix}"
     data: bytes | None = None
     method = 'url' if url else 'token' if token else 'id' if attachment_id else 'message'
     logger.info(

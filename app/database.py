@@ -55,6 +55,8 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("deadline_reminder_sent_at", "deadline_reminder_sent_at DATETIME"),
             ("post_payment_followup_sent_at", "post_payment_followup_sent_at DATETIME"),
             ("consultation_reminder_sent_at", "consultation_reminder_sent_at DATETIME"),
+            ("reminder_delivery_blocked_at", "reminder_delivery_blocked_at DATETIME"),
+            ("reminder_delivery_error", "reminder_delivery_error TEXT"),
             ("paid_regeneration_count", "paid_regeneration_count INTEGER NOT NULL DEFAULT 0"),
             ("paid_corrected_fields_json", "paid_corrected_fields_json TEXT"),
         ],
@@ -79,6 +81,8 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("email", "email TEXT"),
             ("first_deadline_reminder_sent_at", "first_deadline_reminder_sent_at DATETIME"),
             ("first_consultation_reminder_sent_at", "first_consultation_reminder_sent_at DATETIME"),
+            ("reminder_delivery_blocked_at", "reminder_delivery_blocked_at DATETIME"),
+            ("reminder_delivery_error", "reminder_delivery_error TEXT"),
         ],
     )
     if "deadline_reminder_sent_at" in added_case_columns:

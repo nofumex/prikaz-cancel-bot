@@ -1,11 +1,24 @@
 from __future__ import annotations
 
 from aiogram.types import User as TelegramUser
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.models import User
+from app.models import Case, User
+
+
+async def _clear_reminder_delivery_block(session: AsyncSession, user: User) -> None:
+    if not user.id or not user.reminder_delivery_blocked_at:
+        return
+    user.reminder_delivery_blocked_at = None
+    user.reminder_delivery_error = None
+    await session.execute(
+        update(Case).where(Case.user_id == user.id).values(
+            reminder_delivery_blocked_at=None,
+            reminder_delivery_error=None,
+        )
+    )
 
 
 async def get_or_create_telegram_user(session: AsyncSession, tg_user: TelegramUser, settings: Settings) -> User:
@@ -21,6 +34,7 @@ async def get_or_create_telegram_user(session: AsyncSession, tg_user: TelegramUs
     user.last_name = tg_user.last_name
     user.is_admin = tg_user.id in settings.admin_ids
     user.is_manager = user.is_admin or tg_user.id in settings.manager_ids
+    await _clear_reminder_delivery_block(session, user)
     await session.commit()
     await session.refresh(user)
     return user
@@ -51,6 +65,7 @@ async def get_or_create_platform_user(
             max_id = None
         user.is_admin = bool(max_id is not None and max_id in settings.max_admin_ids)
         user.is_manager = user.is_admin
+    await _clear_reminder_delivery_block(session, user)
     await session.commit()
     await session.refresh(user)
     return user
