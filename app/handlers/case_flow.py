@@ -297,7 +297,7 @@ async def choose_manual_date(callback: CallbackQuery, state: FSMContext, session
     await callback.answer()
 
 
-@router.message(CaseStates.waiting_manual_date)
+@router.message(CaseStates.waiting_manual_date, F.text, ~F.text.startswith('/'))
 async def receive_manual_date(message: Message, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
     state_data = await state.get_data()
     case = await session.get(Case, state_data['case_id'])
@@ -805,6 +805,8 @@ async def _generate_documents_flow(
             return False
     preview_file = preview_pdf or preview_docx
     if not payments_enabled():
+        if state is not None:
+            await state.clear()
         if preview_file:
             await message.answer_document(
                 FSInputFile(preview_file),
@@ -1011,7 +1013,11 @@ async def payment_check(callback: CallbackQuery, session: AsyncSession, settings
 async def deliver_full_documents(message: Message, session: AsyncSession, case: Case, settings: Settings | None = None, user: User | None = None) -> None:
     if not case.full_doc_path or not Path(case.full_doc_path).exists():
         raise RuntimeError("Full DOCX file not found")
-    await message.answer_document(FSInputFile(case.full_doc_path), caption=delivery_instruction_text(case))
+    await message.answer_document(
+        FSInputFile(case.full_doc_path),
+        caption=delivery_instruction_text(case),
+        reply_markup=paid_document_actions(),
+    )
     case.status = CaseStatus.DELIVERED.value
     case.delivered_at = datetime.utcnow()
     await session.commit()
