@@ -377,6 +377,10 @@ async def receive_payment_contact(message: Message, state: FSMContext, session: 
         return
     current_user.phone = phone
     await session.commit()
+    await message.answer(
+        "<b>🔄 Заявление составляется, нужно немного подождать...</b>",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     schedule_crm_sync(settings, case.id, current_user.id, "phone_provided", {"note": "Пользователь указал номер телефона"})
     if case.preview_pdf_path or case.preview_doc_path:
         await _finalize_payment(message, state, session, settings, current_user, case)

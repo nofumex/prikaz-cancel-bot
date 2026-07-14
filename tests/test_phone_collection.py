@@ -46,7 +46,7 @@ def test_phone_share_keyboards_use_native_contact_buttons() -> None:
     }
 
 
-def test_max_mapper_reads_phone_from_contact_attachment() -> None:
+def test_max_mapper_reads_phone_from_incoming_contact_vcard() -> None:
     event = parse_update(
         {
             "update_type": "message_created",
@@ -57,7 +57,17 @@ def test_max_mapper_reads_phone_from_contact_attachment() -> None:
                     "attachments": [
                         {
                             "type": "contact",
-                            "payload": {"vcf_phone": "+7 (999) 123-45-67", "hash": "signed"},
+                            "payload": {
+                                "vcf_info": (
+                                    "BEGIN:VCARD\n"
+                                    "VERSION:3.0\n"
+                                    "FN:Егор\n"
+                                    "TEL;TYPE=CELL:+7 (999) 123-45-67\n"
+                                    "END:VCARD"
+                                ),
+                                "max_info": {"user_id": 42, "name": "Егор"},
+                                "hash": "signed",
+                            },
                         }
                     ]
                 },
@@ -70,7 +80,7 @@ def test_max_mapper_reads_phone_from_contact_attachment() -> None:
 
 
 @pytest.mark.asyncio
-async def test_telegram_contact_is_saved_then_generation_starts_without_confirmation_message(monkeypatch) -> None:
+async def test_telegram_contact_shows_progress_then_starts_generation(monkeypatch) -> None:
     settings = _settings(show_user_confirmation_step=False, amocrm_enabled=False)
     case = _case("telegram")
     user = User(id=7, platform="telegram", platform_user_id="42")
@@ -92,7 +102,9 @@ async def test_telegram_contact_is_saved_then_generation_starts_without_confirma
 
     assert user.phone == "+79991234567"
     session.commit.assert_awaited_once()
-    assert message.answer.await_count == 0
+    message.answer.assert_awaited_once()
+    assert message.answer.await_args.args[0] == "<b>🔄 Заявление составляется, нужно немного подождать...</b>"
+    assert message.answer.await_args.kwargs["reply_markup"].remove_keyboard is True
     assert scheduled[0][3] == "phone_provided"
     assert generate.await_args.kwargs["remove_phone_keyboard"] is True
 
@@ -118,6 +130,57 @@ async def test_max_contact_is_saved_then_generation_starts_without_confirmation_
     session.commit.assert_awaited_once()
     assert client.send_message.await_count == 0
     assert scheduled[0][3] == "phone_provided"
+    generate.assert_awaited_once_with(client, event, session, settings, user, case)
+
+
+@pytest.mark.asyncio
+async def test_max_incoming_contact_vcard_runs_the_phone_flow_end_to_end(monkeypatch) -> None:
+    settings = _settings(show_user_confirmation_step=False, amocrm_enabled=False)
+    case = _case("max")
+    user = User(id=7, platform="max", platform_user_id="42")
+    event = parse_update(
+        {
+            "update_type": "message_created",
+            "message": {
+                "sender": {"user_id": 42},
+                "recipient": {"chat_id": 99},
+                "body": {
+                    "attachments": [
+                        {
+                            "type": "contact",
+                            "payload": {
+                                "vcf_info": "BEGIN:VCARD\nVERSION:4.0\nFN:Егор\nTEL;VALUE=uri:tel:+79991234567\nEND:VCARD",
+                                "max_info": {"user_id": 42, "name": "Егор"},
+                            },
+                        }
+                    ]
+                },
+            },
+        }
+    )
+    session = SimpleNamespace(get=AsyncMock(return_value=case), commit=AsyncMock())
+
+    class SessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    client = SimpleNamespace(send_message=AsyncMock(), answer_callback=AsyncMock())
+    generate = AsyncMock()
+
+    monkeypatch.setattr(max_bot, "SessionLocal", lambda: SessionContext())
+    monkeypatch.setattr(max_bot, "get_or_create_platform_user", AsyncMock(return_value=user))
+    monkeypatch.setattr(max_bot, "_state", AsyncMock(return_value=max_bot.STATE_PAYMENT_CONTACT))
+    monkeypatch.setattr(max_bot, "_state_data", AsyncMock(return_value={"case_id": case.id}))
+    monkeypatch.setattr(max_bot, "_generate_documents", generate)
+    monkeypatch.setattr(max_bot, "schedule_crm_sync", lambda *args: None)
+
+    await max_bot.handle_update(client, event, settings)
+
+    assert user.phone == "+79991234567"
+    assert client.send_message.await_count == 0
     generate.assert_awaited_once_with(client, event, session, settings, user, case)
 
 

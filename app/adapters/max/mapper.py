@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -101,6 +102,22 @@ def _normalized_attachments(update: dict[str, Any], message: dict[str, Any]) -> 
         if _payload_url(payload) or _payload_token(payload):
             attachments.append(candidate)
     return attachments
+
+
+def _contact_phone(payload: dict[str, Any]) -> str | None:
+    for key in ("vcf_phone", "phone", "phone_number"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+
+    vcf_info = payload.get("vcf_info")
+    if not isinstance(vcf_info, str):
+        return None
+    match = re.search(
+        r"(?im)^(?:[a-z0-9_-]+\.)?TEL(?:;[^:\r\n]*)?:(?:tel:)?([^\r\n]+)",
+        vcf_info,
+    )
+    return match.group(1).strip() if match else None
 
 
 def _payload_url(payload: dict[str, Any]) -> str | None:
@@ -231,14 +248,7 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
         if str(candidate.get("type") or candidate.get("attachment_type") or "").lower() != "contact":
             continue
         payload = _as_dict(candidate.get("payload")) or candidate
-        contact_phone = next(
-            (
-                str(payload[key])
-                for key in ("vcf_phone", "phone", "phone_number")
-                if payload.get(key)
-            ),
-            None,
-        )
+        contact_phone = _contact_phone(payload)
         if contact_phone:
             break
     for att in _normalized_attachments(update, message):
