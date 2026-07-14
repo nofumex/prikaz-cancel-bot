@@ -42,7 +42,7 @@ def to_attachments(keyboard: MaxKeyboard | None) -> list[dict] | None:
 
 
 def phone_request_keyboard() -> MaxKeyboard:
-    return [[contact_btn("Поделиться номером телефона")]]
+    return [[contact_btn("Поделиться контактом")]]
 
 
 def main_menu() -> MaxKeyboard:

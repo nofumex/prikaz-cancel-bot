@@ -14,7 +14,7 @@ def btn(text: str, callback_data: str | None = None, url: str | None = None) -> 
 
 def phone_request_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Поделиться номером телефона", request_contact=True)]],
+        keyboard=[[KeyboardButton(text="Поделиться контактом", request_contact=True)]],
         resize_keyboard=True,
         one_time_keyboard=True,
     )

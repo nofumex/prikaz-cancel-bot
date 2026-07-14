@@ -213,7 +213,12 @@ def _resolve_receipt_contact(current_user: User, settings: Settings) -> str | No
 
 async def _request_payment_contact(client: MaxBotClient, event: IncomingEvent, session, case: Case) -> None:
     await _set_state(session, event, STATE_PAYMENT_CONTACT, {"case_id": case.id})
-    await _send(client, event, "Укажите свой номер телефона для связи с судом", keyboards.phone_request_keyboard())
+    await _send(
+        client,
+        event,
+        '<b>Укажите свой номер телефона для связи с судом</b>\n\nНажмите кнопку \"Поделиться контактом\" снизу',
+        keyboards.phone_request_keyboard(),
+    )
 
 
 async def _finalize_payment(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User, case: Case, *, state=None) -> bool:

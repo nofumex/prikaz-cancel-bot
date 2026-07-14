@@ -125,7 +125,7 @@ async def test_after_known_date_requests_phone_before_preview_and_payment(monkey
     assert mock_generate.await_count == 0
     assert state.set_state.await_count == 1
     assert state.set_state.await_args.args[0].state == CaseStates.waiting_payment_contact.state
-    assert message.answer.await_args.args[0] == "Укажите свой номер телефона для связи с судом"
+    assert message.answer.await_args.args[0] == '<b>Укажите свой номер телефона для связи с судом</b>\n\nНажмите кнопку \"Поделиться контактом\" снизу'
 
 
 @pytest.mark.asyncio
@@ -307,7 +307,7 @@ async def test_max_manual_date_requests_phone_before_order_processing(monkeypatc
     assert case.received_date == date(2026, 6, 19)
     assert generate.await_count == 0
     assert max_bot._set_state.await_args.args[2] == max_bot.STATE_PAYMENT_CONTACT
-    assert client.send_message.await_args.kwargs["text"] == "Укажите свой номер телефона для связи с судом"
+    assert client.send_message.await_args.kwargs["text"] == '<b>Укажите свой номер телефона для связи с судом</b>\n\nНажмите кнопку \"Поделиться контактом\" снизу'
 
 @pytest.mark.asyncio
 async def test_max_lost_state_photo_recovers_latest_waiting_case(monkeypatch):

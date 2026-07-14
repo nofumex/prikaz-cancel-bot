@@ -37,12 +37,12 @@ def _case(platform: str) -> Case:
 def test_phone_share_keyboards_use_native_contact_buttons() -> None:
     telegram_button = phone_request_keyboard().keyboard[0][0]
     assert telegram_button.request_contact is True
-    assert telegram_button.text == "Поделиться номером телефона"
+    assert telegram_button.text == "Поделиться контактом"
 
     max_attachment = to_attachments(max_phone_request_keyboard())
     assert max_attachment[0]["payload"]["buttons"][0][0] == {
         "type": "request_contact",
-        "text": "Поделиться номером телефона",
+        "text": "Поделиться контактом",
     }
 
 

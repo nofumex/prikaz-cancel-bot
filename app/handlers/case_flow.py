@@ -140,7 +140,10 @@ def _resolve_receipt_contact(current_user: User, settings: Settings) -> str | No
 async def _request_payment_contact(message: Message, state: FSMContext, case: Case) -> None:
     await state.update_data(case_id=case.id)
     await state.set_state(CaseStates.waiting_payment_contact)
-    await message.answer("Укажите свой номер телефона для связи с судом", reply_markup=phone_request_keyboard())
+    await message.answer(
+        '<b>Укажите свой номер телефона для связи с судом</b>\n\nНажмите кнопку \"Поделиться контактом\" снизу',
+        reply_markup=phone_request_keyboard(),
+    )
 
 
 async def _finalize_payment(message: Message, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User, case: Case) -> bool:
