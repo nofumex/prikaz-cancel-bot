@@ -190,6 +190,7 @@ class IncomingEvent:
     document_mime: str | None = None
     attachment_type: str | None = None
     attachment_id: str | None = None
+    contact_phone: str | None = None
     update_type: str | None = None
     sender_is_bot: bool = False
     has_raw_attachment: bool = False
@@ -222,7 +223,24 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
     document_mime = None
     attachment_type = None
     attachment_id = None
+    contact_phone = None
 
+    for candidate in raw_attachments:
+        if not isinstance(candidate, dict):
+            continue
+        if str(candidate.get("type") or candidate.get("attachment_type") or "").lower() != "contact":
+            continue
+        payload = _as_dict(candidate.get("payload")) or candidate
+        contact_phone = next(
+            (
+                str(payload[key])
+                for key in ("vcf_phone", "phone", "phone_number")
+                if payload.get(key)
+            ),
+            None,
+        )
+        if contact_phone:
+            break
     for att in _normalized_attachments(update, message):
         if update_type == 'message_callback' or sender_is_bot:
             break
@@ -287,6 +305,7 @@ def parse_update(update: dict[str, Any]) -> IncomingEvent | None:
         document_mime=document_mime,
         attachment_type=attachment_type,
         attachment_id=attachment_id,
+        contact_phone=contact_phone,
         update_type=update_type,
         sender_is_bot=sender_is_bot,
         has_raw_attachment=bool(raw_attachments),

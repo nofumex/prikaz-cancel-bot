@@ -8,6 +8,7 @@ class MaxButton:
     text: str
     callback_data: str | None = None
     url: str | None = None
+    request_contact: bool = False
 
 
 MaxKeyboard = list[list[MaxButton]]
@@ -17,6 +18,10 @@ def btn(text: str, callback_data: str | None = None, url: str | None = None) -> 
     return MaxButton(text=text, callback_data=callback_data, url=url)
 
 
+def contact_btn(text: str) -> MaxButton:
+    return MaxButton(text=text, request_contact=True)
+
+
 def to_attachments(keyboard: MaxKeyboard | None) -> list[dict] | None:
     if not keyboard:
         return None
@@ -24,7 +29,9 @@ def to_attachments(keyboard: MaxKeyboard | None) -> list[dict] | None:
     for row in keyboard:
         buttons = []
         for button in row:
-            if button.url:
+            if button.request_contact:
+                buttons.append({"type": "request_contact", "text": button.text})
+            elif button.url:
                 buttons.append({"type": "link", "text": button.text, "url": button.url})
             elif button.callback_data:
                 buttons.append({"type": "callback", "text": button.text, "payload": button.callback_data})
@@ -32,6 +39,10 @@ def to_attachments(keyboard: MaxKeyboard | None) -> list[dict] | None:
                 buttons.append({"type": "message", "text": button.text})
         rows.append(buttons)
     return [{"type": "inline_keyboard", "payload": {"buttons": rows}}]
+
+
+def phone_request_keyboard() -> MaxKeyboard:
+    return [[contact_btn("Поделиться номером телефона")]]
 
 
 def main_menu() -> MaxKeyboard:

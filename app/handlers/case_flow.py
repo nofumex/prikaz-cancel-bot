@@ -11,13 +11,13 @@ from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.types import CallbackQuery, FSInputFile, Message, ReplyKeyboardRemove
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.enums import CaseStatus, PaymentStatus
-from app.keyboards.common import case_menu, confirm_extraction, debtor_name_fix_menu, document_details_menu, documents_menu, edit_fields_menu, envelope_choice, main_menu, order_rephoto_menu, paid_date_required_menu, paid_document_actions, paid_edit_fields_menu, paid_review_menu, restore_reason_menu
+from app.keyboards.common import case_menu, confirm_extraction, debtor_name_fix_menu, document_details_menu, documents_menu, edit_fields_menu, envelope_choice, main_menu, order_rephoto_menu, phone_request_keyboard, paid_date_required_menu, paid_document_actions, paid_edit_fields_menu, paid_review_menu, restore_reason_menu
 from app.models import Case, Payment, User
 from app.services.amocrm import get_amocrm_service
 from app.services.crm_background import schedule_crm_sync
@@ -49,7 +49,7 @@ from app.services.received_date import received_date_prompt_text, save_received_
 from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaError, YooKassaReceiptContactRequired
 from app.texts import case_summary, manual_received_date_prompt_text, payment_text
-from app.utils import ensure_dir, h, normalize_receipt_contact, parse_russian_date
+from app.utils import ensure_dir, h, normalize_phone, normalize_receipt_contact, parse_russian_date
 
 router = Router(name="case_flow")
 logger = logging.getLogger(__name__)
@@ -140,7 +140,7 @@ def _resolve_receipt_contact(current_user: User, settings: Settings) -> str | No
 async def _request_payment_contact(message: Message, state: FSMContext, case: Case) -> None:
     await state.update_data(case_id=case.id)
     await state.set_state(CaseStates.waiting_payment_contact)
-    await message.answer("Для оплаты укажите email для чека.")
+    await message.answer("Укажите свой номер телефона для связи с судом", reply_markup=phone_request_keyboard())
 
 
 async def _finalize_payment(message: Message, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User, case: Case) -> bool:
@@ -358,29 +358,41 @@ async def receive_manual_date(message: Message, state: FSMContext, session: Asyn
         await state.set_state(CaseStates.waiting_order_rephoto)
         await _send_order_rephoto_prompt(message, missing, attempts=case.order_rephoto_attempts)
         return
-    if settings.show_user_confirmation_step:
-        await state.clear()
-        await message.answer(extraction_preview(extracted, case.received_date, [], case.deadline_date), reply_markup=confirm_extraction())
-        return
-    await _generate_documents_flow(message, session, settings, current_user, case, state=state, bot=message.bot)
+    await _request_payment_contact(message, state, case)
     return
 
 
+@router.message(CaseStates.waiting_payment_contact, F.contact)
 @router.message(CaseStates.waiting_payment_contact, F.text)
 async def receive_payment_contact(message: Message, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
     data = await state.get_data()
     case = await session.get(Case, data["case_id"])
-    contact = normalize_receipt_contact(message.text)
-    if not contact:
-        await message.answer("Напишите email для чека или номер телефона в международном формате.")
+    raw_phone = message.contact.phone_number if message.contact else message.text
+    phone = normalize_phone(raw_phone)
+    if not phone:
+        await message.answer("Укажите корректный номер телефона.", reply_markup=phone_request_keyboard())
         return
-    if contact[0] == "email":
-        current_user.email = contact[1]
-    else:
-        current_user.phone = contact[1]
+    current_user.phone = phone
     await session.commit()
-    await message.answer(f"✅ Контакт для чека сохранен: <code>{h(contact[1])}</code>.")
-    await _finalize_payment(message, state, session, settings, current_user, case)
+    schedule_crm_sync(settings, case.id, current_user.id, "phone_provided", {"note": "Пользователь указал номер телефона"})
+    if case.preview_pdf_path or case.preview_doc_path:
+        await _finalize_payment(message, state, session, settings, current_user, case)
+        return
+    extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    if settings.show_user_confirmation_step:
+        await state.clear()
+        await message.answer(extraction_preview(extracted, case.received_date, [], case.deadline_date), reply_markup=confirm_extraction())
+        return
+    await _generate_documents_flow(
+        message,
+        session,
+        settings,
+        current_user,
+        case,
+        state=state,
+        bot=message.bot,
+        remove_phone_keyboard=True,
+    )
 
 
 @router.message(CaseStates.waiting_envelope_photo, F.photo)
@@ -485,13 +497,7 @@ async def _extract_and_process_order(
         await message.answer(received_date_prompt_text())
         return
 
-    if settings.show_user_confirmation_step:
-        await message.answer(extraction_preview(extracted, case.received_date, missing, case.deadline_date), reply_markup=confirm_extraction())
-        if name_result and name_result.raw != name_result.normalized and name_result.confidence < 0.85:
-            await _prompt_debtor_name_fix(message, extracted.get("debtor_full_name") or name_result.raw)
-        return
-
-    await _generate_documents_flow(message, session, settings, current_user, case, state=state, bot=message.bot)
+    await _request_payment_contact(message, state, case)
 
 
 @router.callback_query(F.data == "case:rephoto_order")
@@ -736,6 +742,7 @@ async def _generate_documents_flow(
     state: FSMContext | None = None,
     restore_reason: str | None = None,
     bot: Bot | None = None,
+    remove_phone_keyboard: bool = False,
 ) -> bool:
     data = normalize_order_data(json.loads(case.extracted_json or "{}"))
     validation = validate_before_generation(data, case.received_date)
@@ -850,12 +857,14 @@ async def _generate_documents_flow(
                 await _notify_admin_qa_failure(bot, settings, case, "нет preview PDF")
             return False
     preview_file = preview_pdf or preview_docx
+    preview_reply_markup = ReplyKeyboardRemove() if remove_phone_keyboard else None
     if not payments_enabled():
         if state is not None:
             await state.clear()
         if preview_file:
             await message.answer_document(
                 FSInputFile(preview_file),
+                reply_markup=preview_reply_markup,
                 caption="Предпросмотр заявления." if preview_pdf else "Предпросмотр заявления (dev-only DOCX).",
         )
         await message.answer("🧪 Режим оплаты выключен. Сразу отправляю полный DOCX для теста.")
@@ -864,11 +873,9 @@ async def _generate_documents_flow(
     if preview_file:
         await message.answer_document(
             FSInputFile(preview_file),
+            reply_markup=preview_reply_markup,
             caption="Скрытый предпросмотр заявления." if preview_pdf else "Скрытый предпросмотр заявления (dev-only DOCX).",
         )
-    if settings.yookassa_enabled and settings.yookassa_receipt_enabled and not _resolve_receipt_contact(current_user, settings):
-        await _request_payment_contact(message, state, case)
-        return True
     return await _finalize_payment(message, state, session, settings, current_user, case)
 
 

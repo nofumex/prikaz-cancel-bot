@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 
 def btn(text: str, callback_data: str | None = None, url: str | None = None) -> InlineKeyboardButton:
@@ -10,6 +10,14 @@ def btn(text: str, callback_data: str | None = None, url: str | None = None) -> 
     if url:
         kwargs["url"] = url
     return InlineKeyboardButton(**kwargs)
+
+
+def phone_request_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Поделиться номером телефона", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 
 def main_menu() -> InlineKeyboardMarkup:

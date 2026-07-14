@@ -32,7 +32,7 @@ from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaReceiptContactRequired
 from app.services.users import get_or_create_platform_user
 from app.texts import case_summary, help_text, manual_received_date_prompt_text, payment_text, profile_text, welcome_text
-from app.utils import ensure_dir, h, normalize_receipt_contact, parse_russian_date
+from app.utils import ensure_dir, h, normalize_phone, normalize_receipt_contact, parse_russian_date
 
 DATE_PROMPT = received_date_prompt_text()
 
@@ -213,7 +213,7 @@ def _resolve_receipt_contact(current_user: User, settings: Settings) -> str | No
 
 async def _request_payment_contact(client: MaxBotClient, event: IncomingEvent, session, case: Case) -> None:
     await _set_state(session, event, STATE_PAYMENT_CONTACT, {"case_id": case.id})
-    await _send(client, event, "Для оплаты укажите email для чека.")
+    await _send(client, event, "Укажите свой номер телефона для связи с судом", keyboards.phone_request_keyboard())
 
 
 async def _finalize_payment(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User, case: Case, *, state=None) -> bool:
@@ -239,19 +239,25 @@ async def _notify_admin_download_failure(client: MaxBotClient, event: IncomingEv
             logger.exception("Failed to notify MAX admin %s about download failure", admin_id)
 
 
-async def _handle_payment_contact(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User, text: str) -> None:
-    contact = normalize_receipt_contact(text)
-    if not contact:
-        await _send(client, event, "Напишите email для чека или номер телефона в международном формате.")
+async def _handle_payment_contact(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User, raw_phone: str) -> None:
+    phone = normalize_phone(raw_phone)
+    if not phone:
+        await _send(client, event, "Укажите корректный номер телефона.", keyboards.phone_request_keyboard())
         return
-    if contact[0] == "email":
-        user.email = contact[1]
-    else:
-        user.phone = contact[1]
+    user.phone = phone
     await session.commit()
     data = await _state_data(session, event)
     case = await session.get(Case, data["case_id"])
-    await _finalize_payment(client, event, session, settings, user, case)
+    schedule_crm_sync(settings, case.id, user.id, "phone_provided", {"note": "MAX: пользователь указал номер телефона"})
+    if case.preview_pdf_path or case.preview_doc_path:
+        await _finalize_payment(client, event, session, settings, user, case)
+        return
+    extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    if settings.show_user_confirmation_step:
+        await _clear_state(session, event)
+        await _send(client, event, extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.confirm_extraction())
+        return
+    await _generate_documents(client, event, session, settings, user, case)
 
 
 async def _recover_state_for_input(session, event: IncomingEvent, user: User, *, has_attachment: bool, is_date_text: bool) -> str | None:
@@ -562,10 +568,14 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             await _send(client, event, 'Эта кнопка больше неактуальна. Выберите действие в меню.', keyboards.main_menu())
             return
 
-        if current_state == STATE_PAYMENT_CONTACT and event.text:
-            await _handle_payment_contact(client, event, session, settings, user, event.text)
+        if current_state == STATE_PAYMENT_CONTACT and (event.contact_phone or event.text):
+            await _handle_payment_contact(client, event, session, settings, user, event.contact_phone or event.text)
             return
 
+
+        if current_state == STATE_PAYMENT_CONTACT:
+            await _send(client, event, "Укажите корректный номер телефона.", keyboards.phone_request_keyboard())
+            return
 
         if current_state in {STATE_ORDER_PHOTO, STATE_ORDER_REPHOTO} and has_attachment:
             await _handle_order_image(client, event, session, settings, user)
@@ -771,11 +781,7 @@ async def _handle_manual_date(client: MaxBotClient, event: IncomingEvent, sessio
         await _set_state(session, event, STATE_ORDER_REPHOTO, {'case_id': case.id})
         await _send_order_rephoto_prompt(client, event, missing, attempts=case.order_rephoto_attempts)
         return
-    if settings.show_user_confirmation_step:
-        await _clear_state(session, event)
-        await _send(client, event, extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.confirm_extraction())
-        return
-    await _generate_documents(client, event, session, settings, user, case)
+    await _request_payment_contact(client, event, session, case)
     return
 
 
@@ -819,10 +825,7 @@ async def _extract_and_process_order(client: MaxBotClient, event: IncomingEvent,
         await _set_state(session, event, STATE_MANUAL_DATE, {'case_id': case.id})
         await _send(client, event, received_date_prompt_text())
         return
-    if settings.show_user_confirmation_step:
-        await _send(client, event, extraction_preview(extracted, case.received_date, missing, case.deadline_date), keyboards.confirm_extraction())
-        return
-    await _generate_documents(client, event, session, settings, user, case)
+    await _request_payment_contact(client, event, session, case)
 
 
 async def _send_review(client: MaxBotClient, event: IncomingEvent, session, user: User) -> None:
@@ -921,9 +924,6 @@ async def _generate_documents(client: MaxBotClient, event: IncomingEvent, sessio
         return
     if preview_file:
         await client.send_file(event.chat_id, preview_file, caption="Скрытый предпросмотр заявления.")
-    if settings.yookassa_enabled and settings.yookassa_receipt_enabled and not _resolve_receipt_contact(user, settings):
-        await _request_payment_contact(client, event, session, case)
-        return
     await _finalize_payment(client, event, session, settings, user, case)
 
 

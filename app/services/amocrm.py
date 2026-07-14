@@ -795,8 +795,14 @@ class AmoCrmService:
         current_case_id = user.amocrm_current_case_id
         new_cycle = current_case_id != case.id
         try:
-            if not (case.amocrm_lead_id or case.amo_lead_id):
+            if event_type == "phone_provided":
                 contact_id = await self.create_or_update_contact(user)
+                if contact_id:
+                    user.amocrm_contact_id = contact_id
+                    case.amocrm_contact_id = contact_id
+
+            if not (case.amocrm_lead_id or case.amo_lead_id):
+                contact_id = user.amocrm_contact_id if event_type == "phone_provided" else await self.create_or_update_contact(user)
                 if contact_id:
                     user.amocrm_contact_id = contact_id
                     case.amocrm_contact_id = contact_id

@@ -92,7 +92,8 @@ def test_max_file_attachment_reads_top_level_filename_and_camelcase_id():
 
 
 @pytest.mark.asyncio
-async def test_after_manual_date_auto_generates_preview_and_payment(monkeypatch):
+async def test_after_known_date_requests_phone_before_preview_and_payment(monkeypatch):
+    from app.handlers.case_flow import CaseStates
     settings = _make_settings(show_user_confirmation_step=False, amocrm_enabled=False)
     case = _case()
     user = User(id=1, platform="telegram", platform_user_id="1")
@@ -121,8 +122,10 @@ async def test_after_manual_date_auto_generates_preview_and_payment(monkeypatch)
 
     await _extract_and_process_order(message, state, session, settings, case, user)
 
-    assert mock_generate.await_count == 1
-    assert state.set_state.await_count == 0
+    assert mock_generate.await_count == 0
+    assert state.set_state.await_count == 1
+    assert state.set_state.await_args.args[0].state == CaseStates.waiting_payment_contact.state
+    assert message.answer.await_args.args[0] == "Укажите свой номер телефона для связи с судом"
 
 
 @pytest.mark.asyncio
@@ -277,7 +280,7 @@ async def test_max_photo_event_without_text_keeps_case_flow(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_max_manual_date_starts_order_processing(monkeypatch):
+async def test_max_manual_date_requests_phone_before_order_processing(monkeypatch):
     from app.adapters.max import bot as max_bot
     from app.adapters.max.mapper import IncomingEvent
 
@@ -294,6 +297,7 @@ async def test_max_manual_date_starts_order_processing(monkeypatch):
         case_arg.deadline_date = date(2026, 6, 29)
 
     monkeypatch.setattr(max_bot, "_state_data", AsyncMock(return_value={"case_id": 1}))
+    monkeypatch.setattr(max_bot, "_set_state", AsyncMock())
     monkeypatch.setattr(max_bot, 'save_received_date', fake_save_received_date)
     monkeypatch.setattr(max_bot, "schedule_crm_sync", lambda *args, **kwargs: None)
     monkeypatch.setattr(max_bot, '_generate_documents', generate)
@@ -301,7 +305,9 @@ async def test_max_manual_date_starts_order_processing(monkeypatch):
     await max_bot._handle_manual_date(client, event, session, settings, user, "19.06.2026")
 
     assert case.received_date == date(2026, 6, 19)
-    assert generate.await_count == 1
+    assert generate.await_count == 0
+    assert max_bot._set_state.await_args.args[2] == max_bot.STATE_PAYMENT_CONTACT
+    assert client.send_message.await_args.kwargs["text"] == "Укажите свой номер телефона для связи с судом"
 
 @pytest.mark.asyncio
 async def test_max_lost_state_photo_recovers_latest_waiting_case(monkeypatch):
