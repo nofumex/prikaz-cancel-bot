@@ -641,24 +641,21 @@ async def extract_order_data(
     )
     classic_task = asyncio.create_task(extract_classic_ocr_text(order_photo_path, case_id=case_id))
 
-    async def verifier_after_classic() -> tuple[dict[str, Any], LLMResult]:
-        classic_text = await classic_task
-        return await _extract_order_evidence(
+    verifier_task = asyncio.create_task(
+        _extract_order_evidence(
             settings,
             None,
             case_id=case_id,
             user_id=user_id,
             order_photo_path=order_photo_path,
-            classic_ocr_text=classic_text,
+            classic_ocr_text="",
         )
-
-    verifier_task = asyncio.create_task(verifier_after_classic())
+    )
     # Money is read by a role-specific extractor in parallel, so the
     # arithmetic invariant does not add another full round-trip on mismatch.
     amounts_task = asyncio.create_task(
-        extract_order_amounts(
+        _extract_order_amounts_result(
             settings,
-            None,
             case_id=case_id,
             user_id=user_id,
             order_photo_path=order_photo_path,
@@ -718,8 +715,20 @@ async def extract_order_data(
         verifier_payload,
         adjudicator_result,
     )
-    if not isinstance(amounts_result, BaseException):
-        amount_recovery = recover_amounts_from_mismatch(decision.data, amounts_result)
+    if isinstance(amounts_result, BaseException):
+        await record_openai_usage(
+            settings, session, case_id=case_id, user_id=user_id,
+            operation="amounts_ocr_retry", model=settings.vision_model,
+            success=False, error_message=str(amounts_result),
+        )
+    else:
+        amounts_payload, amounts_llm_result = amounts_result
+        await record_openai_usage(
+            settings, session, case_id=case_id, user_id=user_id,
+            operation="amounts_ocr_retry", model=amounts_llm_result.model,
+            result=amounts_llm_result, success=True,
+        )
+        amount_recovery = recover_amounts_from_mismatch(decision.data, amounts_payload)
         if amount_recovery.applied:
             decision.data = amount_recovery.order_data
             decision.applied_fields.update(
@@ -761,8 +770,32 @@ async def extract_order_amounts(
     user_id: int | None,
     order_photo_path: str,
 ) -> dict[str, Any]:
+    try:
+        amounts, result = await _extract_order_amounts_result(
+            settings, case_id=case_id, user_id=user_id, order_photo_path=order_photo_path
+        )
+    except Exception as exc:
+        await record_openai_usage(
+            settings, session, case_id=case_id, user_id=user_id,
+            operation="amounts_ocr_retry", model=settings.vision_model,
+            success=False, error_message=str(exc),
+        )
+        raise
+    await record_openai_usage(
+        settings, session, case_id=case_id, user_id=user_id,
+        operation="amounts_ocr_retry", model=result.model, result=result, success=True,
+    )
+    return amounts
+
+
+async def _extract_order_amounts_result(
+    settings: Settings,
+    *,
+    case_id: int | None,
+    user_id: int | None,
+    order_photo_path: str,
+) -> tuple[dict[str, Any], LLMResult]:
     image_variants = build_amount_ocr_variants(order_photo_path, case_id=case_id)
-    result: LLMResult | None = None
     instructions = (
         "Прочитай на фото судебного приказа только денежные суммы.\n\n"
         "Найди ровно три значения:\n"
@@ -776,36 +809,13 @@ async def extract_order_amounts(
         'Особое внимание удели копейкам после "руб." и перед "коп.".\n'
         "Не путай сумму долга с общей суммой."
     )
-    try:
-        result = await _responses_json(
-            settings,
-            instructions=instructions,
-            text="Прочитай только три денежные суммы с фрагментами текста.",
-            image_paths=image_variants,
-            schema_name="court_order_amounts",
-            schema=AMOUNTS_JSON_SCHEMA,
-        )
-    except Exception as exc:
-        await record_openai_usage(
-            settings,
-            session,
-            case_id=case_id,
-            user_id=user_id,
-            operation="amounts_ocr_retry",
-            model=settings.vision_model,
-            success=False,
-            error_message=str(exc),
-        )
-        raise
-    await record_openai_usage(
+    result = await _responses_json(
         settings,
-        session,
-        case_id=case_id,
-        user_id=user_id,
-        operation="amounts_ocr_retry",
-        model=result.model,
-        result=result,
-        success=True,
+        instructions=instructions,
+        text="Прочитай только три денежные суммы с фрагментами текста.",
+        image_paths=image_variants,
+        schema_name="court_order_amounts",
+        schema=AMOUNTS_JSON_SCHEMA,
     )
     amounts = {key: result.data.get(key, "") for key in AMOUNTS_JSON_SCHEMA_PROPERTIES}
     for key in ("debt_amount", "state_duty", "total_amount"):
@@ -827,7 +837,7 @@ async def extract_order_amounts(
             request_id=result.request_id,
             model=result.model,
         )
-    return amounts
+    return amounts, result
 
 
 def looks_like_dative(value: str) -> bool:

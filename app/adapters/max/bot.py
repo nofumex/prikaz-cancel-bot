@@ -25,6 +25,7 @@ from app.services.document_delivery import deliver_documents_to_case_platform
 from app.services.documents import MANUAL_REVIEW_USER_TEXT, create_case_documents_reviewed, extraction_preview
 from app.services.legal_data import FIELD_LABELS, is_deadline_missed, missing_order_fields, normalize_debtor_name_fields, normalize_order_data, suggest_nominative_full_name, validate_before_generation
 from app.services.llm import extract_envelope_date, extract_order_data
+from app.services.order_background import start_order_extraction, wait_order_extraction
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
 from app.services.paid_correction import correction_allowed, paid_regeneration_requires_new_date, record_corrected_field, regenerate_paid_case
 from app.services.received_date import received_date_prompt_text, save_received_date, validate_received_date
@@ -221,6 +222,14 @@ async def _request_payment_contact(client: MaxBotClient, event: IncomingEvent, s
     )
 
 
+async def _wait_for_background_order(session, settings: Settings, case: Case, user: User) -> list[str]:
+    if case.extracted_json:
+        return json.loads(case.missing_fields or "[]")
+    result = await wait_order_extraction(settings, case.id, user.id)
+    await session.refresh(case)
+    return result.missing
+
+
 async def _finalize_payment(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User, case: Case, *, state=None) -> bool:
     try:
         payment = await ensure_payment(session, case, settings)
@@ -254,6 +263,16 @@ async def _handle_payment_contact(client: MaxBotClient, event: IncomingEvent, se
     data = await _state_data(session, event)
     case = await session.get(Case, data["case_id"])
     schedule_crm_sync(settings, case.id, user.id, "phone_provided", {"note": "MAX: пользователь указал номер телефона"})
+    missing = await _wait_for_background_order(session, settings, case, user)
+    if missing:
+        await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})
+        await _send_order_rephoto_prompt(client, event, missing, attempts=case.order_rephoto_attempts)
+        return
+    _, date_error = validate_received_date(case, case.received_date.strftime("%d.%m.%Y") if case.received_date else None)
+    if date_error:
+        await _set_state(session, event, STATE_MANUAL_DATE, {"case_id": case.id})
+        await _send(client, event, date_error + "\n\n" + manual_received_date_prompt_text())
+        return
     if case.preview_pdf_path or case.preview_doc_path:
         await _finalize_payment(client, event, session, settings, user, case)
         return
@@ -721,7 +740,25 @@ async def _handle_order_image(client: MaxBotClient, event: IncomingEvent, sessio
         'note': 'MAX: загружен приказ',
         'files': [{'path': str(path), 'caption': 'Фото приказа'}],
     })
-    await _extract_and_process_order(client, event, session, settings, user, case)
+    start_order_extraction(settings, case.id, user.id)
+    if not case.received_date:
+        await _set_state(session, event, STATE_MANUAL_DATE, {"case_id": case.id})
+        await _send(client, event, "✅ Фото приказа принято. Уже считываю данные — пока укажите дату получения.\n\n" + manual_received_date_prompt_text())
+        return
+    missing = await _wait_for_background_order(session, settings, case, user)
+    if missing:
+        await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})
+        await _send_order_rephoto_prompt(client, event, missing, attempts=case.order_rephoto_attempts)
+        return
+    _, date_error = validate_received_date(case, case.received_date.strftime("%d.%m.%Y") if case.received_date else None)
+    if date_error:
+        await _set_state(session, event, STATE_MANUAL_DATE, {"case_id": case.id})
+        await _send(client, event, date_error + "\n\n" + manual_received_date_prompt_text())
+        return
+    if normalize_phone(user.phone):
+        await _generate_documents(client, event, session, settings, user, case)
+    else:
+        await _request_payment_contact(client, event, session, case)
     return
 
 
@@ -780,13 +817,21 @@ async def _handle_manual_date(client: MaxBotClient, event: IncomingEvent, sessio
         await _send(client, event, error)
         return
     await save_received_date(session, settings, case, user, received)
-    extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
-    missing = missing_order_fields(extracted, case.received_date)
+    if not normalize_phone(user.phone):
+        await _request_payment_contact(client, event, session, case)
+        return
+    await _send(client, event, "🔄 Заявление составляется, нужно немного подождать...")
+    missing = await _wait_for_background_order(session, settings, case, user)
     if missing:
         await _set_state(session, event, STATE_ORDER_REPHOTO, {'case_id': case.id})
         await _send_order_rephoto_prompt(client, event, missing, attempts=case.order_rephoto_attempts)
         return
-    await _request_payment_contact(client, event, session, case)
+    _, date_error = validate_received_date(case, case.received_date.strftime("%d.%m.%Y") if case.received_date else None)
+    if date_error:
+        await _set_state(session, event, STATE_MANUAL_DATE, {"case_id": case.id})
+        await _send(client, event, date_error + "\n\n" + manual_received_date_prompt_text())
+        return
+    await _generate_documents(client, event, session, settings, user, case)
     return
 
 
@@ -830,7 +875,10 @@ async def _extract_and_process_order(client: MaxBotClient, event: IncomingEvent,
         await _set_state(session, event, STATE_MANUAL_DATE, {'case_id': case.id})
         await _send(client, event, received_date_prompt_text())
         return
-    await _request_payment_contact(client, event, session, case)
+    if normalize_phone(user.phone):
+        await _generate_documents(client, event, session, settings, user, case)
+    else:
+        await _request_payment_contact(client, event, session, case)
 
 
 async def _send_review(client: MaxBotClient, event: IncomingEvent, session, user: User) -> None:

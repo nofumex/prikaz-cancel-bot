@@ -110,6 +110,47 @@ async def test_telegram_contact_shows_progress_then_starts_generation(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_saved_telegram_phone_skips_contact_prompt(monkeypatch) -> None:
+    settings = _settings(show_user_confirmation_step=False, amocrm_enabled=False)
+    case = _case("telegram")
+    case.missing_fields = "[]"
+    user = User(id=7, platform="telegram", platform_user_id="42", phone="+79991234567")
+    message = SimpleNamespace(answer=AsyncMock(), bot=SimpleNamespace())
+    state = SimpleNamespace(update_data=AsyncMock(), set_state=AsyncMock(), clear=AsyncMock())
+    session = SimpleNamespace()
+    generate = AsyncMock(return_value=True)
+
+    monkeypatch.setattr(case_flow, "_generate_documents_flow", generate)
+
+    await case_flow._continue_after_received_date(message, state, session, settings, user, case)
+
+    generate.assert_awaited_once()
+    assert state.set_state.await_count == 0
+    assert all("Поделиться контактом" not in str(call) for call in message.answer.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_saved_max_phone_skips_contact_prompt_after_date(monkeypatch) -> None:
+    settings = _settings(show_user_confirmation_step=False, amocrm_enabled=False)
+    case = _case("max")
+    case.missing_fields = "[]"
+    user = User(id=7, platform="max", platform_user_id="42", phone="+79991234567")
+    event = IncomingEvent(platform_user_id="42", chat_id="99", text="14.07.2026")
+    client = SimpleNamespace(send_message=AsyncMock())
+    session = SimpleNamespace(get=AsyncMock(return_value=case), commit=AsyncMock())
+    generate = AsyncMock()
+
+    monkeypatch.setattr(max_bot, "_state_data", AsyncMock(return_value={"case_id": case.id}))
+    monkeypatch.setattr(max_bot, "save_received_date", AsyncMock())
+    monkeypatch.setattr(max_bot, "_generate_documents", generate)
+
+    await max_bot._handle_manual_date(client, event, session, settings, user, "14.07.2026")
+
+    generate.assert_awaited_once()
+    assert all("Поделиться контактом" not in str(call) for call in client.send_message.await_args_list)
+
+
+@pytest.mark.asyncio
 async def test_max_contact_is_saved_then_generation_starts_without_confirmation_message(monkeypatch) -> None:
     settings = _settings(show_user_confirmation_step=False, amocrm_enabled=False)
     case = _case("max")

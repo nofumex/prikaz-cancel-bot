@@ -43,6 +43,7 @@ from app.services.legal_data import (
     validate_before_generation,
 )
 from app.services.llm import extract_envelope_date, extract_order_amounts, extract_order_data
+from app.services.order_background import start_order_extraction, wait_order_extraction
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
 from app.services.paid_correction import correction_allowed, paid_regeneration_requires_new_date, record_corrected_field, regenerate_paid_case
 from app.services.received_date import received_date_prompt_text, save_received_date, validate_received_date
@@ -246,6 +247,48 @@ async def my_document(callback: CallbackQuery, session: AsyncSession, current_us
     await callback.answer()
 
 
+async def _wait_for_background_order(
+    session: AsyncSession, settings: Settings, case: Case, current_user: User
+) -> list[str]:
+    if case.extracted_json:
+        return json.loads(case.missing_fields or "[]")
+    result = await wait_order_extraction(settings, case.id, current_user.id)
+    await session.refresh(case)
+    return result.missing
+
+
+async def _continue_after_received_date(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    settings: Settings,
+    current_user: User,
+    case: Case,
+) -> None:
+    if not normalize_phone(current_user.phone):
+        await _request_payment_contact(message, state, case)
+        return
+    await message.answer("<b>🔄 Заявление составляется, нужно немного подождать...</b>")
+    missing = await _wait_for_background_order(session, settings, case, current_user)
+    if missing:
+        await state.update_data(case_id=case.id)
+        await state.set_state(CaseStates.waiting_order_rephoto)
+        await _send_order_rephoto_prompt(message, missing, attempts=case.order_rephoto_attempts)
+        return
+    _, date_error = validate_received_date(case, case.received_date.strftime("%d.%m.%Y") if case.received_date else None)
+    if date_error:
+        await state.update_data(case_id=case.id)
+        await state.set_state(CaseStates.waiting_manual_date)
+        await message.answer(date_error + "\n\n" + manual_received_date_prompt_text())
+        return
+    extracted = normalize_order_data(json.loads(case.extracted_json or "{}"))
+    if settings.show_user_confirmation_step:
+        await state.clear()
+        await message.answer(extraction_preview(extracted, case.received_date, [], case.deadline_date), reply_markup=confirm_extraction())
+        return
+    await _generate_documents_flow(message, session, settings, current_user, case, state=state, bot=message.bot)
+
+
 @router.message(CaseStates.waiting_order_photo, F.photo)
 @router.message(CaseStates.waiting_order_rephoto, F.photo)
 async def receive_order_photo(message: Message, bot: Bot, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
@@ -257,7 +300,13 @@ async def receive_order_photo(message: Message, bot: Bot, state: FSMContext, ses
         'note': 'Пользователь отправил фото судебного приказа',
         'files': [{'path': str(path), 'caption': 'Фото приказа'}],
     })
-    await _extract_and_process_order(message, state, session, settings, case, current_user)
+    start_order_extraction(settings, case.id, current_user.id)
+    if not case.received_date:
+        await state.update_data(case_id=case.id)
+        await state.set_state(CaseStates.waiting_manual_date)
+        await message.answer("✅ Фото приказа принято. Уже считываю данные — пока укажите дату получения.\n\n" + manual_received_date_prompt_text())
+        return
+    await _continue_after_received_date(message, state, session, settings, current_user, case)
     return
 
 
@@ -277,7 +326,13 @@ async def receive_order_document(message: Message, bot: Bot, state: FSMContext, 
         'note': 'Пользователь отправил приказ как файл',
         'files': [{'path': str(path), 'caption': 'Приказ (файл)'}],
     })
-    await _extract_and_process_order(message, state, session, settings, case, current_user)
+    start_order_extraction(settings, case.id, current_user.id)
+    if not case.received_date:
+        await state.update_data(case_id=case.id)
+        await state.set_state(CaseStates.waiting_manual_date)
+        await message.answer("✅ Приказ принят. Уже считываю данные — пока укажите дату получения.\n\n" + manual_received_date_prompt_text())
+        return
+    await _continue_after_received_date(message, state, session, settings, current_user, case)
     return
 
 
@@ -355,13 +410,7 @@ async def receive_manual_date(message: Message, state: FSMContext, session: Asyn
         await message.answer(error)
         return
     await save_received_date(session, settings, case, current_user, received)
-    extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
-    missing = missing_order_fields(extracted, case.received_date)
-    if missing:
-        await state.set_state(CaseStates.waiting_order_rephoto)
-        await _send_order_rephoto_prompt(message, missing, attempts=case.order_rephoto_attempts)
-        return
-    await _request_payment_contact(message, state, case)
+    await _continue_after_received_date(message, state, session, settings, current_user, case)
     return
 
 
@@ -382,6 +431,18 @@ async def receive_payment_contact(message: Message, state: FSMContext, session: 
         reply_markup=ReplyKeyboardRemove(),
     )
     schedule_crm_sync(settings, case.id, current_user.id, "phone_provided", {"note": "Пользователь указал номер телефона"})
+    missing = await _wait_for_background_order(session, settings, case, current_user)
+    if missing:
+        await state.update_data(case_id=case.id)
+        await state.set_state(CaseStates.waiting_order_rephoto)
+        await _send_order_rephoto_prompt(message, missing, attempts=case.order_rephoto_attempts)
+        return
+    _, date_error = validate_received_date(case, case.received_date.strftime("%d.%m.%Y") if case.received_date else None)
+    if date_error:
+        await state.update_data(case_id=case.id)
+        await state.set_state(CaseStates.waiting_manual_date)
+        await message.answer(date_error + "\n\n" + manual_received_date_prompt_text())
+        return
     if case.preview_pdf_path or case.preview_doc_path:
         await _finalize_payment(message, state, session, settings, current_user, case)
         return
@@ -504,6 +565,13 @@ async def _extract_and_process_order(
         await message.answer(received_date_prompt_text())
         return
 
+    if normalize_phone(current_user.phone):
+        if settings.show_user_confirmation_step:
+            await state.clear()
+            await message.answer(extraction_preview(extracted, case.received_date, [], case.deadline_date), reply_markup=confirm_extraction())
+            return
+        await _generate_documents_flow(message, session, settings, current_user, case, state=state, bot=message.bot)
+        return
     await _request_payment_contact(message, state, case)
 
 
