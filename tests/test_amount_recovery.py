@@ -66,6 +66,29 @@ def test_retry_amounts_fix_mismatch():
     assert validate_amounts(recovery.order_data).ok
 
 
+def test_case_92_recovers_when_order_has_no_explicit_total():
+    primary = normalize_order_data(
+        {
+            "debt_amount": "18 898 руб. 08 коп.",
+            "state_duty": "2000 (две тысячи рублей 00 копеек)",
+            "total_amount": "",
+        }
+    )
+    retry = {
+        "debt_amount": "18 898 руб. 08 коп.",
+        "debt_amount_fragment": "задолженность в размере 18898,08 рублей",
+        "state_duty": "2 000 руб. 00 коп.",
+        "state_duty_fragment": "государственной пошлины в размере 2000 (две тысячи рублей 00 копеек)",
+        "total_amount": "",
+        "total_amount_fragment": "",
+        "comment": "Итог отдельно не указан",
+    }
+    assert primary["state_duty"] == "2 000 руб. 00 коп."
+    assert primary["total_amount"] == "20 898 руб. 08 коп."
+    recovery = recover_amounts_from_mismatch(primary, retry)
+    assert recovery.reason == "amounts_already_consistent"
+
+
 def test_total_minus_state_duty_recovery():
     primary = normalize_order_data(
         {

@@ -156,6 +156,35 @@ def clean_case_number(value: object | None) -> str:
     return text.strip(" №")
 
 
+_UID_PATTERN = re.compile(r"\b\d{2}[MМ][SС]\d{4}-\d{2}-\d{4}-\d{6}-\d{2}\b", re.IGNORECASE)
+_LABELED_CASE_PATTERN = re.compile(r"(?:дело|производство)\s*№?\s*([^\s,;]+)", re.IGNORECASE)
+
+
+def normalize_case_identifiers(case_number: object | None, uid: object | None) -> tuple[str, str]:
+    """Separate a court case number from the long electronic UID."""
+    case_text = clean_text(case_number)
+    uid_text = clean_text(uid)
+    combined = f"{case_text} {uid_text}".strip()
+    uid_match = _UID_PATTERN.search(combined)
+    labeled_case = _LABELED_CASE_PATTERN.search(combined)
+
+    normalized_uid = clean_uid(uid_match.group(0)).replace("М", "M").replace("м", "M").replace("С", "S").replace("с", "S") if uid_match else ""
+    normalized_case = clean_case_number(labeled_case.group(1)) if labeled_case else ""
+
+    if not normalized_case:
+        candidate = _UID_PATTERN.sub("", case_text).strip(" ,;-")
+        candidate = clean_case_number(candidate)
+        if candidate and not _UID_PATTERN.fullmatch(candidate):
+            normalized_case = candidate
+    if not normalized_uid and uid_text and _UID_PATTERN.fullmatch(clean_uid(uid_text)):
+        normalized_uid = clean_uid(uid_text).replace("М", "M").replace("м", "M").replace("С", "S").replace("с", "S")
+    elif not normalized_uid and uid_text and not _LABELED_CASE_PATTERN.search(uid_text):
+        # Some courts use non-MS identifiers (long numeric ids or prefixes
+        # such as АСВ_). Preserve them instead of deleting an unknown format.
+        normalized_uid = clean_uid(uid_text)
+    return normalized_case, normalized_uid
+
+
 def clean_money_text(value: object | None) -> str:
     decimal_value = money_to_decimal(value)
     if decimal_value is None:
@@ -178,6 +207,20 @@ def money_to_decimal(value: object | None) -> Decimal | None:
     if comma_rub:
         rubles = re.sub(r"[\s.]", "", comma_rub.group(1))
         kopeks = comma_rub.group(2)
+        try:
+            return Decimal(f"{rubles}.{kopeks}")
+        except InvalidOperation:
+            return None
+
+    # Another widespread form puts both the currency word and kopeks inside
+    # the parenthetical wording: 2000 (две тысячи рублей 00 копеек).
+    inside_parentheses = re.search(
+        r"(\d[\d\s.]*)\s*\([^)]{0,260}?руб\.?\s*(\d{1,2})\s*коп\.?[^)]{0,40}\)",
+        text,
+    )
+    if inside_parentheses:
+        rubles = re.sub(r"[\s.]", "", inside_parentheses.group(1))
+        kopeks = inside_parentheses.group(2)
         try:
             return Decimal(f"{rubles}.{kopeks}")
         except InvalidOperation:
@@ -295,6 +338,10 @@ def suggest_nominative_full_name(value: object | None) -> str | None:
 
 def normalize_court_forms(court_name: str) -> dict[str, str]:
     court = clean_text(court_name)
+    # OCR sometimes appends the postal address and web site from the same
+    # header line. Those are separate facts and must not enter the addressee.
+    court = re.split(r",\s*\d{6}\b", court, maxsplit=1)[0].strip(" ,")
+    court = re.split(r"\s+(?:www\.?|https?://)", court, maxsplit=1, flags=re.IGNORECASE)[0].strip(" ,")
     lower = court.lower()
     base = court
     if lower.startswith("мировому судье "):
@@ -365,10 +412,9 @@ def structured_debt_basis_facts(value: object | None) -> dict[str, str]:
 
 def normalize_order_data(data: dict) -> dict:
     normalized = {str(key): clean_text(value) for key, value in (data or {}).items()}
-    if normalized.get("uid"):
-        normalized["uid"] = clean_uid(normalized["uid"])
-    if normalized.get("case_number"):
-        normalized["case_number"] = clean_case_number(normalized["case_number"])
+    case_number, uid = normalize_case_identifiers(normalized.get("case_number"), normalized.get("uid"))
+    normalized["case_number"] = case_number
+    normalized["uid"] = uid
     normalized, _ = normalize_debtor_name_fields(normalized)
     for key in ("court_address", "creditor_address"):
         if normalized.get(key):

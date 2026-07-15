@@ -9,6 +9,7 @@ from app.services.legal_data import (
     format_money_rub_kop,
     legal_deadline_from_received,
     money_to_decimal,
+    normalize_case_identifiers,
     normalize_order_data,
 )
 
@@ -17,6 +18,35 @@ def test_money_with_parenthetical_words_preserves_kopeks():
     value = "120821 (сто двадцать тысяч восемьсот двадцать один) рубль 10 копеек"
     assert money_to_decimal(value) == Decimal("120821.10")
     assert clean_money_text(value) == "120 821 руб. 10 коп."
+
+
+def test_money_with_currency_inside_parentheses_preserves_kopeks():
+    value = "2000 (две тысячи рублей 00 копеек)"
+    assert money_to_decimal(value) == Decimal("2000.00")
+    assert clean_money_text(value) == "2 000 руб. 00 коп."
+
+
+def test_case_92_identifiers_are_separated():
+    case_number, uid = normalize_case_identifiers(
+        "09MS0020-01-2026-001641-42 Дело №2-1292/2026",
+        "09MS0020-01-2026-001641-42",
+    )
+    assert case_number == "2-1292/2026"
+    assert uid == "09MS0020-01-2026-001641-42"
+
+
+def test_cyrillic_ms_uid_is_canonicalized_and_nonstandard_uid_is_preserved():
+    assert normalize_case_identifiers(
+        "09МС0020-01-2026-001641-42, Дело № 2-1292/2026", ""
+    ) == ("2-1292/2026", "09MS0020-01-2026-001641-42")
+    assert normalize_case_identifiers("133511", "АСВ_238_133511") == ("133511", "АСВ_238_133511")
+
+
+def test_court_postal_address_is_not_part_of_court_name():
+    data = normalize_order_data(
+        {"court_name": "судебного участка № 1 Хабезского судебного района, 369400, КЧР, а. Хабез"}
+    )
+    assert data["court_name"] == "судебного участка № 1 Хабезского судебного района"
 
 
 def test_case_number_removes_ocr_spacing_around_separators():

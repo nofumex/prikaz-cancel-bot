@@ -59,17 +59,23 @@ def _retry_amounts_consistent(retry_amounts: dict[str, Any] | None) -> bool:
 def _retry_has_role_evidence(retry_amounts: dict[str, Any] | None) -> bool:
     if not retry_amounts:
         return False
-    return (
+    debt_and_duty_supported = (
         _fragment_supports_amount(
             str(retry_amounts.get("debt_amount_fragment") or ""), retry_amounts.get("debt_amount"), _DEBT_FRAGMENT_KEYWORDS
         )
         and _fragment_supports_amount(
             str(retry_amounts.get("state_duty_fragment") or ""), retry_amounts.get("state_duty"), _DUTY_FRAGMENT_KEYWORDS
         )
-        and _fragment_supports_amount(
+    )
+    total_value = str(retry_amounts.get("total_amount") or "").strip()
+    total_fragment = str(retry_amounts.get("total_amount_fragment") or "").strip()
+    total_supported_or_absent = (
+        (not total_value and not total_fragment)
+        or _fragment_supports_amount(
             str(retry_amounts.get("total_amount_fragment") or ""), retry_amounts.get("total_amount"), _TOTAL_FRAGMENT_KEYWORDS
         )
     )
+    return debt_and_duty_supported and total_supported_or_absent
 
 
 def recover_amounts_from_mismatch(
