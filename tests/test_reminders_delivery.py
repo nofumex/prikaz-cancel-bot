@@ -187,7 +187,7 @@ async def test_due_consultation_reminders_one_day_after_prior_followup() -> None
         cases = await due_case_consultation_reminders(session)
 
     await engine.dispose()
-    assert {case.id for case in cases} == {due.id, paid_due.id}
+    assert {case.id for case in cases} == {paid_due.id}
 
 
 @pytest.mark.asyncio
@@ -210,7 +210,7 @@ async def test_due_user_consultation_reminders_skips_users_with_cases() -> None:
         users = await due_user_consultation_reminders(session)
 
     await engine.dispose()
-    assert [user.id for user in users] == [due.id]
+    assert users == []
 
 
 def test_new_reminder_texts_render_readable_russian() -> None:

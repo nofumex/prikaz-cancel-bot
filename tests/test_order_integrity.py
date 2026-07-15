@@ -7,6 +7,18 @@ from app.services.order_integrity import (
     evidence_payload_fields,
     merge_verified_order_data,
 )
+def test_contract_number_is_not_accepted_as_uid() -> None:
+    data = normalize_order_data({"case_number": "2-59/2015", "uid": "0012297461"})
+    assert data["case_number"] == "2-59/2015"
+    assert data["uid"] == ""
+
+
+def test_short_court_locality_is_not_duplicated_as_address() -> None:
+    data = normalize_order_data({
+        "court_name": "судебного участка № 41 с. Георгиевское и Межевского района Костромской области",
+        "court_address": "с. Георгиевское",
+    })
+    assert data["court_address"] == ""
 
 
 def _payload(**values):

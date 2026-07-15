@@ -419,7 +419,6 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 client,
                 event,
                 "Пожалуйста, отправьте фото судебного приказа ещё раз. Весь лист должен быть в кадре, без бликов.",
-                keyboards.order_rephoto_menu(),
             )
             return
         if data == "chat:start":
@@ -761,6 +760,8 @@ async def _handle_order_image(client: MaxBotClient, event: IncomingEvent, sessio
         await _set_state(session, event, STATE_MANUAL_DATE, {"case_id": case.id})
         await _send(client, event, received_date_prompt_text().replace("Приказ распознан", "Приказ принят"))
         return
+    if normalize_phone(user.phone):
+        await _send(client, event, "🔄 Заявление составляется, нужно немного подождать...")
     missing = await _wait_for_background_order(session, settings, case, user)
     if missing:
         await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})

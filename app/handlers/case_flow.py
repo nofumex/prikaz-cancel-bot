@@ -612,7 +612,6 @@ async def choose_rephoto_order(callback: CallbackQuery, state: FSMContext, sessi
     await state.set_state(CaseStates.waiting_order_rephoto)
     await callback.message.answer(
         "Пожалуйста, отправьте фото судебного приказа ещё раз. Весь лист должен быть в кадре, без бликов.",
-        reply_markup=order_rephoto_menu(),
     )
     await callback.answer()
 

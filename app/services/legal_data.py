@@ -160,7 +160,7 @@ def clean_case_number(value: object | None) -> str:
     return text.strip(" №")
 
 
-_UID_PATTERN = re.compile(r"\b\d{2}[MМ][SС]\d{4}-\d{2}-\d{4}-\d{6}-\d{2}\b", re.IGNORECASE)
+_UID_PATTERN = re.compile(r"\b\d{2}[A-ZА-ЯЁ]{2}\d{4}-\d{2}-\d{4}-\d{6}-\d{2}\b", re.IGNORECASE)
 _LABELED_CASE_PATTERN = re.compile(r"(?:дело|производство)\s*№?\s*([^\s,;]+)", re.IGNORECASE)
 
 
@@ -182,9 +182,7 @@ def normalize_case_identifiers(case_number: object | None, uid: object | None) -
             normalized_case = candidate
     if not normalized_uid and uid_text and _UID_PATTERN.fullmatch(clean_uid(uid_text)):
         normalized_uid = clean_uid(uid_text).replace("М", "M").replace("м", "M").replace("С", "S").replace("с", "S")
-    elif not normalized_uid and uid_text and not _LABELED_CASE_PATTERN.search(uid_text):
-        # Some courts use non-MS identifiers (long numeric ids or prefixes
-        # such as АСВ_). Preserve them instead of deleting an unknown format.
+    elif not normalized_uid and uid_text and re.fullmatch(r"\d{18,}", clean_uid(uid_text)):
         normalized_uid = clean_uid(uid_text)
     if normalized_case and normalized_uid and canonical_identifier(normalized_case) == canonical_identifier(normalized_uid):
         normalized_uid = ""
@@ -465,6 +463,14 @@ def normalize_order_data(data: dict) -> dict:
     for key in ("court_address", "creditor_address"):
         if normalized.get(key):
             normalized[key] = normalize_address_text(normalized[key])
+    court_address = normalized.get("court_address", "")
+    court_name = normalized.get("court_name", "")
+    if (
+        court_address
+        and court_address.lower() in court_name.lower()
+        and not re.search(r"\b(?:ул\.|улица|д\.|дом|проспект|пер\.|шоссе)\b|\d{6}", court_address, re.IGNORECASE)
+    ):
+        normalized["court_address"] = ""
     if normalized.get("debtor_address"):
         normalized["debtor_address"] = clean_debtor_address(normalized["debtor_address"])
     if normalized.get("court_name"):

@@ -19,11 +19,10 @@ from app.services.cases import (
     due_paid_followup_cases,
     due_started_users_without_cases,
     due_unpaid_cases,
-    due_user_consultation_reminders,
 )
 from app.services.crm_background import schedule_crm_sync
 from app.services.app_settings import reminder_settings
-from app.texts import consultation_offer_text, no_order_deadline_reminder_text, post_payment_court_followup_text, unpaid_document_reminder_text
+from app.texts import no_order_deadline_reminder_text, post_payment_court_followup_text, unpaid_document_reminder_text
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +100,6 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
                         bot,
                         case,
                         post_payment_court_followup_text(),
-                        telegram_markup=consultation_menu(),
-                        max_keyboard=max_keyboards.consultation_menu(),
                     )
                     if sent:
                         case.post_payment_followup_sent_at = now
@@ -133,18 +130,6 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
                             "consultation_offer_sent",
                             {"note": "\u041f\u0440\u0435\u0434\u043b\u043e\u0436\u0435\u043d\u0430 \u043a\u043e\u043d\u0441\u0443\u043b\u044c\u0442\u0430\u0446\u0438\u044f \u043f\u043e \u0441\u0438\u0442\u0443\u0430\u0446\u0438\u0438 \u0438 \u0431\u0430\u043d\u043a\u0440\u043e\u0442\u0441\u0442\u0432\u0443"},
                         )
-
-                for user in await due_user_consultation_reminders(session):
-                    sent = await _send_user_message(
-                        settings,
-                        bot,
-                        user,
-                        consultation_offer_text(),
-                        telegram_markup=consultation_menu(),
-                        max_keyboard=max_keyboards.consultation_menu(),
-                    )
-                    if sent:
-                        user.first_consultation_reminder_sent_at = now
 
                 await session.commit()
         except asyncio.CancelledError:

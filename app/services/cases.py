@@ -4,7 +4,7 @@ import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import CaseStatus, PaymentStatus
@@ -238,15 +238,12 @@ async def due_case_consultation_reminders(session: AsyncSession) -> list[Case]:
     result = await session.execute(
         select(Case)
         .where(
-            Case.status.not_in([CaseStatus.CANCELED.value, CaseStatus.SUPERSEDED.value]),
+            Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]),
             Case.consultation_reminder_sent_at.is_(None),
             Case.reminder_delivery_blocked_at.is_(None),
             Case.user.has(User.reminder_delivery_blocked_at.is_(None)),
-            or_(
-                Case.deadline_reminder_sent_at <= due_at,
-                Case.post_payment_followup_sent_at <= due_at,
-                Case.paid_at <= due_at,
-            ),
+            Case.post_payment_followup_sent_at.is_not(None),
+            Case.post_payment_followup_sent_at <= due_at,
         )
         .order_by(Case.created_at.asc())
         .limit(50)
@@ -255,21 +252,5 @@ async def due_case_consultation_reminders(session: AsyncSession) -> list[Case]:
 
 
 async def due_user_consultation_reminders(session: AsyncSession) -> list[User]:
-    now = datetime.utcnow()
-    due_24h = now - timedelta(hours=24)
-    case_exists = select(Case.id).where(Case.user_id == User.id).exists()
-    result = await session.execute(
-        select(User)
-        .where(
-            User.first_deadline_reminder_sent_at.is_not(None),
-            User.first_deadline_reminder_sent_at <= due_24h,
-            User.first_consultation_reminder_sent_at.is_(None),
-            User.reminder_delivery_blocked_at.is_(None),
-            User.is_admin.is_(False),
-            User.is_manager.is_(False),
-            ~case_exists,
-        )
-        .order_by(User.created_at.asc())
-        .limit(50)
-    )
-    return list(result.scalars().unique().all())
+    # Consultation is only offered after the paid-case court follow-up.
+    return []
