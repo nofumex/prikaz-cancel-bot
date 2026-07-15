@@ -279,6 +279,31 @@ def parse_money(value: object | None) -> Decimal | None:
     return money_to_decimal(value)
 
 
+def money_from_source_fragment(value: object | None) -> Decimal | None:
+    """Read the numeric amount from an image-grounded OCR quote.
+
+    Role-specific fragments can contain a contract number before the amount,
+    so decimal-comma values near "в размере" take precedence over the first
+    bare number in the string.
+    """
+    text = clean_text(value).lower().replace("\xa0", " ")
+    if not text:
+        return None
+    contextual = re.findall(
+        r"(?:в\s+размере|в\s+сумме|сумм[аеуы])\s*[:\-]?\s*(\d[\d\s]*[,.]\d{2})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    decimal_values = contextual or re.findall(r"\d[\d\s]*[,.]\d{2}", text)
+    if decimal_values:
+        raw = decimal_values[-1].replace(" ", "").replace(",", ".")
+        try:
+            return Decimal(raw)
+        except InvalidOperation:
+            pass
+    return money_to_decimal(text)
+
+
 def format_money_rub_kop(value: Decimal | int | float | str | None) -> str:
     if value is None:
         return ""

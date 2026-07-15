@@ -9,6 +9,7 @@ from app.services.legal_data import (
     format_money_rub_kop,
     legal_deadline_from_received,
     money_to_decimal,
+    money_from_source_fragment,
     normalize_case_identifiers,
     normalize_order_data,
 )
@@ -30,6 +31,12 @@ def test_whole_rubles_without_kopeks_are_exact_money():
     assert money_to_decimal("2000 руб.") == Decimal("2000.00")
     assert clean_money_text("44 600 рублей") == "44 600 руб. 00 коп."
     assert clean_money_text("769 руб.") == "769 руб. 00 коп."
+
+
+def test_amount_is_grounded_in_role_specific_source_fragment():
+    fragment = "задолженность по договору займа №1906699913 в размере 25704,49"
+    assert money_from_source_fragment(fragment) == Decimal("25704.49")
+    assert money_from_source_fragment("государственной пошлины в размере 2000 руб. 00 коп.") == Decimal("2000.00")
 
 
 def test_case_92_identifiers_are_separated():

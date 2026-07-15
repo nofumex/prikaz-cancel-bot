@@ -18,7 +18,7 @@ from app.config import Settings
 from app.models import OpenAIUsage
 from app.services.amount_recovery import recover_amounts_from_mismatch
 from app.services.image_preprocessing import build_amount_ocr_variants, build_order_verifier_image
-from app.services.legal_data import clean_money_text, missing_order_fields, normalize_debtor_name_fields, normalize_order_data
+from app.services.legal_data import clean_money_text, format_money_rub_kop, missing_order_fields, money_from_source_fragment, normalize_debtor_name_fields, normalize_order_data
 from app.services.order_integrity import (
     CRITICAL_ORDER_FIELDS,
     ORDER_EVIDENCE_SCHEMA,
@@ -791,7 +791,10 @@ async def extract_order_amounts(
     )
     amounts = {key: result.data.get(key, "") for key in AMOUNTS_JSON_SCHEMA_PROPERTIES}
     for key in ("debt_amount", "state_duty", "total_amount"):
-        if amounts.get(key):
+        fragment_value = money_from_source_fragment(amounts.get(f"{key}_fragment"))
+        if fragment_value is not None:
+            amounts[key] = format_money_rub_kop(fragment_value)
+        elif amounts.get(key):
             amounts[key] = clean_money_text(amounts[key])
     if case_id is not None:
         debug_dir = ensure_dir(Path("storage/debug") / f"case_{case_id}")
