@@ -26,34 +26,34 @@ def build_order_verifier_image(order_photo_path: str | Path, *, case_id: int | N
     return target
 
 
-def build_amount_ocr_variants(order_photo_path: str | Path, *, case_id: int | None = None) -> list[Path]:
-    """Build full image and cropped/zoomed variants for targeted amount OCR."""
+def build_order_ocr_variants(order_photo_path: str | Path, *, case_id: int | None = None) -> list[Path]:
+    """Create a full image plus overlapping 2x vertical tiles.
+
+    Screenshots and distant photos often devote most pixels to margins or app
+    chrome. Tiling preserves the original context while giving the model
+    enough pixels to compare individual letters and kopeks.
+    """
     source = Path(order_photo_path)
     if not source.exists():
         return [source]
-
     debug_dir = ensure_dir(Path("storage/debug") / f"case_{case_id or 'unknown'}")
     variants: list[Path] = []
-
     with Image.open(source) as img:
         img = img.convert("RGB")
-        full_path = debug_dir / "amount_ocr_full.jpg"
+        full_path = debug_dir / f"order_ocr_full_{source.stem}.jpg"
         _enhance_for_ocr(img).save(full_path, quality=95)
         variants.append(full_path)
-
         width, height = img.size
-        bottom = img.crop((0, height // 2, width, height))
-        bottom_path = debug_dir / "amount_ocr_bottom_half.jpg"
-        _enhance_for_ocr(bottom).save(bottom_path, quality=95)
-        variants.append(bottom_path)
-
-        zoom_w, zoom_h = max(1, width // 2), max(1, height // 2)
-        zoom_x = max(0, (width - zoom_w) // 2)
-        zoom_y = max(0, height - zoom_h)
-        zoom = img.crop((zoom_x, zoom_y, zoom_x + zoom_w, zoom_y + zoom_h))
-        zoom_2x = zoom.resize((zoom_w * 2, zoom_h * 2), Image.Resampling.LANCZOS)
-        zoom_path = debug_dir / "amount_ocr_bottom_zoom2x.jpg"
-        _enhance_for_ocr(zoom_2x).save(zoom_path, quality=95)
-        variants.append(zoom_path)
-
+        spans = ((0.0, 0.55, "top"), (0.20, 0.78, "middle"), (0.45, 1.0, "bottom"))
+        for start, end, label in spans:
+            tile = img.crop((0, int(height * start), width, int(height * end)))
+            tile = tile.resize((tile.width * 2, tile.height * 2), Image.Resampling.LANCZOS)
+            path = debug_dir / f"order_ocr_{label}_2x_{source.stem}.jpg"
+            _enhance_for_ocr(tile).save(path, quality=95)
+            variants.append(path)
     return variants
+
+
+def build_amount_ocr_variants(order_photo_path: str | Path, *, case_id: int | None = None) -> list[Path]:
+    """Build full image and cropped/zoomed variants for targeted amount OCR."""
+    return build_order_ocr_variants(order_photo_path, case_id=case_id)

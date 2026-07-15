@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.models import OpenAIUsage
 from app.services.amount_recovery import recover_amounts_from_mismatch
-from app.services.image_preprocessing import build_amount_ocr_variants, build_order_verifier_image
+from app.services.image_preprocessing import build_amount_ocr_variants, build_order_ocr_variants
 from app.services.legal_data import clean_money_text, format_money_rub_kop, missing_order_fields, money_from_source_fragment, normalize_debtor_name_fields, normalize_order_data
 from app.services.order_integrity import (
     CRITICAL_ORDER_FIELDS,
@@ -472,7 +472,7 @@ async def _extract_order_evidence(
     prevents the verifier from merely agreeing with an earlier transcription.
     """
     model = settings.order_verifier_model or settings.ai_review_model or settings.text_model
-    verifier_image = build_order_verifier_image(order_photo_path, case_id=case_id)
+    verifier_images = build_order_ocr_variants(order_photo_path, case_id=case_id)
     result: LLMResult | None = None
     try:
         result = await _responses_json(
@@ -489,7 +489,7 @@ async def _extract_order_evidence(
                 "Не оценивай правдоподобие: значение должно следовать только из изображения."
             ),
             text="Независимо извлеки критические поля судебного приказа вместе с точными цитатами.",
-            image_path=verifier_image,
+            image_paths=verifier_images,
             schema_name="court_order_independent_evidence",
             schema=ORDER_EVIDENCE_SCHEMA,
             model=model,
@@ -763,7 +763,7 @@ async def extract_order_amounts(
             settings,
             instructions=instructions,
             text="Прочитай только три денежные суммы с фрагментами текста.",
-            image_paths=image_variants[:3],
+            image_paths=image_variants,
             schema_name="court_order_amounts",
             schema=AMOUNTS_JSON_SCHEMA,
         )
