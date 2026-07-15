@@ -759,7 +759,7 @@ async def _handle_order_image(client: MaxBotClient, event: IncomingEvent, sessio
     start_order_extraction(settings, case.id, user.id)
     if not case.received_date:
         await _set_state(session, event, STATE_MANUAL_DATE, {"case_id": case.id})
-        await _send(client, event, "✅ Фото приказа принято. Уже считываю данные — пока укажите дату получения.\n\n" + manual_received_date_prompt_text())
+        await _send(client, event, received_date_prompt_text().replace("Приказ распознан", "Приказ принят"))
         return
     missing = await _wait_for_background_order(session, settings, case, user)
     if missing:

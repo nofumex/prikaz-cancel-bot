@@ -325,7 +325,7 @@ async def receive_order_photo(message: Message, bot: Bot, state: FSMContext, ses
     if not case.received_date:
         await state.update_data(case_id=case.id)
         await state.set_state(CaseStates.waiting_manual_date)
-        await message.answer("✅ Фото приказа принято. Уже считываю данные — пока укажите дату получения.\n\n" + manual_received_date_prompt_text())
+        await message.answer(received_date_prompt_text().replace("Приказ распознан", "Приказ принят"))
         return
     await _continue_after_received_date(message, state, session, settings, current_user, case)
     return
@@ -351,7 +351,7 @@ async def receive_order_document(message: Message, bot: Bot, state: FSMContext, 
     if not case.received_date:
         await state.update_data(case_id=case.id)
         await state.set_state(CaseStates.waiting_manual_date)
-        await message.answer("✅ Приказ принят. Уже считываю данные — пока укажите дату получения.\n\n" + manual_received_date_prompt_text())
+        await message.answer(received_date_prompt_text().replace("Приказ распознан", "Приказ принят"))
         return
     await _continue_after_received_date(message, state, session, settings, current_user, case)
     return
