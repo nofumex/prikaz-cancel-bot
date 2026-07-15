@@ -89,6 +89,34 @@ def test_case_92_recovers_when_order_has_no_explicit_total():
     assert recovery.reason == "amounts_already_consistent"
 
 
+def test_nonempty_unparseable_total_is_not_silently_accepted():
+    check = validate_amounts(
+        {"debt_amount": "100 руб. 00 коп.", "state_duty": "20 руб. 00 коп.", "total_amount": "итого не прочитано"}
+    )
+    assert not check.ok
+    assert any(error.startswith("total_amount:") for error in check.errors)
+
+
+def test_false_total_is_replaced_when_source_has_no_explicit_total():
+    primary = {
+        "debt_amount": "18 898 руб. 08 коп.",
+        "state_duty": "2 000 руб. 00 коп.",
+        "total_amount": "18 898 руб.",
+    }
+    retry = {
+        "debt_amount": "18 898 руб. 08 коп.",
+        "debt_amount_fragment": "задолженность в размере 18898,08 рублей",
+        "state_duty": "2 000 руб. 00 коп.",
+        "state_duty_fragment": "государственной пошлины в размере 2000 рублей",
+        "total_amount": "",
+        "total_amount_fragment": "",
+        "comment": "Итог отдельно не указан",
+    }
+    recovery = recover_amounts_from_mismatch(primary, retry)
+    assert recovery.applied
+    assert recovery.order_data["total_amount"] == "20 898 руб. 08 коп."
+
+
 def test_total_minus_state_duty_recovery():
     primary = normalize_order_data(
         {

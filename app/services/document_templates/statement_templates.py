@@ -186,6 +186,7 @@ def _structured_debt_basis_inline(data: dict) -> str:
 def _period_inline(value: str) -> str:
     value = re.sub(r"\s+", " ", value).strip(" ,.;")
     value = re.sub(r"^(за\s+период|период|за)\s+", "", value, flags=re.IGNORECASE).strip(" ,.;")
+    value = re.sub(r"\s+г$", " г.", value, flags=re.IGNORECASE)
     if not value.startswith("с "):
         return f"с {value}"
     return value

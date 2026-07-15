@@ -80,11 +80,15 @@ def clean_text(value: object | None) -> str:
     text = text.replace("\xa0", " ")
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"№\s*(\d+)", r"№ \1", text)
+    # Normalize Latin OCR homoglyphs only inside common legal abbreviations.
+    text = re.sub(r"\b[ОO]{3}\b", "ООО", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b[ПP][КK][ОO]\b", "ПКО", text, flags=re.IGNORECASE)
     return text.strip(" \t\r\n,;")
 
 
 def normalize_address_text(value: object | None) -> str:
     text = clean_text(value)
+    text = re.sub(r"^(\d{6}),\s*\1,\s*", r"\1, ", text)
     text = re.sub(r"\bв\s+городе\s+Москва\b", "г. Москва", text, flags=re.IGNORECASE)
     text = re.sub(r"\bв\s+городе\s+", "г. ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bгород\s+Москва\b", "г. Москва", text, flags=re.IGNORECASE)
@@ -246,6 +250,16 @@ def money_to_decimal(value: object | None) -> Decimal | None:
         except InvalidOperation:
             return None
 
+    # Whole-ruble amounts are legally common and may omit kopeks entirely:
+    # "2000 руб.", "44 600 рублей". Treat them as exactly .00.
+    rubles_only = re.search(r"(\d[\d\s.]*)\s*руб\.?(?!\s*\d{1,2}\s*коп)", text)
+    if rubles_only:
+        rubles = re.sub(r"[\s.]", "", rubles_only.group(1))
+        try:
+            return Decimal(f"{rubles}.00")
+        except InvalidOperation:
+            return None
+
     # A money-looking string that could not be parsed must not silently lose
     # kopeks through the generic bare-number fallback.
     if "руб" in text or "коп" in text:
@@ -390,7 +404,8 @@ def structured_court_facts(court_name: object | None, judge: object | None = Non
 def structured_debt_basis_facts(value: object | None) -> dict[str, str]:
     """Extract agreement facts without storing a ready-made sentence."""
     text = clean_text(value)
-    number_match = re.search(r"(?:№\s*)?(\d{5,}(?:[-/]\d+)*)", text)
+    labeled_number = re.search(r"№\s*([A-Za-zА-Яа-яЁё]{0,8}\s*\d{3,}(?:[-/]\d+)*)", text)
+    number_match = labeled_number or re.search(r"(\d{5,}(?:[-/]\d+)*)", text)
     date_match = re.search(r"\b(\d{1,2}[./]\d{1,2}[./]\d{2,4})\b", text)
     lower = text.lower()
     if "карт" in lower:
@@ -405,7 +420,7 @@ def structured_debt_basis_facts(value: object | None) -> dict[str, str]:
         basis_type = ""
     return {
         "debt_basis_type": basis_type,
-        "debt_basis_number": number_match.group(1) if number_match else "",
+        "debt_basis_number": re.sub(r"\s+", "", number_match.group(1)) if number_match else "",
         "debt_basis_date": date_match.group(1).replace("/", ".") if date_match else "",
     }
 
@@ -588,6 +603,8 @@ def validate_amounts(data: dict) -> AmountValidationResult:
         errors.append("debt_amount: не удалось распознать сумму долга")
     if state_duty is None and normalized.get("state_duty"):
         errors.append("state_duty: не удалось распознать госпошлину")
+    if total is None and normalized.get("total_amount"):
+        errors.append("total_amount: не удалось распознать итоговую сумму")
     computed_total = None
     if debt is not None and state_duty is not None:
         computed_total = (debt + state_duty).quantize(Decimal("0.01"))

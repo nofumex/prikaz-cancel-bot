@@ -26,6 +26,12 @@ def test_money_with_currency_inside_parentheses_preserves_kopeks():
     assert clean_money_text(value) == "2 000 руб. 00 коп."
 
 
+def test_whole_rubles_without_kopeks_are_exact_money():
+    assert money_to_decimal("2000 руб.") == Decimal("2000.00")
+    assert clean_money_text("44 600 рублей") == "44 600 руб. 00 коп."
+    assert clean_money_text("769 руб.") == "769 руб. 00 коп."
+
+
 def test_case_92_identifiers_are_separated():
     case_number, uid = normalize_case_identifiers(
         "09MS0020-01-2026-001641-42 Дело №2-1292/2026",
@@ -47,6 +53,22 @@ def test_court_postal_address_is_not_part_of_court_name():
         {"court_name": "судебного участка № 1 Хабезского судебного района, 369400, КЧР, а. Хабез"}
     )
     assert data["court_name"] == "судебного участка № 1 Хабезского судебного района"
+
+
+def test_common_legal_homoglyphs_and_duplicate_postcode_are_normalized():
+    data = normalize_order_data(
+        {
+            "creditor_name": 'OOO ПКO "ЭОС"',
+            "debtor_address": "662978, 662978, Красноярский край, г. Железногорск",
+        }
+    )
+    assert data["creditor_name"] == 'ООО ПКО "ЭОС"'
+    assert data["debtor_address"] == "662978, Красноярский край, г. Железногорск"
+
+
+def test_debt_basis_preserves_alphanumeric_contract_prefix():
+    data = normalize_order_data({"debt_contract": "договор № СП356655 от 16.11.2021"})
+    assert data["debt_basis_number"] == "СП356655"
 
 
 def test_case_number_removes_ocr_spacing_around_separators():
