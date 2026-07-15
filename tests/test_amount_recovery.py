@@ -117,6 +117,25 @@ def test_false_total_is_replaced_when_source_has_no_explicit_total():
     assert recovery.order_data["total_amount"] == "20 898 руб. 08 коп."
 
 
+def test_state_duty_evidence_accepts_inflected_pochline_word():
+    primary = {
+        "debt_amount": "25 704 руб. 49 коп.",
+        "state_duty": "2 000 руб. 00 коп.",
+        "total_amount": "25 704 руб. 49 коп.",
+    }
+    retry = {
+        "debt_amount": "25 704 руб. 49 коп.",
+        "debt_amount_fragment": "задолженность в размере 25704,49",
+        "state_duty": "2 000 руб. 00 коп.",
+        "state_duty_fragment": "государственной пошлине в размере 2000 руб. 00 коп.",
+        "total_amount": "",
+        "total_amount_fragment": "",
+    }
+    recovery = recover_amounts_from_mismatch(primary, retry)
+    assert recovery.applied
+    assert recovery.order_data["total_amount"] == "27 704 руб. 49 коп."
+
+
 def test_total_minus_state_duty_recovery():
     primary = normalize_order_data(
         {

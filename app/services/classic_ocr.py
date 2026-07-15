@@ -30,9 +30,9 @@ def _tesseract_one(path: Path) -> str:
 
 async def extract_classic_ocr_text(order_photo_path: str | Path, *, case_id: int | None = None) -> str:
     variants = build_order_ocr_variants(order_photo_path, case_id=case_id)
-    # Top and middle overlap intentionally: headers live in the first tile,
-    # operative facts and money usually live in the second one.
-    selected = variants[1:3] if len(variants) >= 3 else variants[:1]
+    # The overlapping middle tile covers both the header and operative block
+    # on normal pages while keeping classic OCR latency bounded.
+    selected = variants[2:3] if len(variants) >= 3 else variants[:1]
     chunks = await asyncio.gather(*(asyncio.to_thread(_tesseract_one, path) for path in selected))
     return "\n\n--- OCR TILE ---\n\n".join(chunk for chunk in chunks if chunk)[:24000]
 

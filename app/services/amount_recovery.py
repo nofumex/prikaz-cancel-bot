@@ -26,7 +26,7 @@ class AmountRecoveryResult:
 
 
 _TOTAL_FRAGMENT_KEYWORDS = ("всего", "итого", "всего к взысканию")
-_DUTY_FRAGMENT_KEYWORDS = ("государственной пошлины", "госпошлина", "гос. пошлина", "гос пошлина")
+_DUTY_FRAGMENT_KEYWORDS = ("пошлин", "госпошлин")
 _DEBT_FRAGMENT_KEYWORDS = ("задолженност", "сумма долга", "сумму долга", "долг")
 
 
