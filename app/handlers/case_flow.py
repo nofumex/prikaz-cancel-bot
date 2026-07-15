@@ -24,6 +24,7 @@ from app.services.crm_background import schedule_crm_sync
 from app.services.document_delivery import delivery_instruction_text
 from app.services.cases import create_case, generated_case_for_user, generated_cases, get_or_create_active_case, latest_case, latest_open_case, save_photo_path, set_received_date
 from app.services.documents import MANUAL_REVIEW_USER_TEXT, create_case_documents_reviewed, extraction_preview
+from app.services.document_background import start_document_preparation, wait_started_document_preparation
 from app.services.app_settings import payments_enabled
 from app.services.amount_recovery import (
     AmountRecoveryResult,
@@ -265,11 +266,17 @@ async def _continue_after_received_date(
     current_user: User,
     case: Case,
 ) -> None:
+    start_document_preparation(settings, case.id, current_user.id)
     if not normalize_phone(current_user.phone):
         await _request_payment_contact(message, state, case)
         return
     await message.answer("<b>🔄 Заявление составляется, нужно немного подождать...</b>")
-    missing = await _wait_for_background_order(session, settings, case, current_user)
+    preparation = await wait_started_document_preparation(case.id)
+    if preparation is not None:
+        await session.refresh(case)
+        missing = json.loads(case.missing_fields or "[]")
+    else:
+        missing = await _wait_for_background_order(session, settings, case, current_user)
     if missing:
         await state.update_data(case_id=case.id)
         await state.set_state(CaseStates.waiting_order_rephoto)
@@ -286,7 +293,21 @@ async def _continue_after_received_date(
         await state.clear()
         await message.answer(extraction_preview(extracted, case.received_date, [], case.deadline_date), reply_markup=confirm_extraction())
         return
+    if preparation is not None and preparation.ok and (case.preview_pdf_path or case.preview_doc_path):
+        await _deliver_prepared_preview(message, state, session, settings, current_user, case)
+        return
     await _generate_documents_flow(message, session, settings, current_user, case, state=state, bot=message.bot)
+
+
+async def _deliver_prepared_preview(
+    message: Message, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User, case: Case
+) -> bool:
+    if not payments_enabled():
+        return await _generate_documents_flow(message, session, settings, current_user, case, state=state, bot=message.bot)
+    preview_file = case.preview_pdf_path or case.preview_doc_path
+    if preview_file:
+        await message.answer_document(FSInputFile(preview_file), reply_markup=ReplyKeyboardRemove(), caption="Скрытый предпросмотр заявления.")
+    return await _finalize_payment(message, state, session, settings, current_user, case)
 
 
 @router.message(CaseStates.waiting_order_photo, F.photo)
@@ -431,7 +452,12 @@ async def receive_payment_contact(message: Message, state: FSMContext, session: 
         reply_markup=ReplyKeyboardRemove(),
     )
     schedule_crm_sync(settings, case.id, current_user.id, "phone_provided", {"note": "Пользователь указал номер телефона"})
-    missing = await _wait_for_background_order(session, settings, case, current_user)
+    preparation = await wait_started_document_preparation(case.id)
+    if preparation is not None:
+        await session.refresh(case)
+        missing = json.loads(case.missing_fields or "[]")
+    else:
+        missing = await _wait_for_background_order(session, settings, case, current_user)
     if missing:
         await state.update_data(case_id=case.id)
         await state.set_state(CaseStates.waiting_order_rephoto)
@@ -443,8 +469,8 @@ async def receive_payment_contact(message: Message, state: FSMContext, session: 
         await state.set_state(CaseStates.waiting_manual_date)
         await message.answer(date_error + "\n\n" + manual_received_date_prompt_text())
         return
-    if case.preview_pdf_path or case.preview_doc_path:
-        await _finalize_payment(message, state, session, settings, current_user, case)
+    if preparation is not None and preparation.ok and (case.preview_pdf_path or case.preview_doc_path):
+        await _deliver_prepared_preview(message, state, session, settings, current_user, case)
         return
     extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
     if settings.show_user_confirmation_step:

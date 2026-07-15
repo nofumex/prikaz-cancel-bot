@@ -301,6 +301,7 @@ async def test_max_manual_date_requests_phone_before_order_processing(monkeypatc
     monkeypatch.setattr(max_bot, 'save_received_date', fake_save_received_date)
     monkeypatch.setattr(max_bot, "schedule_crm_sync", lambda *args, **kwargs: None)
     monkeypatch.setattr(max_bot, '_generate_documents', generate)
+    monkeypatch.setattr(max_bot, 'start_document_preparation', lambda *args: None)
 
     await max_bot._handle_manual_date(client, event, session, settings, user, "19.06.2026")
 

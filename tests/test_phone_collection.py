@@ -96,6 +96,8 @@ async def test_telegram_contact_shows_progress_then_starts_generation(monkeypatc
     scheduled = []
 
     monkeypatch.setattr(case_flow, "_generate_documents_flow", generate)
+    monkeypatch.setattr(case_flow, "start_document_preparation", lambda *args: None)
+    monkeypatch.setattr(case_flow, "wait_started_document_preparation", AsyncMock(return_value=None))
     monkeypatch.setattr(case_flow, "schedule_crm_sync", lambda *args: scheduled.append(args))
 
     await case_flow.receive_payment_contact(message, state, session, settings, user)
@@ -121,6 +123,8 @@ async def test_saved_telegram_phone_skips_contact_prompt(monkeypatch) -> None:
     generate = AsyncMock(return_value=True)
 
     monkeypatch.setattr(case_flow, "_generate_documents_flow", generate)
+    monkeypatch.setattr(case_flow, "start_document_preparation", lambda *args: None)
+    monkeypatch.setattr(case_flow, "wait_started_document_preparation", AsyncMock(return_value=None))
 
     await case_flow._continue_after_received_date(message, state, session, settings, user, case)
 
@@ -143,6 +147,8 @@ async def test_saved_max_phone_skips_contact_prompt_after_date(monkeypatch) -> N
     monkeypatch.setattr(max_bot, "_state_data", AsyncMock(return_value={"case_id": case.id}))
     monkeypatch.setattr(max_bot, "save_received_date", AsyncMock())
     monkeypatch.setattr(max_bot, "_generate_documents", generate)
+    monkeypatch.setattr(max_bot, "start_document_preparation", lambda *args: None)
+    monkeypatch.setattr(max_bot, "wait_started_document_preparation", AsyncMock(return_value=None))
 
     await max_bot._handle_manual_date(client, event, session, settings, user, "14.07.2026")
 

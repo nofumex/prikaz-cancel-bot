@@ -23,6 +23,7 @@ from app.services.cases import generated_case_for_user, generated_cases, get_or_
 from app.services.crm_background import schedule_crm_sync
 from app.services.document_delivery import deliver_documents_to_case_platform
 from app.services.documents import MANUAL_REVIEW_USER_TEXT, create_case_documents_reviewed, extraction_preview
+from app.services.document_background import start_document_preparation, wait_started_document_preparation
 from app.services.legal_data import FIELD_LABELS, is_deadline_missed, missing_order_fields, normalize_debtor_name_fields, normalize_order_data, suggest_nominative_full_name, validate_before_generation
 from app.services.llm import extract_envelope_date, extract_order_data
 from app.services.order_background import start_order_extraction, wait_order_extraction
@@ -242,6 +243,16 @@ async def _finalize_payment(client: MaxBotClient, event: IncomingEvent, session,
     return True
 
 
+async def _deliver_prepared_preview(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User, case: Case) -> bool:
+    if not payments_enabled():
+        await _generate_documents(client, event, session, settings, user, case)
+        return True
+    preview_file = case.preview_pdf_path or case.preview_doc_path
+    if preview_file:
+        await client.send_file(event.chat_id, preview_file, caption="Скрытый предпросмотр заявления.")
+    return await _finalize_payment(client, event, session, settings, user, case)
+
+
 async def _notify_admin_download_failure(client: MaxBotClient, event: IncomingEvent, settings: Settings, reason: str) -> None:
     raw = json.dumps(sanitize_raw_update(event.raw_update or {}), ensure_ascii=False)
     text = f"⚠️ MAX не смог скачать вложение.\n\nПричина: {reason}\n\nraw_update={raw}"
@@ -263,7 +274,12 @@ async def _handle_payment_contact(client: MaxBotClient, event: IncomingEvent, se
     data = await _state_data(session, event)
     case = await session.get(Case, data["case_id"])
     schedule_crm_sync(settings, case.id, user.id, "phone_provided", {"note": "MAX: пользователь указал номер телефона"})
-    missing = await _wait_for_background_order(session, settings, case, user)
+    preparation = await wait_started_document_preparation(case.id)
+    if preparation is not None:
+        await session.refresh(case)
+        missing = json.loads(case.missing_fields or "[]")
+    else:
+        missing = await _wait_for_background_order(session, settings, case, user)
     if missing:
         await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})
         await _send_order_rephoto_prompt(client, event, missing, attempts=case.order_rephoto_attempts)
@@ -273,8 +289,8 @@ async def _handle_payment_contact(client: MaxBotClient, event: IncomingEvent, se
         await _set_state(session, event, STATE_MANUAL_DATE, {"case_id": case.id})
         await _send(client, event, date_error + "\n\n" + manual_received_date_prompt_text())
         return
-    if case.preview_pdf_path or case.preview_doc_path:
-        await _finalize_payment(client, event, session, settings, user, case)
+    if preparation is not None and preparation.ok and (case.preview_pdf_path or case.preview_doc_path):
+        await _deliver_prepared_preview(client, event, session, settings, user, case)
         return
     extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
     if settings.show_user_confirmation_step:
@@ -817,11 +833,17 @@ async def _handle_manual_date(client: MaxBotClient, event: IncomingEvent, sessio
         await _send(client, event, error)
         return
     await save_received_date(session, settings, case, user, received)
+    start_document_preparation(settings, case.id, user.id)
     if not normalize_phone(user.phone):
         await _request_payment_contact(client, event, session, case)
         return
     await _send(client, event, "🔄 Заявление составляется, нужно немного подождать...")
-    missing = await _wait_for_background_order(session, settings, case, user)
+    preparation = await wait_started_document_preparation(case.id)
+    if preparation is not None:
+        await session.refresh(case)
+        missing = json.loads(case.missing_fields or "[]")
+    else:
+        missing = await _wait_for_background_order(session, settings, case, user)
     if missing:
         await _set_state(session, event, STATE_ORDER_REPHOTO, {'case_id': case.id})
         await _send_order_rephoto_prompt(client, event, missing, attempts=case.order_rephoto_attempts)
@@ -831,7 +853,10 @@ async def _handle_manual_date(client: MaxBotClient, event: IncomingEvent, sessio
         await _set_state(session, event, STATE_MANUAL_DATE, {"case_id": case.id})
         await _send(client, event, date_error + "\n\n" + manual_received_date_prompt_text())
         return
-    await _generate_documents(client, event, session, settings, user, case)
+    if preparation is not None and preparation.ok and (case.preview_pdf_path or case.preview_doc_path):
+        await _deliver_prepared_preview(client, event, session, settings, user, case)
+    else:
+        await _generate_documents(client, event, session, settings, user, case)
     return
 
 
