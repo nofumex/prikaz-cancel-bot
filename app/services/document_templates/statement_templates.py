@@ -159,7 +159,28 @@ def _contract_inline(value: str) -> str:
         return re.sub(r"^договор", "договору", value, flags=re.IGNORECASE)
     if value.startswith("№"):
         return f"договору {value}"
+    if re.fullmatch(r"\d[\d\s-]*", value):
+        return f"договору № {value}"
     return value
+
+
+def _structured_debt_basis_inline(data: dict) -> str:
+    number = _optional(data, "debt_basis_number")
+    basis_date = _optional(data, "debt_basis_date")
+    basis_type = _optional(data, "debt_basis_type")
+    if not number:
+        return _contract_inline(_optional(data, "debt_contract"))
+    if basis_type == "credit_card_agreement":
+        phrase = f"договору о выпуске и использовании кредитной банковской карты № {number}"
+    elif basis_type == "credit_agreement":
+        phrase = f"кредитному договору № {number}"
+    elif basis_type == "loan_agreement":
+        phrase = f"договору займа № {number}"
+    else:
+        phrase = f"договору № {number}"
+    if basis_date:
+        phrase += f" от {basis_date}"
+    return phrase
 
 
 def _period_inline(value: str) -> str:
@@ -175,7 +196,7 @@ def _money_body_phrase(data: dict) -> str:
     state_duty = state_duty_raw.rstrip(".") if state_duty_raw else ""
     debt = _required(data, "debt_amount").rstrip(".") + ("." if state_duty else "")
     total = _optional(data, "total_amount").rstrip(".")
-    contract = _optional(data, "debt_contract")
+    contract = _structured_debt_basis_inline(data)
     period = _optional(data, "debt_period")
     fragments = []
     if contract:

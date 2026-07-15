@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -14,8 +16,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.models import OpenAIUsage
-from app.services.image_preprocessing import build_amount_ocr_variants
+from app.services.amount_recovery import recover_amounts_from_mismatch
+from app.services.image_preprocessing import build_amount_ocr_variants, build_order_verifier_image
 from app.services.legal_data import clean_money_text, missing_order_fields, normalize_debtor_name_fields, normalize_order_data
+from app.services.order_integrity import (
+    CRITICAL_ORDER_FIELDS,
+    ORDER_EVIDENCE_SCHEMA,
+    build_order_evidence_schema,
+    conflicting_fields,
+    evidence_payload_fields,
+    merge_verified_order_data,
+)
 from app.utils import ensure_dir, parse_russian_date
 
 logger = logging.getLogger(__name__)
@@ -89,7 +100,6 @@ AMOUNTS_JSON_SCHEMA_PROPERTIES = {
     "state_duty_fragment": {"type": "string"},
     "total_amount": {"type": "string"},
     "total_amount_fragment": {"type": "string"},
-    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     "comment": {"type": "string"},
 }
 
@@ -124,6 +134,10 @@ DOCUMENT_REVIEW_CLEAN_FIELDS = {
     "uid": "",
     "debt_contract": "",
     "debt_period": "",
+    "order_date": "",
+    "debt_amount": "",
+    "state_duty": "",
+    "total_amount": "",
 }
 
 DOCUMENT_REVIEW_ISSUE_SCHEMA = {
@@ -135,9 +149,13 @@ DOCUMENT_REVIEW_ISSUE_SCHEMA = {
         "severity": {"type": "string", "enum": ["ok", "warning", "blocker"]},
         "message": {"type": "string"},
         "suggested_fix": {"type": "string"},
-        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "source_fragment": {"type": "string"},
+        "source_verified": {"type": "boolean"},
     },
-    "required": ["code", "field", "severity", "message", "suggested_fix", "confidence"],
+    "required": [
+        "code", "field", "severity", "message", "suggested_fix",
+        "source_fragment", "source_verified",
+    ],
 }
 
 DOCUMENT_REVIEW_SCHEMA = {
@@ -147,7 +165,6 @@ DOCUMENT_REVIEW_SCHEMA = {
         "ok": {"type": "boolean"},
         "severity": {"type": "string", "enum": ["ok", "warning", "blocker"]},
         "needs_regeneration": {"type": "boolean"},
-        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "issues": {"type": "array", "items": DOCUMENT_REVIEW_ISSUE_SCHEMA},
         "clean_fields": {
             "type": "object",
@@ -156,7 +173,7 @@ DOCUMENT_REVIEW_SCHEMA = {
             "required": list(DOCUMENT_REVIEW_CLEAN_FIELDS.keys()),
         },
     },
-    "required": ["ok", "severity", "needs_regeneration", "confidence", "issues", "clean_fields"],
+    "required": ["ok", "severity", "needs_regeneration", "issues", "clean_fields"],
 }
 
 
@@ -276,12 +293,52 @@ async def record_openai_usage(
     await session.commit()
 
 
-def _save_order_ocr_raw(case_id: int | None, raw_data: dict[str, Any]) -> None:
+def _save_debug_attempt(
+    case_id: int | None,
+    operation: str,
+    payload: dict[str, Any],
+    *,
+    request_id: str | None = None,
+    model: str | None = None,
+) -> None:
     if case_id is None:
         return
     debug_dir = ensure_dir(Path("storage/debug") / f"case_{case_id}")
-    path = debug_dir / "order_ocr_raw.json"
-    path.write_text(json.dumps(raw_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    attempts_dir = ensure_dir(debug_dir / "attempts")
+    safe_operation = re.sub(r"[^a-zA-Z0-9_-]+", "_", operation).strip("_") or "attempt"
+    safe_request = re.sub(r"[^a-zA-Z0-9_-]+", "_", request_id or "no_request_id")[-80:]
+    attempt_path = attempts_dir / f"{time.time_ns()}_{safe_operation}_{safe_request}.json"
+    body = {
+        "operation": operation,
+        "request_id": request_id,
+        "model": model,
+        "payload": payload,
+    }
+    attempt_path.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _save_order_ocr_raw(
+    case_id: int | None,
+    raw_data: dict[str, Any],
+    *,
+    request_id: str | None = None,
+    model: str | None = None,
+) -> None:
+    if case_id is None:
+        return
+    debug_dir = ensure_dir(Path("storage/debug") / f"case_{case_id}")
+    # Keep the compatibility snapshot for admin tooling, but never use it as
+    # the audit history: every attempt is also written immutably below.
+    (debug_dir / "order_ocr_raw.json").write_text(
+        json.dumps(raw_data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    _save_debug_attempt(
+        case_id,
+        "order_ocr",
+        raw_data,
+        request_id=request_id,
+        model=model,
+    )
 
 
 async def _responses_json(
@@ -324,25 +381,33 @@ async def _responses_json(
     }
     headers = {"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"}
     timeout = aiohttp.ClientTimeout(total=settings.llm_timeout_seconds)
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        async with session.post(f"{settings.openai_base_url}/responses", json=body) as response:
-            raw = await response.text()
-            if response.status >= 400:
-                raise RuntimeError(f"OpenAI API error {response.status}: {raw[:800]}")
-            data = json.loads(raw)
-    answer = _response_text(data)
-    if not answer.strip():
-        raise RuntimeError("OpenAI API returned empty structured output")
-    return LLMResult(
-        data=json.loads(answer),
-        usage=_parse_usage(data),
-        model=str(data.get("model") or model or settings.vision_model),
-        request_id=str(data.get("id") or ""),
-        latency_ms=int((time.perf_counter() - start) * 1000),
-    )
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.post(f"{settings.openai_base_url}/responses", json=body) as response:
+                    raw = await response.text()
+                    if response.status >= 400:
+                        raise RuntimeError(f"OpenAI API error {response.status}: {raw[:800]}")
+                    data = json.loads(raw)
+            answer = _response_text(data)
+            if not answer.strip():
+                raise RuntimeError("OpenAI API returned empty structured output")
+            return LLMResult(
+                data=json.loads(answer),
+                usage=_parse_usage(data),
+                model=str(data.get("model") or model or settings.vision_model),
+                request_id=str(data.get("id") or ""),
+                latency_ms=int((time.perf_counter() - start) * 1000),
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                await asyncio.sleep(0.15)
+    raise RuntimeError(f"OpenAI structured request failed after retry: {last_error}")
 
 
-async def extract_order_data(
+async def _extract_order_data_primary(
     settings: Settings,
     session: AsyncSession | None,
     *,
@@ -377,7 +442,12 @@ async def extract_order_data(
     raw_data = {key: str(result.data.get(key) or "").strip() for key in ORDER_SCHEMA_HINT}
     if result.data.get("debtor_full_name_confidence") is not None:
         raw_data["debtor_full_name_confidence"] = str(result.data.get("debtor_full_name_confidence") or 0)
-    _save_order_ocr_raw(case_id, raw_data)
+    _save_order_ocr_raw(
+        case_id,
+        raw_data,
+        request_id=result.request_id,
+        model=result.model,
+    )
     normalized = normalize_order_data(raw_data)
     normalized, name_result = normalize_debtor_name_fields(normalized)
     if name_result and name_result.confidence < 0.85 and looks_like_dative(normalized.get("debtor_full_name", "")):
@@ -386,6 +456,283 @@ async def extract_order_data(
         except Exception:
             logger.warning("LLM name normalization failed", exc_info=True)
     return normalized
+
+
+async def _extract_order_evidence(
+    settings: Settings,
+    session: AsyncSession | None,
+    *,
+    case_id: int | None,
+    user_id: int | None,
+    order_photo_path: str,
+) -> tuple[dict[str, Any], LLMResult]:
+    """Independently re-read legally significant fields from the image.
+
+    This request intentionally does not receive the primary OCR result, which
+    prevents the verifier from merely agreeing with an earlier transcription.
+    """
+    model = settings.order_verifier_model or settings.ai_review_model or settings.text_model
+    verifier_image = build_order_verifier_image(order_photo_path, case_id=case_id)
+    result: LLMResult | None = None
+    try:
+        result = await _responses_json(
+            settings,
+            instructions=(
+                "Ты независимый верификатор судебного приказа РФ. Прочитай изображение сам, "
+                "не додумывай и не нормализуй неразборчивые символы по смыслу. Для каждого поля "
+                "верни значение и точный фрагмент исходного документа, где оно напечатано. "
+                "Различай сумму задолженности, госпошлину и общую сумму. Сверяй цифровую сумму "
+                "с суммой прописью. В court_name не включай слова 'мировой суд' или 'мировой судья' "
+                "как часть названия: возвращай судебный участок и территорию. Для debtor_address "
+                "проверяй каждую букву по изображению. Если поле отсутствует, верни пустую строку. "
+                "В debtor_full_name верни ФИО в именительном падеже, а source_fragment оставь точной цитатой с изображения. "
+                "Не оценивай правдоподобие: значение должно следовать только из изображения."
+            ),
+            text="Независимо извлеки критические поля судебного приказа вместе с точными цитатами.",
+            image_path=verifier_image,
+            schema_name="court_order_independent_evidence",
+            schema=ORDER_EVIDENCE_SCHEMA,
+            model=model,
+        )
+    except Exception as exc:
+        await record_openai_usage(
+            settings,
+            session,
+            case_id=case_id,
+            user_id=user_id,
+            operation="order_integrity_verifier",
+            model=model,
+            success=False,
+            error_message=str(exc),
+        )
+        raise
+    await record_openai_usage(
+        settings,
+        session,
+        case_id=case_id,
+        user_id=user_id,
+        operation="order_integrity_verifier",
+        model=result.model,
+        result=result,
+        success=True,
+    )
+    _save_debug_attempt(
+        case_id,
+        "order_integrity_verifier",
+        result.data,
+        request_id=result.request_id,
+        model=result.model,
+    )
+    return result.data, result
+
+
+async def _adjudicate_order_conflicts(
+    settings: Settings,
+    session: AsyncSession | None,
+    *,
+    case_id: int | None,
+    user_id: int | None,
+    order_photo_path: str,
+    primary: dict[str, Any],
+    verifier_payload: dict[str, Any],
+    conflicts: list[str],
+) -> dict[str, Any]:
+    model = settings.order_adjudicator_model or settings.ai_review_model or settings.text_model
+    verifier = evidence_payload_fields(verifier_payload)
+    comparison = {
+        field: {
+            "primary": str(primary.get(field) or ""),
+            "independent_verifier": verifier.get(field).value if verifier.get(field) else "",
+            "verifier_fragment": verifier.get(field).source_fragment if verifier.get(field) else "",
+        }
+        for field in conflicts
+    }
+    result: LLMResult | None = None
+    try:
+        result = await _responses_json(
+            settings,
+            instructions=(
+                "Ты финальный арбитр расхождений OCR судебного приказа. Решай только по исходному "
+                "изображению, а не по правдоподобию кандидатов. Для конфликтных полей внимательно "
+                "увеличь соответствующую область, выбери посимвольно верное значение и приведи "
+                "точную цитату. Особое внимание: одна буква в ФИО/адресе, копейки, сумма долга против "
+                "итога, номер дела, номер договора и корректное название судебного участка. "
+                "debtor_full_name верни в именительном падеже; исходную падежную форму сохрани в source_fragment. "
+                "Неконфликтные поля можно повторить или оставить пустыми."
+            ),
+            text=(
+                "Конфликтные поля: " + ", ".join(conflicts) + "\n"
+                "Кандидаты (это подсказки, не источник истины):\n"
+                + json.dumps(comparison, ensure_ascii=False, indent=2)
+            ),
+            image_path=order_photo_path,
+            schema_name="court_order_conflict_adjudication",
+            schema=build_order_evidence_schema(conflicts),
+            model=model,
+        )
+    except Exception as exc:
+        await record_openai_usage(
+            settings,
+            session,
+            case_id=case_id,
+            user_id=user_id,
+            operation="order_integrity_adjudicator",
+            model=model,
+            success=False,
+            error_message=str(exc),
+            metadata={"conflicts": conflicts},
+        )
+        raise
+    await record_openai_usage(
+        settings,
+        session,
+        case_id=case_id,
+        user_id=user_id,
+        operation="order_integrity_adjudicator",
+        model=result.model,
+        result=result,
+        success=True,
+        metadata={"conflicts": conflicts},
+    )
+    _save_debug_attempt(
+        case_id,
+        "order_integrity_adjudicator",
+        result.data,
+        request_id=result.request_id,
+        model=result.model,
+    )
+    return result.data
+
+
+async def extract_order_data(
+    settings: Settings,
+    session: AsyncSession | None,
+    *,
+    case_id: int | None,
+    user_id: int | None,
+    order_photo_path: str,
+) -> dict[str, Any]:
+    if not settings.order_integrity_enabled:
+        return await _extract_order_data_primary(
+            settings,
+            session,
+            case_id=case_id,
+            user_id=user_id,
+            order_photo_path=order_photo_path,
+        )
+
+    primary_task = asyncio.create_task(
+        _extract_order_data_primary(
+            settings,
+            session,
+            case_id=case_id,
+            user_id=user_id,
+            order_photo_path=order_photo_path,
+        )
+    )
+    verifier_task = asyncio.create_task(
+        _extract_order_evidence(
+            settings,
+            # AsyncSession is intentionally not shared across concurrent
+            # tasks. The immutable attempt file still retains the verifier
+            # response; the primary request keeps the normal usage row.
+            None,
+            case_id=case_id,
+            user_id=user_id,
+            order_photo_path=order_photo_path,
+        )
+    )
+    # Money is read by a role-specific extractor in parallel, so the
+    # arithmetic invariant does not add another full round-trip on mismatch.
+    amounts_task = asyncio.create_task(
+        extract_order_amounts(
+            settings,
+            None,
+            case_id=case_id,
+            user_id=user_id,
+            order_photo_path=order_photo_path,
+        )
+    )
+    primary_result, verifier_result, amounts_result = await asyncio.gather(
+        primary_task, verifier_task, amounts_task, return_exceptions=True
+    )
+    if isinstance(primary_result, BaseException):
+        raise primary_result
+    if isinstance(verifier_result, BaseException):
+        await record_openai_usage(
+            settings,
+            session,
+            case_id=case_id,
+            user_id=user_id,
+            operation="order_integrity_verifier",
+            model=settings.order_verifier_model or settings.ai_review_model or settings.text_model,
+            success=False,
+            error_message=str(verifier_result),
+        )
+        raise RuntimeError(f"independent order verifier failed after internal API retries: {verifier_result}")
+
+    verifier_payload, verifier_llm_result = verifier_result
+    await record_openai_usage(
+        settings,
+        session,
+        case_id=case_id,
+        user_id=user_id,
+        operation="order_integrity_verifier",
+        model=verifier_llm_result.model,
+        result=verifier_llm_result,
+        success=True,
+    )
+
+    verifier_fields = evidence_payload_fields(verifier_payload)
+    conflicts = conflicting_fields(primary_result, verifier_fields)
+    adjudicator_result: dict[str, Any] | None = None
+    if conflicts:
+        try:
+            adjudicator_result = await _adjudicate_order_conflicts(
+                settings,
+                session,
+                case_id=case_id,
+                user_id=user_id,
+                order_photo_path=order_photo_path,
+                primary=primary_result,
+                verifier_payload=verifier_payload,
+                conflicts=conflicts,
+            )
+        except Exception:
+            logger.exception("Order integrity adjudication failed for case %s", case_id)
+
+    decision = merge_verified_order_data(
+        primary_result,
+        verifier_payload,
+        adjudicator_result,
+    )
+    if not isinstance(amounts_result, BaseException):
+        amount_recovery = recover_amounts_from_mismatch(decision.data, amounts_result)
+        if amount_recovery.applied:
+            decision.data = amount_recovery.order_data
+            decision.applied_fields.update(
+                {
+                    "debt_amount": str(decision.data.get("debt_amount") or ""),
+                    "state_duty": str(decision.data.get("state_duty") or ""),
+                    "total_amount": str(decision.data.get("total_amount") or ""),
+                }
+            )
+    _save_debug_attempt(
+        case_id,
+        "order_integrity_decision",
+        {
+            "conflicts": decision.conflicts,
+            "unresolved_fields": decision.unresolved_fields,
+            "applied_fields": decision.applied_fields,
+            "evidence": decision.evidence,
+            "final_data": decision.data,
+        },
+    )
+    if decision.unresolved_fields:
+        raise RuntimeError(
+            "Order integrity could not resolve fields: " + ", ".join(decision.unresolved_fields)
+        )
+    return decision.data
 
 
 async def extract_order_amounts(
@@ -451,6 +798,13 @@ async def extract_order_amounts(
         (debug_dir / "amounts_ocr_retry.json").write_text(
             json.dumps(amounts, ensure_ascii=False, indent=2),
             encoding="utf-8",
+        )
+        _save_debug_attempt(
+            case_id,
+            "amounts_ocr_retry",
+            amounts,
+            request_id=result.request_id,
+            model=result.model,
         )
     return amounts
 
@@ -592,6 +946,7 @@ async def review_generated_document(
     source_data: dict[str, Any],
     visual_summary: dict[str, Any] | None = None,
     regeneration_happened: bool = False,
+    source_image_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Semantic review of the final client-visible statement text."""
     if not settings.openai_api_key:
@@ -599,7 +954,6 @@ async def review_generated_document(
             "ok": True,
             "severity": "ok",
             "needs_regeneration": False,
-            "confidence": 1.0,
             "issues": [],
             "clean_fields": dict(DOCUMENT_REVIEW_CLEAN_FIELDS),
             "skipped": "OPENAI_API_KEY is not configured",
@@ -607,7 +961,7 @@ async def review_generated_document(
 
     instructions = (
         "You are a legal QA reviewer for a final Russian court-order cancellation statement. "
-        "Review the final client-visible text. Return strict JSON only. "
+        "Review the final client-visible text against the attached SOURCE COURT ORDER IMAGE. Return strict JSON only. "
         "Only issues present in FINAL STATEMENT TEXT may block delivery. SOURCE OCR/CASE FIELDS is reference-only and must not be treated as client-visible text. "
         "Check the header for OCR garbage, passport data, birthplace used as debtor address, multiple creditor addresses, "
         "non-nominative debtor full name, bad court-address wrapping, missing space after the numero sign, unsupported legal claims, "
@@ -616,8 +970,11 @@ async def review_generated_document(
         "Do not flag feminine nominative Russian names such as \"\u041a\u0430\u0440\u0438\u043c\u043e\u0432\u0430 \u0415\u043b\u0435\u043d\u0430 \u0412\u0438\u043a\u0442\u043e\u0440\u043e\u0432\u043d\u0430\". "
         "Flag debtor block tokens including \"\u0443\u0440\u043e\u0436\u0435\u043d\", \"\u043f\u0430\u0441\u043f\u043e\u0440\u0442\", \"\u0432\u044b\u0434\u0430\u043d\", \"\u0423\u0424\u041c\u0421\", \"\u041e\u0423\u0424\u041c\u0421\", \"\u041c\u0412\u0414\", "
         "and registration markers left in raw grammatical form. In clean_fields, provide only safe text-field fixes. "
-        "Never suggest changing amounts, received date, case number, or UID unless confirmed by source_data. "
+        "Check every factual field against the image itself, including single-letter address/name errors, court wording, case number, contract, dates, rubles and kopeks. "
+        "Never suggest changing amounts, order date, case number, or UID unless the exact value is directly visible in the source image. "
+        "The received date is user-provided and is not expected to appear in the order image. "
         "If a fix is unsafe or uncertain, keep suggested_fix empty and mark the issue as blocker."
+        " Set source_verified=true only when source_fragment is an exact quote visibly supporting the fix in the attached image."
     )
     payload_text = (
         "FINAL STATEMENT TEXT:\n"
@@ -642,6 +999,7 @@ async def review_generated_document(
                 settings,
                 instructions=instructions,
                 text=payload_text,
+                image_path=source_image_path,
                 schema_name="document_ai_review",
                 schema=DOCUMENT_REVIEW_SCHEMA,
                 model=model,

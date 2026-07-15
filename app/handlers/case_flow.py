@@ -75,7 +75,7 @@ async def _download_photo(bot: Bot, message: Message, case_id: int, kind: str) -
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     suffix = Path(file.file_path or "").suffix or ".jpg"
-    path = Path("storage/photos") / f"case_{case_id}_{kind}_{photo.file_unique_id}{suffix}"
+    path = Path("storage/photos") / f"case_{case_id}_{kind}_{message.message_id}_{photo.file_unique_id}{suffix}"
     await bot.download_file(file.file_path, destination=path)
     return path
 
@@ -87,7 +87,7 @@ async def _download_document_image(bot: Bot, message: Message, case_id: int, kin
     suffix = Path(doc.file_name or file.file_path or "").suffix or ".jpg"
     if suffix.lower() not in {'.jpg', '.jpeg', '.png', '.webp', '.pdf', '.heic', '.heif'}:
         suffix = '.jpg'
-    path = Path("storage/photos") / f"case_{case_id}_{kind}_{doc.file_unique_id}{suffix}"
+    path = Path("storage/photos") / f"case_{case_id}_{kind}_{message.message_id}_{doc.file_unique_id}{suffix}"
     await bot.download_file(file.file_path, destination=path)
     return path
 

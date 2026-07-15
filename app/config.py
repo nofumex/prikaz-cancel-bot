@@ -127,6 +127,12 @@ class Settings:
     company_name: str
     manager_contact_text: str
 
+    # Fast integrity pipeline: primary OCR and verifier run concurrently;
+    # adjudication is invoked only for fields where they disagree.
+    order_integrity_enabled: bool = True
+    order_verifier_model: str = ""
+    order_adjudicator_model: str = ""
+
     @property
     def staff_ids(self) -> set[int]:
         return self.admin_ids | self.manager_ids
@@ -223,4 +229,7 @@ def get_settings() -> Settings:
         auto_recover_amount_min_confidence=float(getenv("AUTO_RECOVER_AMOUNT_MIN_CONFIDENCE") or 0.75),
         company_name=getenv("COMPANY_NAME", "Юридическая компания «Синай»"),
         manager_contact_text=getenv("MANAGER_CONTACT_TEXT", "Напишите менеджеру, и мы подключимся к диалогу."),
+        order_integrity_enabled=_parse_bool(getenv("ORDER_INTEGRITY_ENABLED"), True),
+        order_verifier_model=(getenv("ORDER_VERIFIER_MODEL") or getenv("VISION_MODEL") or "gpt-4.1-mini").strip(),
+        order_adjudicator_model=(getenv("ORDER_ADJUDICATOR_MODEL") or getenv("AI_REVIEW_MODEL") or getenv("TEXT_MODEL") or "gpt-4.1").strip(),
     )

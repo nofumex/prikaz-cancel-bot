@@ -5,11 +5,22 @@ from app.services.legal_data import (
     bad_tokens_in_text,
     clean_case_number,
     clean_debtor_address,
+    clean_money_text,
     format_money_rub_kop,
     legal_deadline_from_received,
     money_to_decimal,
     normalize_order_data,
 )
+
+
+def test_money_with_parenthetical_words_preserves_kopeks():
+    value = "120821 (сто двадцать тысяч восемьсот двадцать один) рубль 10 копеек"
+    assert money_to_decimal(value) == Decimal("120821.10")
+    assert clean_money_text(value) == "120 821 руб. 10 коп."
+
+
+def test_case_number_removes_ocr_spacing_around_separators():
+    assert clean_case_number("Дело № 2-59 /2015") == "2-59/2015"
 
 
 def test_case_number_normalization():

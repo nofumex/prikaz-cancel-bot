@@ -114,9 +114,9 @@ def test_unrecoverable_amounts_go_needs_review():
     )
     retry = {
         "debt_amount": "78 472 руб. 00 коп.",
-        "debt_amount_fragment": "задолженность",
+        "debt_amount_fragment": "задолженность 78 472 руб. 87 коп.",
         "state_duty": "1 277 руб. 00 коп.",
-        "state_duty_fragment": "госпошлина",
+        "state_duty_fragment": "госпошлина 1 277 руб. 00 коп.",
         "total_amount": "79 749 руб. 87 коп.",
         "total_amount_fragment": "итого",
         "confidence": 0.4,
@@ -136,11 +136,11 @@ def test_user_not_blocked_when_amounts_recovered():
     )
     retry = {
         "debt_amount": "78 472 руб. 87 коп.",
-        "debt_amount_fragment": "задолженность",
+        "debt_amount_fragment": "задолженность 78 472 руб. 87 коп.",
         "state_duty": "1 277 руб. 00 коп.",
-        "state_duty_fragment": "госпошлина",
+        "state_duty_fragment": "госпошлина 1 277 руб. 00 коп.",
         "total_amount": "79 749 руб. 87 коп.",
-        "total_amount_fragment": "всего к взысканию",
+        "total_amount_fragment": "всего к взысканию 79 749 руб. 87 коп.",
         "confidence": 0.9,
         "comment": "",
     }
@@ -193,11 +193,11 @@ async def test_resolve_amount_mismatch_integration():
     )
     retry = {
         "debt_amount": "78 472 руб. 87 коп.",
-        "debt_amount_fragment": "задолженность",
+        "debt_amount_fragment": "задолженность 78 472 руб. 87 коп.",
         "state_duty": "1 277 руб. 00 коп.",
-        "state_duty_fragment": "госпошлина",
+        "state_duty_fragment": "госпошлина 1 277 руб. 00 коп.",
         "total_amount": "79 749 руб. 87 коп.",
-        "total_amount_fragment": "всего к взысканию",
+        "total_amount_fragment": "всего к взысканию 79 749 руб. 87 коп.",
         "confidence": 0.95,
         "comment": "",
     }

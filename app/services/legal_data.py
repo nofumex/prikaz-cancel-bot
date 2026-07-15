@@ -151,6 +151,8 @@ def clean_uid(value: object | None) -> str:
 def clean_case_number(value: object | None) -> str:
     text = clean_text(value)
     text = re.sub(r"^(дело|производство|дело/производство)\s*№?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*/\s*", "/", text)
+    text = re.sub(r"\s*-\s*", "-", text)
     return text.strip(" №")
 
 
@@ -181,7 +183,14 @@ def money_to_decimal(value: object | None) -> Decimal | None:
         except InvalidOperation:
             return None
 
-    pattern = re.search(r"(\d[\d\s.]*)\s*руб\.?\s*(\d{1,2})?\s*коп\.?", text)
+    # Court orders frequently repeat the numeric amount in words between the
+    # ruble digits and the word "рубль":
+    #   120821 (сто двадцать тысяч ...) рубль 10 копеек
+    # Preserve the kopeks instead of falling back to the first bare number.
+    pattern = re.search(
+        r"(\d[\d\s.]*)\s*(?:\([^)]{0,300}\)\s*)?руб\.?\s*(\d{1,2})?\s*коп\.?",
+        text,
+    )
     if pattern:
         rubles_raw = pattern.group(1)
         kopeks = pattern.group(2) or "0"
@@ -193,6 +202,11 @@ def money_to_decimal(value: object | None) -> Decimal | None:
             return Decimal(f"{rubles}.{kopeks}")
         except InvalidOperation:
             return None
+
+    # A money-looking string that could not be parsed must not silently lose
+    # kopeks through the generic bare-number fallback.
+    if "руб" in text or "коп" in text:
+        return None
 
     compact = text.replace(" ", "").replace(",", ".")
     match = re.search(r"\d+(?:\.\d{1,2})?", compact)
@@ -287,12 +301,65 @@ def normalize_court_forms(court_name: str) -> dict[str, str]:
         base = court[len("мировому судье ") :].strip()
     elif lower.startswith("мировой судья "):
         base = court[len("мировой судья ") :].strip()
+    elif lower.startswith("мировой суд ") and "судебн" in lower:
+        base = court[len("мировой суд ") :].strip()
     elif lower.startswith("судебный участок"):
         base = re.sub(r"^судебный участок", "судебного участка", court, flags=re.IGNORECASE)
+    if base.lower().startswith("судебный участок"):
+        base = re.sub(r"^судебный участок", "судебного участка", base, flags=re.IGNORECASE)
     return {
         "court_name": base,
         "court_addressee": f"Мировому судье {base}" if not base.lower().startswith("мировому") else court,
         "court_instrumental": f"мировым судьей {base}",
+    }
+
+
+def structured_court_facts(court_name: object | None, judge: object | None = None) -> dict[str, str]:
+    """Split OCR court prose into atomic facts used by templates."""
+    forms = normalize_court_forms(clean_text(court_name)) if clean_text(court_name) else {}
+    base = forms.get("court_name", "")
+    number_match = re.search(r"(?:№|номер)\s*(\d+[\w-]*)", base, flags=re.IGNORECASE)
+    unit_number = number_match.group(1) if number_match else ""
+    court_type = "magistrate" if "судебн" in base.lower() and "участ" in base.lower() else "court"
+    region_match = re.search(
+        r"((?:[А-ЯЁA-Z][^,]{1,80}?\s+)?(?:области|область|края|край|республики|республика))\s*$",
+        base,
+        flags=re.IGNORECASE,
+    )
+    region = clean_text(region_match.group(1)) if region_match else ""
+    territory = base
+    territory = re.sub(r"^судебного участка\s*№?\s*\d+[\w-]*\s*", "", territory, flags=re.IGNORECASE)
+    if region and territory.lower().endswith(region.lower()):
+        territory = territory[: -len(region)].strip(" ,")
+    return {
+        "court_type": court_type,
+        "court_unit_number": unit_number,
+        "court_territory": clean_text(territory),
+        "court_region": region,
+        "judge_name": clean_text(judge),
+    }
+
+
+def structured_debt_basis_facts(value: object | None) -> dict[str, str]:
+    """Extract agreement facts without storing a ready-made sentence."""
+    text = clean_text(value)
+    number_match = re.search(r"(?:№\s*)?(\d{5,}(?:[-/]\d+)*)", text)
+    date_match = re.search(r"\b(\d{1,2}[./]\d{1,2}[./]\d{2,4})\b", text)
+    lower = text.lower()
+    if "карт" in lower:
+        basis_type = "credit_card_agreement"
+    elif "кредит" in lower:
+        basis_type = "credit_agreement"
+    elif "займ" in lower:
+        basis_type = "loan_agreement"
+    elif text:
+        basis_type = "agreement"
+    else:
+        basis_type = ""
+    return {
+        "debt_basis_type": basis_type,
+        "debt_basis_number": number_match.group(1) if number_match else "",
+        "debt_basis_date": date_match.group(1).replace("/", ".") if date_match else "",
     }
 
 
@@ -313,6 +380,9 @@ def normalize_order_data(data: dict) -> dict:
         normalized["court_name"] = court_forms["court_name"]
         normalized["court_addressee"] = court_forms["court_addressee"]
         normalized["court_instrumental"] = court_forms["court_instrumental"]
+        normalized.update(structured_court_facts(normalized["court_name"], normalized.get("judge")))
+    if normalized.get("debt_contract"):
+        normalized.update(structured_debt_basis_facts(normalized["debt_contract"]))
     for key in ("debt_amount", "state_duty", "total_amount"):
         if normalized.get(key):
             normalized[key] = clean_money_text(normalized[key])
@@ -441,6 +511,14 @@ VALIDATION_SKIP_KEYS = {
     "court_addressee",
     "court_instrumental",
     "restore_reason",
+    "court_type",
+    "court_unit_number",
+    "court_territory",
+    "court_region",
+    "judge_name",
+    "debt_basis_type",
+    "debt_basis_number",
+    "debt_basis_date",
 }
 
 

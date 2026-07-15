@@ -18,7 +18,7 @@ from app.services.documents import (
 FIXED_ADDRESS = "\u0433. \u0415\u0441\u0441\u0435\u043d\u0442\u0443\u043a\u0438, \u0443\u043b. \u0412\u043e\u043b\u043e\u0434\u0430\u0440\u0441\u043a\u043e\u0433\u043e, \u0434. 14"
 
 
-def test_ai_review_safe_fix_requires_confidence_and_safe_field():
+def test_ai_review_safe_fix_requires_source_evidence_and_safe_field():
     data = {"debtor_address": "\u0430\u0434\u0440\u0435\u0441: \u0433. \u0410\u0447\u0438\u043d\u0441\u043a, \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u043e\u043c\u0443 \u0432 \u0433\u043e\u0440\u043e\u0434\u0435 \u0415\u0441\u0441\u0435\u043d\u0442\u0443\u043a\u0438"}
     review = {
         "issues": [
@@ -27,6 +27,8 @@ def test_ai_review_safe_fix_requires_confidence_and_safe_field():
                 "severity": "blocker",
                 "confidence": 0.95,
                 "suggested_fix": FIXED_ADDRESS,
+                "source_verified": True,
+                "source_fragment": "проживающего: г. Ессентуки, ул. Володарского, д. 14",
             },
             {"field": "case_number", "severity": "blocker", "confidence": 0.99, "suggested_fix": "2-123/2026"},
         ],
@@ -184,7 +186,7 @@ async def test_autofix_mode_applies_clean_fields_and_rechecks_final_text(monkeyp
                 "severity": "blocker",
                 "needs_regeneration": True,
                 "confidence": 0.95,
-                "issues": [{"field": "debtor_full_name", "severity": "blocker", "confidence": 0.95, "suggested_fix": "\u0418\u0432\u0430\u043d\u043e\u0432 \u0418\u0432\u0430\u043d \u0418\u0432\u0430\u043d\u043e\u0432\u0438\u0447", "message": "case", "code": "NAME_CASE"}],
+                "issues": [{"field": "debtor_full_name", "severity": "blocker", "confidence": 0.95, "suggested_fix": "\u0418\u0432\u0430\u043d\u043e\u0432 \u0418\u0432\u0430\u043d \u0418\u0432\u0430\u043d\u043e\u0432\u0438\u0447", "source_verified": True, "source_fragment": "с должника: Иванова Ивана Ивановича", "message": "case", "code": "NAME_CASE"}],
                 "clean_fields": {"debtor_full_name": "\u0418\u0432\u0430\u043d\u043e\u0432 \u0418\u0432\u0430\u043d \u0418\u0432\u0430\u043d\u043e\u0432\u0438\u0447"},
             }
         return {"ok": True, "severity": "ok", "needs_regeneration": False, "confidence": 1.0, "issues": [], "clean_fields": {}}
@@ -283,7 +285,7 @@ async def test_review_generated_document_retries_then_fallback_model(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_autofix_ai_failure_delivers_deterministic_artifacts_and_logs_crm(monkeypatch, tmp_path):
+async def test_autofix_ai_failure_blocks_delivery_and_logs_crm(monkeypatch, tmp_path):
     full_docx = tmp_path / "full.docx"
     full_docx.write_bytes(b"docx")
     artifacts = SimpleNamespace(full_docx_path=full_docx, qa_report={})
@@ -303,7 +305,7 @@ async def test_autofix_ai_failure_delivers_deterministic_artifacts_and_logs_crm(
 
     outcome = await create_case_documents_reviewed(case, user, settings, None)
 
-    assert outcome.ok is True
+    assert outcome.ok is False
     assert outcome.artifacts is artifacts
     assert outcome.review["ai_review_failed"] is True
     assert scheduled[0][0][3] == "document_ai_review_failed"

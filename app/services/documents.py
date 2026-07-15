@@ -146,8 +146,9 @@ def _review_issue_lines(review: dict[str, Any], *, applied_fixes: dict[str, str]
                 f"issue code: {issue.get('code') or ''}",
                 f"field: {field}",
                 f"severity: {issue.get('severity') or ''}",
-                f"confidence: {issue.get('confidence') or 0}",
                 f"suggested_fix: {issue.get('suggested_fix') or ''}",
+                f"source_verified: {bool(issue.get('source_verified'))}",
+                f"source_fragment: {issue.get('source_fragment') or ''}",
                 f"auto_fixed: {field in applied_fixes}",
                 f"source_only: {bool(issue.get('source_only'))}",
                 f"message: {issue.get('message') or ''}",
@@ -158,21 +159,17 @@ def _review_issue_lines(review: dict[str, Any], *, applied_fixes: dict[str, str]
 
 def _safe_review_fixes(data: dict[str, Any], review: dict[str, Any]) -> dict[str, str]:
     clean_fields = review.get("clean_fields") if isinstance(review.get("clean_fields"), dict) else {}
-    confidence_by_field: dict[str, float] = {}
+    source_verified_fields: set[str] = set()
     for issue in review.get("issues") or []:
         if not isinstance(issue, dict) or issue.get("source_only"):
             continue
         field = str(issue.get("field") or "").strip()
-        try:
-            confidence = float(issue.get("confidence") or 0)
-        except (TypeError, ValueError):
-            confidence = 0.0
-        if field:
-            confidence_by_field[field] = max(confidence_by_field.get(field, 0.0), confidence)
+        if field and issue.get("source_verified") is True and str(issue.get("source_fragment") or "").strip():
+            source_verified_fields.add(field)
     fixes: dict[str, str] = {}
     for field in SAFE_AI_REVIEW_FIELDS:
         value = str(clean_fields.get(field) or "").strip()
-        if not value or confidence_by_field.get(field, 0.0) < 0.85:
+        if not value or field not in source_verified_fields:
             continue
         if str(data.get(field) or "").strip() == value:
             continue
@@ -269,10 +266,9 @@ def _ai_review_failed_outcome(
     from app.services.crm_background import schedule_crm_sync
 
     review = {
-        "ok": True,
-        "severity": "warning",
+        "ok": False,
+        "severity": "blocker",
         "needs_regeneration": False,
-        "confidence": 0.0,
         "issues": [],
         "clean_fields": {},
         "ai_review_failed": True,
@@ -280,7 +276,7 @@ def _ai_review_failed_outcome(
     }
     report = f"AI document review failed after retry/fallback: {error}"
     schedule_crm_sync(settings, case.id, user.id, "document_ai_review_failed", {"note": report[:65000]})
-    return DocumentReviewOutcome(ok=True, artifacts=artifacts, review=review, admin_report=report)
+    return DocumentReviewOutcome(ok=False, artifacts=artifacts, review=review, admin_report=report)
 
 
 async def create_case_documents_reviewed(
@@ -294,7 +290,7 @@ async def create_case_documents_reviewed(
     mode = document_ai_review_mode(settings)
     if mode in {"off", "shadow"}:
         artifacts = create_case_documents_with_qa(case, user, settings, restore_reason=restore_reason)
-        review = {"ok": True, "severity": "ok", "needs_regeneration": False, "confidence": 1.0, "issues": [], "clean_fields": {}, "mode": mode}
+        review = {"ok": True, "severity": "ok", "needs_regeneration": False, "issues": [], "clean_fields": {}, "mode": mode}
         if mode == "shadow":
             data = normalize_order_data(json.loads(case.extracted_json or "{}"))
             final_text = docx_text(str(artifacts.full_docx_path))
@@ -321,16 +317,17 @@ async def create_case_documents_reviewed(
         data = normalize_order_data(json.loads(case.extracted_json or "{}"))
         final_text = docx_text(str(artifacts.full_docx_path))
         try:
-            raw_review = await review_generated_document(
-                settings,
-                session,
-                case_id=case.id,
-                user_id=user.id,
-                document_text=final_text,
-                source_data=data,
-                visual_summary=artifacts.qa_report,
-                regeneration_happened=regeneration_count > 0,
-            )
+            review_kwargs = {
+                "case_id": case.id,
+                "user_id": user.id,
+                "document_text": final_text,
+                "source_data": data,
+                "visual_summary": artifacts.qa_report,
+                "regeneration_happened": regeneration_count > 0,
+            }
+            if case.order_photo_path:
+                review_kwargs["source_image_path"] = case.order_photo_path
+            raw_review = await review_generated_document(settings, session, **review_kwargs)
         except Exception as exc:
             if mode == "autofix":
                 logger.warning("Document AI autofix failed; delivering deterministic QA-passed artifacts case_id=%s error=%s", case.id, exc)

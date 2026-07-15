@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from decimal import Decimal
+import re
 from typing import Any
 
 from app.services.legal_data import format_money_rub_kop, money_to_decimal, normalize_order_data, validate_amounts
@@ -34,13 +35,12 @@ def _fragment_matches(fragment: str, keywords: tuple[str, ...]) -> bool:
     return any(keyword in lower for keyword in keywords)
 
 
-def _retry_confidence(retry_amounts: dict[str, Any] | None) -> float:
-    if not retry_amounts:
-        return 0.0
-    try:
-        return float(retry_amounts.get("confidence") or 0)
-    except (TypeError, ValueError):
-        return 0.0
+def _fragment_supports_amount(fragment: str, amount: Any, keywords: tuple[str, ...]) -> bool:
+    if not _fragment_matches(fragment, keywords):
+        return False
+    expected_digits = "".join(re.findall(r"\d+", str(amount or "")))
+    fragment_digits = "".join(re.findall(r"\d+", fragment or ""))
+    return bool(expected_digits and expected_digits in fragment_digits)
 
 
 def _retry_amounts_consistent(retry_amounts: dict[str, Any] | None) -> bool:
@@ -54,6 +54,22 @@ def _retry_amounts_consistent(retry_amounts: dict[str, Any] | None) -> bool:
         }
     )
     return check.ok
+
+
+def _retry_has_role_evidence(retry_amounts: dict[str, Any] | None) -> bool:
+    if not retry_amounts:
+        return False
+    return (
+        _fragment_supports_amount(
+            str(retry_amounts.get("debt_amount_fragment") or ""), retry_amounts.get("debt_amount"), _DEBT_FRAGMENT_KEYWORDS
+        )
+        and _fragment_supports_amount(
+            str(retry_amounts.get("state_duty_fragment") or ""), retry_amounts.get("state_duty"), _DUTY_FRAGMENT_KEYWORDS
+        )
+        and _fragment_supports_amount(
+            str(retry_amounts.get("total_amount_fragment") or ""), retry_amounts.get("total_amount"), _TOTAL_FRAGMENT_KEYWORDS
+        )
+    )
 
 
 def recover_amounts_from_mismatch(
@@ -80,7 +96,11 @@ def recover_amounts_from_mismatch(
         result.reason = "auto_recover_disabled"
         return result
 
-    if retry_amounts and _retry_amounts_consistent(retry_amounts) and _retry_confidence(retry_amounts) >= min_confidence:
+    # min_confidence is retained only for call-site compatibility. Model
+    # self-confidence is deliberately not used to accept legal facts.
+    del min_confidence
+
+    if retry_amounts and _retry_amounts_consistent(retry_amounts) and _retry_has_role_evidence(retry_amounts):
         updated = dict(normalized)
         updated["debt_amount"] = retry_amounts.get("debt_amount", "")
         updated["state_duty"] = retry_amounts.get("state_duty", "")
@@ -97,8 +117,8 @@ def recover_amounts_from_mismatch(
         result.qa_report = _build_qa_report(result, primary_check, retry_amounts)
         return result
 
-    if not retry_amounts or _retry_confidence(retry_amounts) < min_confidence:
-        result.reason = "retry_confidence_too_low_or_missing"
+    if not retry_amounts or not _retry_has_role_evidence(retry_amounts):
+        result.reason = "retry_source_fragments_missing_or_unproven"
         result.qa_report = _build_qa_report(result, primary_check, retry_amounts)
         return result
 
@@ -201,7 +221,6 @@ def _build_qa_report(
                 "state_duty_fragment",
                 "total_amount",
                 "total_amount_fragment",
-                "confidence",
                 "comment",
             )
         }
@@ -250,7 +269,6 @@ def format_amount_mismatch_admin_report(
                 f"Фрагмент: {retry_amounts.get('state_duty_fragment') or '—'}",
                 f"Итого: {retry_amounts.get('total_amount') or '—'}",
                 f"Фрагмент: {retry_amounts.get('total_amount_fragment') or '—'}",
-                f"Confidence: {retry_amounts.get('confidence', '—')}",
             ]
         )
 

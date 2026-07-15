@@ -883,6 +883,28 @@ async def _generate_documents(client: MaxBotClient, event: IncomingEvent, sessio
         await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})
         await _send_order_rephoto_prompt(client, event, validation.missing, attempts=case.order_rephoto_attempts)
         return
+    # Keep MAX and Telegram on the same amount-integrity path. The helper is
+    # imported lazily to avoid coupling the adapter modules at import time.
+    from app.handlers.case_flow import _resolve_amount_mismatch
+
+    data, amount_check, _, _ = await _resolve_amount_mismatch(
+        settings,
+        session,
+        case,
+        user,
+        data,
+    )
+    if not amount_check.ok:
+        case.status = CaseStatus.NEEDS_REVIEW.value
+        await session.commit()
+        await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})
+        await _send(
+            client,
+            event,
+            "Суммы приказа требуют повторной проверки. Отправьте фото ещё раз или исправьте поля после оплаты.",
+            keyboards.order_rephoto_menu(),
+        )
+        return
     try:
         review_outcome = await create_case_documents_reviewed(case, user, settings, session)
     except Exception as exc:
