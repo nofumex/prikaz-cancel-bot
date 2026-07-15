@@ -82,7 +82,7 @@ def clean_text(value: object | None) -> str:
     text = re.sub(r"№\s*(\d+)", r"№ \1", text)
     # Normalize Latin OCR homoglyphs only inside common legal abbreviations.
     text = re.sub(r"\b[ОO]{3}\b", "ООО", text, flags=re.IGNORECASE)
-    text = re.sub(r"\b[ПP][КK][ОO]\b", "ПКО", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b[ПP][КK][ОOЮ]\b", "ПКО", text, flags=re.IGNORECASE)
     return text.strip(" \t\r\n,;")
 
 

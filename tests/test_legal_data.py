@@ -64,6 +64,7 @@ def test_common_legal_homoglyphs_and_duplicate_postcode_are_normalized():
     )
     assert data["creditor_name"] == 'ООО ПКО "ЭОС"'
     assert data["debtor_address"] == "662978, Красноярский край, г. Железногорск"
+    assert normalize_order_data({"creditor_name": "ООО ПКЮ «Бустер.Ру»"})["creditor_name"] == "ООО ПКО «Бустер.Ру»"
 
 
 def test_debt_basis_preserves_alphanumeric_contract_prefix():
