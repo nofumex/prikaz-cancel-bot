@@ -107,7 +107,7 @@ def test_false_total_is_replaced_when_source_has_no_explicit_total():
         "debt_amount": "18 898 руб. 08 коп.",
         "debt_amount_fragment": "задолженность в размере 18898,08 рублей",
         "state_duty": "2 000 руб. 00 коп.",
-        "state_duty_fragment": "государственной пошлины в размере 2000 рублей",
+        "state_duty_fragment": "государственной пошлины в размере 2000 (две тысячи рублей 00 копеек)",
         "total_amount": "",
         "total_amount_fragment": "",
         "comment": "Итог отдельно не указан",
