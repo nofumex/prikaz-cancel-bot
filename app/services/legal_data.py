@@ -293,6 +293,27 @@ def money_from_source_fragment(value: object | None) -> Decimal | None:
     text = clean_text(value).lower().replace("\xa0", " ")
     if not text:
         return None
+    explicit_rubles = re.findall(
+        r"(\d[\d ]*)\s*(?:руб(?:л(?:ей|я|ь)?)?\.?|р\.)\s*(\d{1,2})\s*(?:коп(?:еек|ейки|ейка)?\.?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if explicit_rubles:
+        rubles, kopeks = explicit_rubles[-1]
+        try:
+            return Decimal(re.sub(r"\s+", "", rubles)) + Decimal(kopeks) / 100
+        except InvalidOperation:
+            pass
+    decimal_rubles = re.findall(
+        r"(\d[\d ]*[,.]\d{2})\s*(?:руб(?:л(?:ей|я|ь)?)?\.?|р\.)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if decimal_rubles:
+        try:
+            return Decimal(decimal_rubles[-1].replace(" ", "").replace(",", "."))
+        except InvalidOperation:
+            pass
     contextual = re.findall(
         r"(?:в\s+размере|в\s+сумме|сумм[аеуы])\s*[:\-]?\s*(\d[\d\s]*[,.]\d{2})",
         text,

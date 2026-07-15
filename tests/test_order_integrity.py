@@ -1,7 +1,9 @@
 from datetime import date
+from decimal import Decimal
 
 from app.services.document_templates.statement_templates import StatementContext, build_header_lines, build_statement_paragraphs
-from app.services.legal_data import normalize_order_data
+from app.services.legal_data import money_from_source_fragment, normalize_order_data
+from app.services.classic_ocr import classic_court_name
 from app.services.order_integrity import (
     conflicting_fields,
     evidence_payload_fields,
@@ -19,6 +21,16 @@ def test_short_court_locality_is_not_duplicated_as_address() -> None:
         "court_address": "с. Георгиевское",
     })
     assert data["court_address"] == ""
+
+
+def test_money_fragment_does_not_confuse_contract_date_with_amount() -> None:
+    fragment = "договору № 4319870 от 21.07.2025 в размере 5283 руб. 59 коп."
+    assert money_from_source_fragment(fragment) == Decimal("5283.59")
+
+
+def test_classic_court_name_extracts_region_without_judge() -> None:
+    text = "Мировой судья судебного участка № 1 Перелюбского района Саратовской области Бишева А.А."
+    assert classic_court_name(text) == "судебного участка № 1 Перелюбского района Саратовской области"
 
 
 def _payload(**values):

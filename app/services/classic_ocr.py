@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -56,3 +57,17 @@ def classic_amount_facts(text: str) -> dict[str, Any]:
             facts["debt_amount"] = format_money_rub_kop(amount)
             facts["debt_amount_fragment"] = context
     return facts
+
+
+def classic_court_name(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", text or " ")
+    match = re.search(
+        r"(судебн\w*\s+участк\w*\s*№\s*\d+[\w-]*\s+.{2,140}?(?:области|края|республики))\b",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    value = match.group(1).strip(" ,.;")
+    value = re.sub(r"^судебный участок", "судебного участка", value, flags=re.IGNORECASE)
+    return value

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+from difflib import SequenceMatcher
 import json
 import logging
 import re
@@ -18,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.models import OpenAIUsage
 from app.services.amount_recovery import recover_amounts_from_mismatch
-from app.services.classic_ocr import classic_amount_facts, extract_classic_ocr_text
+from app.services.classic_ocr import classic_amount_facts, classic_court_name, extract_classic_ocr_text
 from app.services.image_preprocessing import build_amount_ocr_variants, build_order_ocr_variants
 from app.services.legal_data import clean_money_text, format_money_rub_kop, missing_order_fields, money_from_source_fragment, normalize_debtor_name_fields, normalize_order_data, validate_amounts
 from app.services.order_integrity import (
@@ -33,7 +34,7 @@ from app.utils import ensure_dir, parse_russian_date
 
 logger = logging.getLogger(__name__)
 
-ORDER_EXTRACTION_CACHE_VERSION = "v2"
+ORDER_EXTRACTION_CACHE_VERSION = "v3"
 _order_cache_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -768,6 +769,15 @@ async def _extract_order_data_uncached(
         verifier_payload,
         adjudicator_result,
     )
+    if isinstance(classic_result, str):
+        classic_court = classic_court_name(classic_result)
+        current_court = str(decision.data.get("court_name") or "")
+        current_numbers = re.findall(r"\d+", current_court)
+        classic_numbers = re.findall(r"\d+", classic_court)
+        similarity = SequenceMatcher(None, current_court.lower(), classic_court.lower()).ratio() if current_court and classic_court else 0.0
+        if classic_court and current_numbers == classic_numbers and similarity >= 0.78:
+            decision.data["court_name"] = classic_court
+            decision.data = normalize_order_data(decision.data)
     if isinstance(amounts_result, BaseException):
         await record_openai_usage(
             settings, session, case_id=case_id, user_id=user_id,
