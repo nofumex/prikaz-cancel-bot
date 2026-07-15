@@ -186,7 +186,13 @@ def normalize_case_identifiers(case_number: object | None, uid: object | None) -
         # Some courts use non-MS identifiers (long numeric ids or prefixes
         # such as АСВ_). Preserve them instead of deleting an unknown format.
         normalized_uid = clean_uid(uid_text)
+    if normalized_case and normalized_uid and canonical_identifier(normalized_case) == canonical_identifier(normalized_uid):
+        normalized_uid = ""
     return normalized_case, normalized_uid
+
+
+def canonical_identifier(value: object | None) -> str:
+    return re.sub(r"[^0-9a-zа-я]+", "", clean_text(value).lower())
 
 
 def clean_money_text(value: object | None) -> str:

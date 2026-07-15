@@ -40,7 +40,10 @@ def _fragment_supports_amount(fragment: str, amount: Any, keywords: tuple[str, .
         return False
     expected_digits = "".join(re.findall(r"\d+", str(amount or "")))
     fragment_digits = "".join(re.findall(r"\d+", fragment or ""))
-    return bool(expected_digits and expected_digits in fragment_digits)
+    if expected_digits and expected_digits in fragment_digits:
+        return True
+    # A quote may legally state whole rubles without printing "00 коп.".
+    return bool(expected_digits.endswith("00") and expected_digits[:-2] in fragment_digits)
 
 
 def _retry_amounts_consistent(retry_amounts: dict[str, Any] | None) -> bool:

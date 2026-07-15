@@ -17,8 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.models import OpenAIUsage
 from app.services.amount_recovery import recover_amounts_from_mismatch
+from app.services.classic_ocr import classic_amount_facts, extract_classic_ocr_text
 from app.services.image_preprocessing import build_amount_ocr_variants, build_order_ocr_variants
-from app.services.legal_data import clean_money_text, format_money_rub_kop, missing_order_fields, money_from_source_fragment, normalize_debtor_name_fields, normalize_order_data
+from app.services.legal_data import clean_money_text, format_money_rub_kop, missing_order_fields, money_from_source_fragment, normalize_debtor_name_fields, normalize_order_data, validate_amounts
 from app.services.order_integrity import (
     CRITICAL_ORDER_FIELDS,
     ORDER_EVIDENCE_SCHEMA,
@@ -465,6 +466,7 @@ async def _extract_order_evidence(
     case_id: int | None,
     user_id: int | None,
     order_photo_path: str,
+    classic_ocr_text: str = "",
 ) -> tuple[dict[str, Any], LLMResult]:
     """Independently re-read legally significant fields from the image.
 
@@ -488,7 +490,11 @@ async def _extract_order_evidence(
                 "В debtor_full_name верни ФИО в именительном падеже, а source_fragment оставь точной цитатой с изображения. "
                 "Не оценивай правдоподобие: значение должно следовать только из изображения."
             ),
-            text="Независимо извлеки критические поля судебного приказа вместе с точными цитатами.",
+            text=(
+                "Независимо извлеки критические поля судебного приказа вместе с точными цитатами.\n\n"
+                "НЕЗАВИСИМЫЙ TESSERACT OCR (может содержать ошибки, используй для посимвольной сверки с изображением):\n"
+                + classic_ocr_text[:18000]
+            ),
             image_paths=verifier_images,
             schema_name="court_order_independent_evidence",
             schema=ORDER_EVIDENCE_SCHEMA,
@@ -536,6 +542,7 @@ async def _adjudicate_order_conflicts(
     primary: dict[str, Any],
     verifier_payload: dict[str, Any],
     conflicts: list[str],
+    classic_ocr_text: str = "",
 ) -> dict[str, Any]:
     model = settings.order_adjudicator_model or settings.ai_review_model or settings.text_model
     verifier = evidence_payload_fields(verifier_payload)
@@ -564,6 +571,8 @@ async def _adjudicate_order_conflicts(
                 "Конфликтные поля: " + ", ".join(conflicts) + "\n"
                 "Кандидаты (это подсказки, не источник истины):\n"
                 + json.dumps(comparison, ensure_ascii=False, indent=2)
+                + "\n\nНЕЗАВИСИМЫЙ TESSERACT OCR:\n"
+                + classic_ocr_text[:16000]
             ),
             image_path=order_photo_path,
             schema_name="court_order_conflict_adjudication",
@@ -630,18 +639,20 @@ async def extract_order_data(
             order_photo_path=order_photo_path,
         )
     )
-    verifier_task = asyncio.create_task(
-        _extract_order_evidence(
+    classic_task = asyncio.create_task(extract_classic_ocr_text(order_photo_path, case_id=case_id))
+
+    async def verifier_after_classic() -> tuple[dict[str, Any], LLMResult]:
+        classic_text = await classic_task
+        return await _extract_order_evidence(
             settings,
-            # AsyncSession is intentionally not shared across concurrent
-            # tasks. The immutable attempt file still retains the verifier
-            # response; the primary request keeps the normal usage row.
             None,
             case_id=case_id,
             user_id=user_id,
             order_photo_path=order_photo_path,
+            classic_ocr_text=classic_text,
         )
-    )
+
+    verifier_task = asyncio.create_task(verifier_after_classic())
     # Money is read by a role-specific extractor in parallel, so the
     # arithmetic invariant does not add another full round-trip on mismatch.
     amounts_task = asyncio.create_task(
@@ -653,8 +664,8 @@ async def extract_order_data(
             order_photo_path=order_photo_path,
         )
     )
-    primary_result, verifier_result, amounts_result = await asyncio.gather(
-        primary_task, verifier_task, amounts_task, return_exceptions=True
+    primary_result, verifier_result, amounts_result, classic_result = await asyncio.gather(
+        primary_task, verifier_task, amounts_task, classic_task, return_exceptions=True
     )
     if isinstance(primary_result, BaseException):
         raise primary_result
@@ -697,6 +708,7 @@ async def extract_order_data(
                 primary=primary_result,
                 verifier_payload=verifier_payload,
                 conflicts=conflicts,
+                classic_ocr_text=classic_result if isinstance(classic_result, str) else "",
             )
         except Exception:
             logger.exception("Order integrity adjudication failed for case %s", case_id)
@@ -717,6 +729,12 @@ async def extract_order_data(
                     "total_amount": str(decision.data.get("total_amount") or ""),
                 }
             )
+    final_amount_check = validate_amounts(decision.data)
+    if not final_amount_check.ok and isinstance(classic_result, str):
+        classic_amounts = classic_amount_facts(classic_result)
+        classic_recovery = recover_amounts_from_mismatch(decision.data, classic_amounts)
+        if classic_recovery.applied:
+            decision.data = classic_recovery.order_data
     _save_debug_attempt(
         case_id,
         "order_integrity_decision",

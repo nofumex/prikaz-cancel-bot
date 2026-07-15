@@ -53,6 +53,7 @@ def test_cyrillic_ms_uid_is_canonicalized_and_nonstandard_uid_is_preserved():
         "09МС0020-01-2026-001641-42, Дело № 2-1292/2026", ""
     ) == ("2-1292/2026", "09MS0020-01-2026-001641-42")
     assert normalize_case_identifiers("133511", "АСВ_238_133511") == ("133511", "АСВ_238_133511")
+    assert normalize_case_identifiers("2-1235/2026", "2-1235/2026") == ("2-1235/2026", "")
 
 
 def test_court_postal_address_is_not_part_of_court_name():
