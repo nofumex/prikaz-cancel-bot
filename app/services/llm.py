@@ -34,7 +34,7 @@ from app.utils import ensure_dir, parse_russian_date
 
 logger = logging.getLogger(__name__)
 
-ORDER_EXTRACTION_CACHE_VERSION = "v3"
+ORDER_EXTRACTION_CACHE_VERSION = "v4"
 _order_cache_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -76,6 +76,15 @@ class LLMResult:
     latency_ms: int
 
 
+@dataclass(slots=True)
+class PrimaryOrderExtraction:
+    data: dict[str, Any]
+    document_kind: str
+    is_court_order: bool
+    confidence: float
+    reason: str = ""
+
+
 ORDER_SCHEMA_HINT = {
     "court_name": "",
     "court_address": "",
@@ -109,6 +118,17 @@ ORDER_JSON_SCHEMA_PROPERTIES = {
         "minimum": 0,
         "maximum": 1,
     },
+    "document_kind": {
+        "type": "string",
+        "enum": ["court_order", "other", "unclear"],
+    },
+    "is_court_order": {"type": "boolean"},
+    "document_type_confidence": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+    },
+    "document_type_reason": {"type": "string"},
 }
 
 ORDER_JSON_SCHEMA = {
@@ -440,12 +460,20 @@ async def _extract_order_data_primary(
     case_id: int | None,
     user_id: int | None,
     order_photo_path: str,
-) -> dict[str, Any]:
+) -> PrimaryOrderExtraction:
     result: LLMResult | None = None
+    classification_instructions = (
+        "First classify the image. A Russian court order is a document issued by a court or magistrate "
+        "that identifies the parties and orders recovery. An FSSP, Gosuslugi, or bank card showing an "
+        "enforcement proceeding, a payment button, or a list of debts is not a court order. For those "
+        "images return document_kind=other, is_court_order=false, and do not invent order fields. "
+        "Set document_type_confidence to your confidence in the classification itself: high for clearly court_order "
+        "or clearly other, and low only when document_kind=unclear. "
+    )
     try:
         result = await _responses_json(
             settings,
-            instructions=(
+            instructions=classification_instructions + (
                 "Ты аккуратно извлекаешь данные из фото судебного приказа РФ. "
                 "Верни только факты, которые видны на изображении. Не придумывай паспорт, адрес, суммы, ИНН, ОГРН, даты и номера. "
                 "Если поле не видно или не уверено, оставь пустую строку. Даты сохраняй так, как они написаны в документе. "
@@ -468,9 +496,22 @@ async def _extract_order_data_primary(
     raw_data = {key: str(result.data.get(key) or "").strip() for key in ORDER_SCHEMA_HINT}
     if result.data.get("debtor_full_name_confidence") is not None:
         raw_data["debtor_full_name_confidence"] = str(result.data.get("debtor_full_name_confidence") or 0)
+    document_kind = str(result.data.get("document_kind") or "unclear").strip().lower()
+    is_court_order = bool(result.data.get("is_court_order"))
+    try:
+        confidence = max(0.0, min(1.0, float(result.data.get("document_type_confidence") or 0)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    reason = str(result.data.get("document_type_reason") or "").strip()
     _save_order_ocr_raw(
         case_id,
-        raw_data,
+        {
+            **raw_data,
+            "document_kind": document_kind,
+            "is_court_order": is_court_order,
+            "document_type_confidence": confidence,
+            "document_type_reason": reason,
+        },
         request_id=result.request_id,
         model=result.model,
     )
@@ -481,7 +522,13 @@ async def _extract_order_data_primary(
             normalized = await normalize_debtor_name_llm(settings, session, case_id=case_id, user_id=user_id, data=normalized)
         except Exception:
             logger.warning("LLM name normalization failed", exc_info=True)
-    return normalized
+    return PrimaryOrderExtraction(
+        data=normalized,
+        document_kind=document_kind,
+        is_court_order=is_court_order,
+        confidence=confidence,
+        reason=reason,
+    )
 
 
 async def _extract_order_evidence(
@@ -676,24 +723,46 @@ async def _extract_order_data_uncached(
     order_photo_path: str,
 ) -> dict[str, Any]:
     if not settings.order_integrity_enabled:
-        return await _extract_order_data_primary(
+        primary = await _extract_order_data_primary(
             settings,
             session,
             case_id=case_id,
             user_id=user_id,
             order_photo_path=order_photo_path,
         )
+        return primary.data
 
-    primary_task = asyncio.create_task(
-        _extract_order_data_primary(
+    classic_task = asyncio.create_task(extract_classic_ocr_text(order_photo_path, case_id=case_id))
+    try:
+        primary = await _extract_order_data_primary(
             settings,
             session,
             case_id=case_id,
             user_id=user_id,
             order_photo_path=order_photo_path,
         )
-    )
-    classic_task = asyncio.create_task(extract_classic_ocr_text(order_photo_path, case_id=case_id))
+    except BaseException:
+        if not classic_task.done():
+            classic_task.cancel()
+        await asyncio.gather(classic_task, return_exceptions=True)
+        raise
+
+    if primary.document_kind == "other" and not primary.is_court_order and primary.confidence >= 0.75:
+        if not classic_task.done():
+            classic_task.cancel()
+        await asyncio.gather(classic_task, return_exceptions=True)
+        logger.info(
+            "Order integrity skipped for non-order case_id=%s confidence=%.2f reason=%s",
+            case_id,
+            primary.confidence,
+            primary.reason[:300],
+        )
+        return {
+            **primary.data,
+            "_document_kind": "other",
+            "_document_type_confidence": str(primary.confidence),
+            "_document_type_reason": primary.reason,
+        }
 
     verifier_task = asyncio.create_task(
         _extract_order_evidence(
@@ -715,11 +784,9 @@ async def _extract_order_data_uncached(
             order_photo_path=order_photo_path,
         )
     )
-    primary_result, verifier_result, amounts_result, classic_result = await asyncio.gather(
-        primary_task, verifier_task, amounts_task, classic_task, return_exceptions=True
+    verifier_result, amounts_result, classic_result = await asyncio.gather(
+        verifier_task, amounts_task, classic_task, return_exceptions=True
     )
-    if isinstance(primary_result, BaseException):
-        raise primary_result
     if isinstance(verifier_result, BaseException):
         await record_openai_usage(
             settings,
@@ -746,7 +813,7 @@ async def _extract_order_data_uncached(
     )
 
     verifier_fields = evidence_payload_fields(verifier_payload)
-    conflicts = conflicting_fields(primary_result, verifier_fields)
+    conflicts = conflicting_fields(primary.data, verifier_fields)
     adjudicator_result: dict[str, Any] | None = None
     if conflicts:
         try:
@@ -756,7 +823,7 @@ async def _extract_order_data_uncached(
                 case_id=case_id,
                 user_id=user_id,
                 order_photo_path=order_photo_path,
-                primary=primary_result,
+                primary=primary.data,
                 verifier_payload=verifier_payload,
                 conflicts=conflicts,
                 classic_ocr_text=classic_result if isinstance(classic_result, str) else "",
@@ -765,7 +832,7 @@ async def _extract_order_data_uncached(
             logger.exception("Order integrity adjudication failed for case %s", case_id)
 
     decision = merge_verified_order_data(
-        primary_result,
+        primary.data,
         verifier_payload,
         adjudicator_result,
     )

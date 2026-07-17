@@ -41,6 +41,7 @@ async def _extract_and_store(settings: Settings, case_id: int, user_id: int) -> 
             logger.exception("Background order extraction failed case_id=%s", case_id)
             extracted = {}
         extracted = normalize_order_data(extracted)
+        wrong_document_type = extracted.get("_document_kind") == "other"
         extracted, name_result = normalize_debtor_name_fields(extracted)
         if name_result and name_result.confidence >= 0.85 and name_result.normalized:
             extracted["debtor_full_name"] = name_result.normalized
@@ -55,6 +56,17 @@ async def _extract_and_store(settings: Settings, case_id: int, user_id: int) -> 
             case.status = CaseStatus.PROCESSING.value
         await session.commit()
         schedule_crm_sync(settings, case.id, user.id, "ocr_completed", {"note": "OCR приказа завершен в фоне"})
+        if wrong_document_type:
+            schedule_crm_sync(
+                settings,
+                case.id,
+                user.id,
+                "wrong_document_type",
+                {
+                    "note": "Загруженное изображение не является судебным приказом",
+                    "reason": extracted.get("_document_type_reason") or "",
+                },
+            )
         return OrderExtractionResult(case.id, missing, not missing)
 
 

@@ -344,7 +344,7 @@ async def test_max_lost_state_photo_recovers_latest_waiting_case(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_max_attachment_with_payload_url_avoids_no_file_message(monkeypatch):
+async def test_max_attachment_without_active_case_auto_creates_and_processes_case(monkeypatch):
     from app.adapters.max import bot as max_bot
     from app.adapters.max.mapper import parse_update
 
@@ -360,6 +360,13 @@ async def test_max_attachment_with_payload_url_avoids_no_file_message(monkeypatc
 
     client = SimpleNamespace(answer_callback=AsyncMock(), send_message=AsyncMock())
     user = User(id=1, platform="max", platform_user_id="185607445")
+    case = _case(
+        id=81,
+        platform="max",
+        platform_user_id="185607445",
+        status=CaseStatus.WAITING_ORDER_PHOTO.value,
+        order_photo_path=None,
+    )
     event = parse_update(
         {
             "update_type": "message_created",
@@ -375,13 +382,18 @@ async def test_max_attachment_with_payload_url_avoids_no_file_message(monkeypatc
     monkeypatch.setattr(max_bot, "get_or_create_platform_user", AsyncMock(return_value=user))
     monkeypatch.setattr(max_bot, "_state", AsyncMock(return_value=None))
     monkeypatch.setattr(max_bot, "latest_open_case", AsyncMock(return_value=None))
+    create_case = AsyncMock(return_value=case)
+    handle_order = AsyncMock()
+    monkeypatch.setattr(max_bot, "get_or_create_active_case", create_case)
+    monkeypatch.setattr(max_bot, "_set_state", AsyncMock())
+    monkeypatch.setattr(max_bot, "_handle_order_image", handle_order)
+    monkeypatch.setattr(max_bot, "schedule_crm_sync", lambda *args, **kwargs: None)
 
     await max_bot.handle_update(client, event, settings)
 
-    sent_text = client.send_message.await_args.kwargs["text"]
-    assert "MAX не передал файл" not in sent_text
-    assert "не смог скачать вложение" in sent_text
-    assert client.send_message.await_count == 1
+    create_case.assert_awaited_once_with(session, user, chat_id="chat-1")
+    assert handle_order.await_count == 1
+    assert client.send_message.await_count == 0
 
 
 @pytest.mark.asyncio

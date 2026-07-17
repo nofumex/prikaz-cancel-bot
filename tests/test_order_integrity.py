@@ -1,5 +1,9 @@
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 from app.services.document_templates.statement_templates import StatementContext, build_header_lines, build_statement_paragraphs
 from app.services.legal_data import money_from_source_fragment, normalize_order_data
@@ -9,6 +13,42 @@ from app.services.order_integrity import (
     evidence_payload_fields,
     merge_verified_order_data,
 )
+
+
+@pytest.mark.asyncio
+async def test_confident_non_order_skips_verifier_amounts_and_adjudicator(monkeypatch) -> None:
+    from app.services import llm
+
+    primary = llm.PrimaryOrderExtraction(
+        data={"court_name": "", "case_number": "", "debtor_full_name": ""},
+        document_kind="other",
+        is_court_order=False,
+        confidence=0.99,
+        reason="FSSP enforcement proceeding card",
+    )
+    verifier = AsyncMock()
+    amounts = AsyncMock()
+    adjudicator = AsyncMock()
+    classic = AsyncMock(return_value="Исполнительное производство №964723/26/66023-ИП")
+    monkeypatch.setattr(llm, "_extract_order_data_primary", AsyncMock(return_value=primary))
+    monkeypatch.setattr(llm, "_extract_order_evidence", verifier)
+    monkeypatch.setattr(llm, "_extract_order_amounts_result", amounts)
+    monkeypatch.setattr(llm, "_adjudicate_order_conflicts", adjudicator)
+    monkeypatch.setattr(llm, "extract_classic_ocr_text", classic)
+
+    result = await llm._extract_order_data_uncached(
+        SimpleNamespace(order_integrity_enabled=True),
+        None,
+        case_id=106,
+        user_id=79,
+        order_photo_path="case_106_order.jpg",
+    )
+
+    assert result["_document_kind"] == "other"
+    assert result["_document_type_confidence"] == "0.99"
+    verifier.assert_not_awaited()
+    amounts.assert_not_awaited()
+    adjudicator.assert_not_awaited()
 def test_contract_number_is_not_accepted_as_uid() -> None:
     data = normalize_order_data({"case_number": "2-59/2015", "uid": "0012297461"})
     assert data["case_number"] == "2-59/2015"

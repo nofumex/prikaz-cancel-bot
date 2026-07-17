@@ -300,8 +300,26 @@ async def _handle_payment_contact(client: MaxBotClient, event: IncomingEvent, se
     await _generate_documents(client, event, session, settings, user, case)
 
 
-async def _recover_state_for_input(session, event: IncomingEvent, user: User, *, has_attachment: bool, is_date_text: bool) -> str | None:
+async def _recover_state_for_input(
+    session,
+    event: IncomingEvent,
+    user: User,
+    *,
+    has_attachment: bool,
+    is_date_text: bool,
+    settings: Settings | None = None,
+) -> str | None:
     case = await latest_open_case(session, user.id)
+    if case is None and has_attachment and settings is not None:
+        case = await get_or_create_active_case(session, user, chat_id=event.chat_id)
+        schedule_crm_sync(
+            settings,
+            case.id,
+            user.id,
+            "user_started_bot",
+            {"note": "MAX: заявка автоматически создана по входящему фото приказа"},
+        )
+        logger.info("MAX auto-created case for order attachment case_id=%s user_id=%s", case.id, user.id)
     if not case:
         return None
     if has_attachment and (case.status in {CaseStatus.WAITING_ORDER_PHOTO.value, CaseStatus.WAITING_ORDER_REPHOTO.value} or not case.order_photo_path):
@@ -332,9 +350,23 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
         data = event.callback_data
         current_state = await _state(session, event)
         has_attachment = bool(event.photo_url or event.document_url or event.photo_token or event.document_token or event.has_raw_attachment)
+        has_order_attachment = bool(
+            event.photo_url
+            or event.document_url
+            or event.photo_token
+            or event.document_token
+            or event.attachment_type in {"image", "photo", "file", "document"}
+        )
         is_date_text = bool(event.text and parse_russian_date(event.text))
-        if not current_state and (has_attachment or is_date_text):
-            current_state = await _recover_state_for_input(session, event, user, has_attachment=has_attachment, is_date_text=is_date_text)
+        if not current_state and (has_order_attachment or is_date_text):
+            current_state = await _recover_state_for_input(
+                session,
+                event,
+                user,
+                has_attachment=has_order_attachment,
+                is_date_text=is_date_text,
+                settings=settings,
+            )
 
         async def generate_admin_documents(case: Case) -> None:
             await _generate_documents(client, event, session, settings, case.user, case)
