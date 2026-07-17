@@ -9,6 +9,7 @@ from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message, ReplyKeyboardRemove
@@ -355,6 +356,66 @@ async def receive_order_document(message: Message, bot: Bot, state: FSMContext, 
         return
     await _continue_after_received_date(message, state, session, settings, current_user, case)
     return
+
+
+async def _ensure_case_for_unscoped_order_upload(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    settings: Settings,
+    current_user: User,
+) -> Case:
+    case = await latest_open_case(session, current_user.id)
+    if case is None:
+        case = await get_or_create_active_case(session, current_user, chat_id=str(message.chat.id))
+        schedule_crm_sync(
+            settings,
+            case.id,
+            current_user.id,
+            "user_started_bot",
+            {"note": "Telegram: заявка автоматически создана по входящему фото приказа"},
+        )
+        logger.info("Telegram auto-created case for order upload case_id=%s user_id=%s", case.id, current_user.id)
+    await state.update_data(case_id=case.id)
+    target_state = (
+        CaseStates.waiting_order_rephoto
+        if case.status == CaseStatus.WAITING_ORDER_REPHOTO.value
+        else CaseStates.waiting_order_photo
+    )
+    await state.set_state(target_state)
+    return case
+
+
+@router.message(StateFilter(None), F.photo)
+async def receive_unscoped_order_photo(
+    message: Message,
+    bot: Bot,
+    state: FSMContext,
+    session: AsyncSession,
+    settings: Settings,
+    current_user: User,
+) -> None:
+    case = await latest_open_case(session, current_user.id)
+    if case and case.order_photo_path and not case.received_date:
+        await state.update_data(case_id=case.id)
+        await state.set_state(CaseStates.waiting_envelope_photo)
+        await receive_envelope_photo(message, bot, state, session, settings, current_user)
+        return
+    await _ensure_case_for_unscoped_order_upload(message, state, session, settings, current_user)
+    await receive_order_photo(message, bot, state, session, settings, current_user)
+
+
+@router.message(StateFilter(None), F.document)
+async def receive_unscoped_order_document(
+    message: Message,
+    bot: Bot,
+    state: FSMContext,
+    session: AsyncSession,
+    settings: Settings,
+    current_user: User,
+) -> None:
+    await _ensure_case_for_unscoped_order_upload(message, state, session, settings, current_user)
+    await receive_order_document(message, bot, state, session, settings, current_user)
 
 
 @router.message(CaseStates.waiting_order_photo)

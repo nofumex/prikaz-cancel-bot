@@ -216,6 +216,38 @@ async def test_telegram_case_new_starts_fresh_case(monkeypatch):
     assert state.set_state.await_count == 1
 
 
+@pytest.mark.asyncio
+async def test_telegram_photo_without_state_auto_creates_and_processes_case(monkeypatch):
+    from app.handlers import case_flow
+
+    settings = _make_settings(amocrm_enabled=False)
+    fresh = _case(
+        id=108,
+        status=CaseStatus.WAITING_ORDER_PHOTO.value,
+        order_photo_path=None,
+        received_date=None,
+        deadline_date=None,
+    )
+    user = User(id=1, platform="telegram", platform_user_id="42")
+    message = SimpleNamespace(chat=SimpleNamespace(id=99))
+    state = SimpleNamespace(update_data=AsyncMock(), set_state=AsyncMock())
+    session = SimpleNamespace()
+    bot = SimpleNamespace()
+    create_case = AsyncMock(return_value=fresh)
+    process_photo = AsyncMock()
+
+    monkeypatch.setattr(case_flow, "latest_open_case", AsyncMock(side_effect=[None, None]))
+    monkeypatch.setattr(case_flow, "get_or_create_active_case", create_case)
+    monkeypatch.setattr(case_flow, "receive_order_photo", process_photo)
+    monkeypatch.setattr(case_flow, "schedule_crm_sync", lambda *args, **kwargs: None)
+
+    await case_flow.receive_unscoped_order_photo(message, bot, state, session, settings, user)
+
+    create_case.assert_awaited_once_with(session, user, chat_id="99")
+    assert state.set_state.await_args.args[0].state == case_flow.CaseStates.waiting_order_photo.state
+    process_photo.assert_awaited_once_with(message, bot, state, session, settings, user)
+
+
 def test_user_confirmation_step_disabled_by_default():
     get_settings.cache_clear()
     assert not get_settings().show_user_confirmation_step
