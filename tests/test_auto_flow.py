@@ -248,6 +248,71 @@ async def test_telegram_photo_without_state_auto_creates_and_processes_case(monk
     process_photo.assert_awaited_once_with(message, bot, state, session, settings, user)
 
 
+@pytest.mark.asyncio
+async def test_unscoped_photo_after_generated_case_starts_new_case(monkeypatch):
+    from app.handlers import case_flow
+
+    previous = _case(
+        id=114,
+        status=CaseStatus.PAYMENT_PENDING.value,
+        order_photo_path="storage/photos/old.jpg",
+        received_date=date(2026, 7, 18),
+    )
+    fresh = _case(
+        id=115,
+        status=CaseStatus.WAITING_ORDER_PHOTO.value,
+        order_photo_path=None,
+        received_date=None,
+    )
+    user = User(id=1, platform="telegram", platform_user_id="42")
+    message = SimpleNamespace(chat=SimpleNamespace(id=99))
+    state = SimpleNamespace(update_data=AsyncMock(), set_state=AsyncMock())
+    session = SimpleNamespace()
+    create_case = AsyncMock(return_value=fresh)
+
+    monkeypatch.setattr(case_flow, "latest_open_case", AsyncMock(return_value=previous))
+    monkeypatch.setattr(case_flow, "get_or_create_active_case", create_case)
+    monkeypatch.setattr(case_flow, "schedule_crm_sync", lambda *args, **kwargs: None)
+
+    result = await case_flow._ensure_case_for_unscoped_order_upload(
+        message, state, session, _make_settings(amocrm_enabled=False), user
+    )
+
+    assert result is fresh
+    create_case.assert_awaited_once_with(session, user, chat_id="99", force_new=True)
+    assert fresh.received_date is None
+
+
+@pytest.mark.asyncio
+async def test_unscoped_photo_does_not_reuse_rephoto_case_with_old_preview(monkeypatch):
+    from app.handlers import case_flow
+
+    previous = _case(
+        id=114,
+        status=CaseStatus.WAITING_ORDER_REPHOTO.value,
+        order_photo_path="storage/photos/rejected.jpg",
+        received_date=date(2026, 7, 18),
+        preview_pdf_path="storage/documents/case_114/preview.pdf",
+    )
+    fresh = _case(id=115, status=CaseStatus.WAITING_ORDER_PHOTO.value, received_date=None)
+    user = User(id=1, platform="telegram", platform_user_id="42")
+    message = SimpleNamespace(chat=SimpleNamespace(id=99))
+    state = SimpleNamespace(update_data=AsyncMock(), set_state=AsyncMock())
+    create_case = AsyncMock(return_value=fresh)
+
+    monkeypatch.setattr(case_flow, "latest_open_case", AsyncMock(return_value=previous))
+    monkeypatch.setattr(case_flow, "get_or_create_active_case", create_case)
+    monkeypatch.setattr(case_flow, "schedule_crm_sync", lambda *args, **kwargs: None)
+
+    result = await case_flow._ensure_case_for_unscoped_order_upload(
+        message, state, SimpleNamespace(), _make_settings(amocrm_enabled=False), user
+    )
+
+    assert result is fresh
+    create_case.assert_awaited_once()
+    assert create_case.await_args.kwargs["force_new"] is True
+
+
 def test_user_confirmation_step_disabled_by_default():
     get_settings.cache_clear()
     assert not get_settings().show_user_confirmation_step

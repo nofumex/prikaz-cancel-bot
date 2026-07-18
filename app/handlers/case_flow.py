@@ -366,8 +366,27 @@ async def _ensure_case_for_unscoped_order_upload(
     current_user: User,
 ) -> Case:
     case = await latest_open_case(session, current_user.id)
-    if case is None:
-        case = await get_or_create_active_case(session, current_user, chat_id=str(message.chat.id))
+    has_generated_documents = bool(
+        case
+        and (case.preview_pdf_path or case.preview_doc_path or case.full_doc_path or case.full_pdf_path)
+    )
+    must_start_new = bool(
+        case
+        and case.order_photo_path
+        and (
+            case.status != CaseStatus.WAITING_ORDER_REPHOTO.value
+            or has_generated_documents
+        )
+    )
+    if case is None or must_start_new:
+        if must_start_new:
+            case = await get_or_create_active_case(
+                session, current_user, chat_id=str(message.chat.id), force_new=True
+            )
+        else:
+            case = await get_or_create_active_case(
+                session, current_user, chat_id=str(message.chat.id)
+            )
         schedule_crm_sync(
             settings,
             case.id,
@@ -375,7 +394,12 @@ async def _ensure_case_for_unscoped_order_upload(
             "user_started_bot",
             {"note": "Telegram: заявка автоматически создана по входящему фото приказа"},
         )
-        logger.info("Telegram auto-created case for order upload case_id=%s user_id=%s", case.id, current_user.id)
+        logger.info(
+            "Telegram auto-created case for order upload case_id=%s user_id=%s replaced_existing=%s",
+            case.id,
+            current_user.id,
+            must_start_new,
+        )
     await state.update_data(case_id=case.id)
     target_state = (
         CaseStates.waiting_order_rephoto
