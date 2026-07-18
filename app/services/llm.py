@@ -38,7 +38,7 @@ from app.utils import ensure_dir, parse_russian_date
 
 logger = logging.getLogger(__name__)
 
-ORDER_EXTRACTION_CACHE_VERSION = "v5"
+ORDER_EXTRACTION_CACHE_VERSION = "v6"
 _order_cache_locks: dict[str, asyncio.Lock] = {}
 
 
