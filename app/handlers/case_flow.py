@@ -316,6 +316,11 @@ async def _deliver_prepared_preview(
 async def receive_order_photo(message: Message, bot: Bot, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
     data = await state.get_data()
     case = await session.get(Case, data["case_id"])
+    if case and (case.preview_pdf_path or case.preview_doc_path or case.full_doc_path or case.full_pdf_path):
+        case = await get_or_create_active_case(
+            session, current_user, chat_id=str(message.chat.id), force_new=True
+        )
+        await state.update_data(case_id=case.id)
     path = await _download_photo(bot, message, case.id, 'order')
     await save_photo_path(session, case, 'order', path)
     schedule_crm_sync(settings, case.id, current_user.id, 'order_photo_uploaded', {
@@ -342,6 +347,11 @@ async def receive_order_document(message: Message, bot: Bot, state: FSMContext, 
         return
     data = await state.get_data()
     case = await session.get(Case, data["case_id"])
+    if case and (case.preview_pdf_path or case.preview_doc_path or case.full_doc_path or case.full_pdf_path):
+        case = await get_or_create_active_case(
+            session, current_user, chat_id=str(message.chat.id), force_new=True
+        )
+        await state.update_data(case_id=case.id)
     path = normalize_order_upload(await _download_document_image(bot, message, case.id, 'order'))
     await save_photo_path(session, case, 'order', path)
     schedule_crm_sync(settings, case.id, current_user.id, 'order_photo_uploaded', {
