@@ -1,15 +1,53 @@
 from app.services.legal_data import normalize_debtor_name_fields, normalize_order_data
 from app.services.tesseract_ai import (
+    _contract_ok,
     TESSERACT_RECONCILIATION_SCHEMA,
     compact_tesseract_texts,
+    lock_selected_tesseract_name,
     normalize_tesseract_ai_data,
 )
 
 
 def test_schema_has_no_confidence_or_document_kind() -> None:
-    schema = str(TESSERACT_RECONCILIATION_SCHEMA).lower()
-    assert "confidence" not in schema
-    assert "document_kind" not in schema
+    schema_text = str(TESSERACT_RECONCILIATION_SCHEMA).lower()
+    assert "confidence" not in schema_text
+    assert "document_kind" not in schema_text
+    assert "selected_name_occurrence" in TESSERACT_RECONCILIATION_SCHEMA["required"]
+
+
+def test_extracted_name_must_be_exact_selected_nominative() -> None:
+    fields = {key: "x" for key in TESSERACT_RECONCILIATION_SCHEMA["properties"]["fields"]["required"]}
+    fragments = {key: "x" for key in TESSERACT_RECONCILIATION_SCHEMA["properties"]["source_fragments"]["required"]}
+    fields["debtor_full_name"] = "Вараюн Валерий Александрович"
+    payload = {
+        "fields": fields,
+        "source_fragments": fragments,
+        "debtor_full_name_source": "extracted",
+        "selected_name_occurrence": "Вараюн Валерий Александрович",
+        "debtor_name_occurrences": [
+            {"text": "Вараюна Валерия Александровича", "grammatical_case": "other", "source_fragment": "с должника"},
+            {"text": "Вараюн Валерий Александрович", "grammatical_case": "nominative", "source_fragment": "Вараюн Валерий Александрович"},
+        ],
+    }
+    assert _contract_ok(payload)
+    payload["fields"]["debtor_full_name"] = "Варанов Валерий Александрович"
+    assert _contract_ok(payload)
+    assert lock_selected_tesseract_name(payload)["debtor_full_name"] == "Вараюн Валерий Александрович"
+
+
+def test_generated_name_is_forbidden_when_nominative_exists() -> None:
+    fields = {key: "x" for key in TESSERACT_RECONCILIATION_SCHEMA["properties"]["fields"]["required"]}
+    fragments = {key: "x" for key in TESSERACT_RECONCILIATION_SCHEMA["properties"]["source_fragments"]["required"]}
+    payload = {
+        "fields": fields,
+        "source_fragments": fragments,
+        "debtor_full_name_source": "generated",
+        "selected_name_occurrence": "",
+        "debtor_name_occurrences": [
+            {"text": "Вараюн Валерий Александрович", "grammatical_case": "nominative", "source_fragment": "строка"},
+        ],
+    }
+    assert not _contract_ok(payload)
 
 
 def test_tesseract_variants_are_deduplicated() -> None:

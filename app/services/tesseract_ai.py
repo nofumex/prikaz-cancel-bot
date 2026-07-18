@@ -63,11 +63,13 @@ TESSERACT_RECONCILIATION_SCHEMA: dict[str, Any] = {
         "fields": _string_object(list(ORDER_FIELD_KEYS)),
         "debtor_name_occurrences": {"type": "array", "items": NAME_OCCURRENCE_SCHEMA},
         "debtor_full_name_source": {"type": "string", "enum": ["extracted", "generated"]},
+        "selected_name_occurrence": {"type": "string"},
         "source_fragments": _string_object(list(EVIDENCE_FIELDS)),
         "issues": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
         "safe_to_generate", "fields", "debtor_name_occurrences", "debtor_full_name_source",
+        "selected_name_occurrence",
         "source_fragments", "issues",
     ],
 }
@@ -84,8 +86,10 @@ RECONCILE_INSTRUCTIONS = """
 «взыскать с», source_fragment — строку Tesseract вокруг него. Сопоставляй повторения посимвольно и не заменяй редкую
 фамилию более распространённой.
 
-Если Tesseract содержит напечатанную именительную форму, fields.debtor_full_name должен дословно совпасть с ней и
-debtor_full_name_source=extracted. Только если именительной формы во всех четырёх прочтениях нет, поставь generated и
+Если Tesseract содержит напечатанную именительную форму, выбери её в selected_name_occurrence строго дословно из
+debtor_name_occurrences, без исправления единой буквы; fields.debtor_full_name должен быть её точной копией, а
+debtor_full_name_source=extracted. Выбирай форму по смыслу документа, не по распространённости фамилии. Только если
+именительной формы во всех четырёх прочтениях нет, оставь selected_name_occurrence пустым, поставь generated и
 восстанови именительный падеж из повторяющихся косвенных форм, меняя только падежные окончания и не меняя основу
 фамилии. debtor_name_raw сохрани в самой ясной исходной напечатанной форме. debtor_name_source_fragment возьми из
 Tesseract. Изображения используй для остальных реквизитов, но не для изменения букв ФИО.
@@ -116,6 +120,7 @@ class TesseractAiExtraction:
     source_fragments: dict[str, str]
     debtor_name_occurrences: list[dict[str, str]]
     debtor_full_name_source: str
+    selected_name_occurrence: str
     ocr: TesseractOcrResult
     llm_result: Any
 
@@ -194,18 +199,24 @@ def _name_occurrences(payload: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def _contract_ok(payload: dict[str, Any]) -> bool:
-    fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+    fields = lock_selected_tesseract_name(payload)
     fragments = payload.get("source_fragments") if isinstance(payload.get("source_fragments"), dict) else {}
     occurrences = _name_occurrences(payload)
     full_name = clean_text(fields.get("debtor_full_name"))
-    if not full_name or not occurrences:
+    selected_name = clean_text(payload.get("selected_name_occurrence"))
+    if not occurrences:
         return False
     if payload.get("debtor_full_name_source") == "extracted":
         nominatives = {
             item["text"] for item in occurrences if item.get("grammatical_case") == "nominative"
         }
-        if full_name not in nominatives:
+        if not selected_name or selected_name not in nominatives:
             return False
+    elif payload.get("debtor_full_name_source") == "generated":
+        if not full_name or selected_name or any(item.get("grammatical_case") == "nominative" for item in occurrences):
+            return False
+    else:
+        return False
     mandatory_groups = (
         ("court_name",), ("debtor_full_name",), ("creditor_name",), ("order_date",),
         ("debt_amount",), ("case_number", "uid"), ("state_duty", "total_amount"),
@@ -231,6 +242,20 @@ def normalize_tesseract_ai_data(fields: dict[str, Any]) -> dict[str, str]:
     if not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", normalized.get("order_date", "")):
         normalized["order_date"] = ""
     return {str(key): clean_text(value) for key, value in normalized.items()}
+
+
+def lock_selected_tesseract_name(payload: dict[str, Any]) -> dict[str, Any]:
+    """Copy the exact AI-selected nominative OCR occurrence over model-written text."""
+    fields = dict(payload.get("fields") or {})
+    selected_name = clean_text(payload.get("selected_name_occurrence"))
+    nominatives = {
+        item["text"]
+        for item in _name_occurrences(payload)
+        if item.get("grammatical_case") == "nominative"
+    }
+    if clean_text(payload.get("debtor_full_name_source")) == "extracted" and selected_name in nominatives:
+        fields["debtor_full_name"] = selected_name
+    return fields
 
 
 async def extract_order_data_from_tesseract_ai(
@@ -279,7 +304,10 @@ async def extract_order_data_from_tesseract_ai(
     )
     payload = result.data
     occurrences = _name_occurrences(payload)
-    fields = normalize_tesseract_ai_data(payload.get("fields") or {})
+    raw_fields = lock_selected_tesseract_name(payload)
+    selected_name = clean_text(payload.get("selected_name_occurrence"))
+    name_source = clean_text(payload.get("debtor_full_name_source"))
+    fields = normalize_tesseract_ai_data(raw_fields)
     fragments = {
         key: clean_text((payload.get("source_fragments") or {}).get(key)) for key in EVIDENCE_FIELDS
     }
@@ -290,7 +318,8 @@ async def extract_order_data_from_tesseract_ai(
         issues=[clean_text(item) for item in (payload.get("issues") or []) if clean_text(item)],
         source_fragments=fragments,
         debtor_name_occurrences=occurrences,
-        debtor_full_name_source=clean_text(payload.get("debtor_full_name_source")),
+        debtor_full_name_source=name_source,
+        selected_name_occurrence=selected_name,
         ocr=ocr,
         llm_result=result,
     )

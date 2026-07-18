@@ -521,7 +521,12 @@ async def _extract_order_data_primary(
     )
     normalized = normalize_order_data(raw_data)
     normalized, name_result = normalize_debtor_name_fields(normalized)
-    if name_result and name_result.confidence < 0.85 and looks_like_dative(normalized.get("debtor_full_name", "")):
+    if (
+        not getattr(settings, "tesseract_ai_enabled", False)
+        and name_result
+        and name_result.confidence < 0.85
+        and looks_like_dative(normalized.get("debtor_full_name", ""))
+    ):
         try:
             normalized = await normalize_debtor_name_llm(settings, session, case_id=case_id, user_id=user_id, data=normalized)
         except Exception:
@@ -777,6 +782,7 @@ async def _extract_order_data_tesseract_fast(
             "issues": extraction.issues,
             "debtor_name_occurrences": extraction.debtor_name_occurrences,
             "debtor_full_name_source": extraction.debtor_full_name_source,
+            "selected_name_occurrence": extraction.selected_name_occurrence,
             "tesseract_ms": extraction.ocr.latency_ms,
             "reconcile_ms": extraction.llm_result.latency_ms,
             "final_data": extraction.data,
