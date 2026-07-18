@@ -350,6 +350,15 @@ def normalize_debtor_full_name(value: object | None, context: str | None = None)
 
 
 def normalize_debtor_name_fields(data: dict) -> tuple[dict, NameNormalizationResult | None]:
+    if clean_text(data.get("_debtor_name_tesseract_locked")) == "1":
+        updated = dict(data)
+        full_name = clean_text(updated.get("debtor_full_name"))
+        updated["debtor_full_name"] = full_name
+        updated["debtor_name_raw"] = clean_text(updated.get("debtor_name_raw")) or full_name
+        updated["debtor_short_name"] = make_short_name(full_name)
+        updated.pop("debtor_full_name_confidence", None)
+        updated.pop("debtor_name_confidence", None)
+        return updated, None
     raw = clean_text(data.get("debtor_name_raw") or data.get("debtor_full_name"))
     context = clean_text(data.get("debtor_name_context") or data.get("debtor_name_source_fragment"))
     if not raw:

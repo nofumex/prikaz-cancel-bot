@@ -30,11 +30,15 @@ from app.services.order_integrity import (
     evidence_payload_fields,
     merge_verified_order_data,
 )
+from app.services.tesseract_ai import (
+    extract_fast_tesseract_text,
+    extract_order_data_from_tesseract_ai,
+)
 from app.utils import ensure_dir, parse_russian_date
 
 logger = logging.getLogger(__name__)
 
-ORDER_EXTRACTION_CACHE_VERSION = "v4"
+ORDER_EXTRACTION_CACHE_VERSION = "v5"
 _order_cache_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -714,6 +718,83 @@ async def extract_order_data(
             _order_cache_locks.pop(cache_path.name, None)
 
 
+async def _extract_order_data_tesseract_fast(
+    settings: Settings,
+    session: AsyncSession | None,
+    *,
+    case_id: int | None,
+    user_id: int | None,
+    order_photo_path: str,
+) -> dict[str, Any]:
+    tess_task = asyncio.create_task(extract_fast_tesseract_text(order_photo_path, case_id=case_id))
+    try:
+        primary = await _extract_order_data_primary(
+            settings,
+            session,
+            case_id=case_id,
+            user_id=user_id,
+            order_photo_path=order_photo_path,
+        )
+    except BaseException:
+        if not tess_task.done():
+            tess_task.cancel()
+        await asyncio.gather(tess_task, return_exceptions=True)
+        raise
+
+    if primary.document_kind == "other" and not primary.is_court_order and primary.confidence >= 0.75:
+        if not tess_task.done():
+            tess_task.cancel()
+        await asyncio.gather(tess_task, return_exceptions=True)
+        logger.info(
+            "Tesseract fast pipeline skipped for non-order case_id=%s confidence=%.2f reason=%s",
+            case_id,
+            primary.confidence,
+            primary.reason[:300],
+        )
+        return {
+            **primary.data,
+            "_document_kind": "other",
+            "_document_type_confidence": str(primary.confidence),
+            "_document_type_reason": primary.reason,
+        }
+
+    ocr = await tess_task
+
+    extraction = await extract_order_data_from_tesseract_ai(
+        settings,
+        session,
+        case_id=case_id,
+        user_id=user_id,
+        order_photo_path=order_photo_path,
+        primary_candidates=primary.data,
+        ocr=ocr,
+    )
+    _save_debug_attempt(
+        case_id,
+        "tesseract_ai_reconcile",
+        {
+            "safe_to_generate": extraction.safe_to_generate,
+            "issues": extraction.issues,
+            "debtor_name_occurrences": extraction.debtor_name_occurrences,
+            "debtor_full_name_source": extraction.debtor_full_name_source,
+            "tesseract_ms": extraction.ocr.latency_ms,
+            "reconcile_ms": extraction.llm_result.latency_ms,
+            "final_data": extraction.data,
+        },
+        request_id=extraction.llm_result.request_id,
+        model=extraction.llm_result.model,
+    )
+    if not extraction.safe_to_generate:
+        reason = "; ".join(extraction.issues) or "Документ не прошёл финальную проверку приказа"
+        return {
+            **extraction.data,
+            "_document_kind": "other",
+            "_document_type_confidence": "0.9",
+            "_document_type_reason": reason,
+        }
+    return extraction.data
+
+
 async def _extract_order_data_uncached(
     settings: Settings,
     session: AsyncSession | None,
@@ -722,6 +803,15 @@ async def _extract_order_data_uncached(
     user_id: int | None,
     order_photo_path: str,
 ) -> dict[str, Any]:
+    if getattr(settings, "tesseract_ai_enabled", False):
+        return await _extract_order_data_tesseract_fast(
+            settings,
+            session,
+            case_id=case_id,
+            user_id=user_id,
+            order_photo_path=order_photo_path,
+        )
+
     if not settings.order_integrity_enabled:
         primary = await _extract_order_data_primary(
             settings,
