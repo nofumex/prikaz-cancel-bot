@@ -1535,8 +1535,6 @@ def _simple_extraction_data(payload: dict[str, Any], ocr: TesseractOcrResult) ->
         "state_duty", "total_amount",
     )
     issues.extend(f"missing:{name}" for name in required if not values.get(name))
-    if not parsed_date:
-        issues.append("format:order_date")
     amounts = {name: money_to_decimal(values[name]) for name in ("debt_amount", "state_duty", "total_amount")}
     if all(amount is not None for amount in amounts.values()):
         if amounts["debt_amount"] + amounts["state_duty"] != amounts["total_amount"]:

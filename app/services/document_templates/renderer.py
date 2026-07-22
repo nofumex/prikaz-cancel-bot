@@ -253,6 +253,27 @@ def _render_statement_docx(path: Path, ctx: StatementContext, profile: StyleProf
     doc.save(path)
 
 
+def _strip_missing_placeholder(path: Path) -> None:
+    doc = Document(path)
+    containers = [doc, *doc.sections]
+    paragraphs = list(doc.paragraphs)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                paragraphs.extend(cell.paragraphs)
+    for section in doc.sections:
+        paragraphs.extend(section.header.paragraphs)
+        paragraphs.extend(section.footer.paragraphs)
+    changed = False
+    for paragraph in paragraphs:
+        for run in paragraph.runs:
+            if "MISSING" in run.text.upper():
+                run.text = re.sub(r"\bMISSING\b", "", run.text, flags=re.IGNORECASE)
+                changed = True
+    if changed:
+        doc.save(path)
+
+
 def _validate_a4_margins(docx_path: Path) -> None:
     doc = Document(str(docx_path))
     section = doc.sections[0]
@@ -310,6 +331,7 @@ def create_case_documents(
 
     profile = StyleProfile.normal()
     _render_statement_docx(full_docx, ctx, profile)
+    _strip_missing_placeholder(full_docx)
     _validate_a4_margins(full_docx)
 
     full_pdf_path: Path | None = None
@@ -327,6 +349,7 @@ def create_case_documents(
     if not restore_term and page_count and page_count > 1:
         profile = StyleProfile.compact()
         _render_statement_docx(full_docx, ctx, profile)
+        _strip_missing_placeholder(full_docx)
         _validate_a4_margins(full_docx)
         if full_pdf_path:
             full_pdf_path = convert_docx_to_pdf(
