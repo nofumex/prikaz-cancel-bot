@@ -11,7 +11,7 @@ from app.adapters.max.client import MaxApiError, MaxBotClient
 from app.config import get_settings
 from app.database import SessionLocal
 from app.enums import CaseStatus
-from app.keyboards.common import case_menu, consultation_menu, main_menu
+from app.keyboards.common import case_menu, consultation_menu, inactivity_offer_keyboard, main_menu, connect_chat_keyboard
 from app.models import Case, User
 from app.services.cases import (
     due_case_consultation_reminders,
@@ -19,10 +19,16 @@ from app.services.cases import (
     due_paid_followup_cases,
     due_started_users_without_cases,
     due_unpaid_cases,
+    due_inactive_users,
+    latest_open_case,
 )
 from app.services.crm_background import schedule_crm_sync
 from app.services.app_settings import reminder_settings
 from app.texts import no_order_deadline_reminder_text, post_payment_court_followup_text, unpaid_document_reminder_text
+from app.services.chat import open_session
+from app.services.users import get_staff
+
+INACTIVITY_TEXT = "Видим, что у вас возникли сложности с использованием сервиса. В ближайшее время с вами свяжется наша служба поддержки и поможет разобраться."
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +40,29 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
             async with SessionLocal() as session:
                 now = datetime.utcnow()
                 reminder_config = reminder_settings()
+
+                for user in await due_inactive_users(session):
+                    chat = await open_session(session, user)
+                    sent = await _send_user_message(
+                        settings, bot, user, INACTIVITY_TEXT,
+                        telegram_markup=inactivity_offer_keyboard(chat.id),
+                        max_keyboard=max_keyboards.inactivity_offer_keyboard(chat.id),
+                    )
+                    if not sent:
+                        continue
+                    user.inactivity_offer_sent_at = now
+                    notice = f"Пользователь #{user.id} бездействует 10 минут. Можно подключиться к чату."
+                    if user.platform == "telegram" and bot is not None:
+                        for staff in await get_staff(session, "telegram"):
+                            if staff.telegram_id and staff.admin_notifications_enabled:
+                                await bot.send_message(staff.telegram_id, notice, reply_markup=connect_chat_keyboard(chat.id))
+                    elif user.platform == "max":
+                        for staff in await get_staff(session, "max"):
+                            if staff.admin_notifications_enabled:
+                                await _send_max_message(settings, notice, max_keyboards.connect_chat_keyboard(chat.id), user_id=staff.platform_user_id)
+                    case = await latest_open_case(session, user.id)
+                    if case:
+                        schedule_crm_sync(settings, case.id, user.id, "manager_requested", {"note": "Бездействие пользователя 10 минут: менеджеру предложено подключиться"})
 
                 for user in await due_started_users_without_cases(session):
                     sent = await _send_user_message(
@@ -136,7 +165,7 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
             raise
         except Exception:
             logger.exception("Payment reminder loop failed")
-        await asyncio.sleep(300)
+        await asyncio.sleep(60)
 
 
 async def _send_case_message(settings, bot: Bot | None, case: Case, text: str, *, telegram_markup=None, max_keyboard=None) -> bool:

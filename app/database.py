@@ -83,6 +83,8 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("first_consultation_reminder_sent_at", "first_consultation_reminder_sent_at DATETIME"),
             ("reminder_delivery_blocked_at", "reminder_delivery_blocked_at DATETIME"),
             ("reminder_delivery_error", "reminder_delivery_error TEXT"),
+            ("inactivity_offer_sent_at", "inactivity_offer_sent_at DATETIME"),
+            ("inactivity_offer_dismissed_at", "inactivity_offer_dismissed_at DATETIME"),
         ],
     )
     if "deadline_reminder_sent_at" in added_case_columns:

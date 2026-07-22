@@ -34,6 +34,9 @@ async def get_or_create_telegram_user(session: AsyncSession, tg_user: TelegramUs
     user.last_name = tg_user.last_name
     user.is_admin = tg_user.id in settings.admin_ids
     user.is_manager = user.is_admin or tg_user.id in settings.manager_ids
+    if not user.is_manager:
+        user.inactivity_offer_sent_at = None
+        user.inactivity_offer_dismissed_at = None
     await _clear_reminder_delivery_block(session, user)
     await session.commit()
     await session.refresh(user)
@@ -65,6 +68,9 @@ async def get_or_create_platform_user(
             max_id = None
         user.is_admin = bool(max_id is not None and max_id in settings.max_admin_ids)
         user.is_manager = user.is_admin
+    if not user.is_manager:
+        user.inactivity_offer_sent_at = None
+        user.inactivity_offer_dismissed_at = None
     await _clear_reminder_delivery_block(session, user)
     await session.commit()
     await session.refresh(user)

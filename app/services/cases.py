@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import CaseStatus, PaymentStatus
-from app.models import Case, Payment, User
+from app.models import Case, ChatSession, Payment, User
 from app.services.legal_data import legal_deadline_from_received
 from app.services.app_settings import reminder_settings
 
@@ -211,6 +211,33 @@ async def due_started_users_without_cases(session: AsyncSession) -> list[User]:
         .limit(50)
     )
     return list(result.scalars().unique().all())
+
+
+async def due_inactive_users(session: AsyncSession) -> list[User]:
+    """Users with a phone who stopped interacting for ten minutes."""
+    due_at = datetime.utcnow() - timedelta(minutes=10)
+    open_case_exists = select(Case.id).where(
+        Case.user_id == User.id,
+        Case.status.not_in(list(ACTIVE_FINAL_STATUSES)),
+    ).exists()
+    active_chat_exists = select(ChatSession.id).where(
+        ChatSession.user_id == User.id,
+        ChatSession.status.in_(["open", "connected"]),
+    ).exists()
+    result = await session.execute(
+        select(User).where(
+            User.phone.is_not(None),
+            User.phone != "",
+            User.is_admin.is_(False),
+            User.is_manager.is_(False),
+            User.updated_at <= due_at,
+            User.inactivity_offer_sent_at.is_(None),
+            User.inactivity_offer_dismissed_at.is_(None),
+            open_case_exists,
+            ~active_chat_exists,
+        ).order_by(User.updated_at.asc()).limit(50)
+    )
+    return list(result.scalars().all())
 
 
 async def due_paid_followup_cases(session: AsyncSession) -> list[Case]:

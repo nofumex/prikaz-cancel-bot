@@ -48,6 +48,7 @@ EVENT_LABELS = {
     'deadline_recalculated': 'Срок подачи пересчитан',
     'manager_requested': 'Связался с менеджером',
     'manager_message_sent': 'Написал менеджеру',
+    'manager_reply_sent': 'Ответ менеджера',
     'preview_generated': 'Получил preview заявления',
     'payment_created': 'Перешел к оплате',
     'payment_paid': 'Оплатил',

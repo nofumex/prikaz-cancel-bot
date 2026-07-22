@@ -101,6 +101,19 @@ async def _end_chat(client, event, session, user):
 async def handle_chat_update(client, event, settings, session, user: User) -> bool:
     data = event.callback_data
     command = (event.text or '').strip().lower()
+    if data and data.startswith('chat:inactivity:dismiss:'):
+        from datetime import datetime
+        chat = await get_session(session, int(data.split(':')[-1]))
+        if not chat or chat.user_id != user.id:
+            await _send(client, chat_id=event.chat_id, text='Предложение не найдено.')
+        elif chat.manager_id:
+            await _send(client, chat_id=event.chat_id, text='Менеджер уже подключился к чату.')
+        else:
+            user.inactivity_offer_dismissed_at = datetime.utcnow()
+            await close_session(session, chat)
+            await session.commit()
+            await _send(client, chat_id=event.chat_id, text='Хорошо, помощь не требуется.')
+        return True
     if data == 'chat:start' or command == '/tutor':
         await _start_chat(client, event, session, settings, user)
         return True
@@ -167,6 +180,15 @@ async def _relay_message(client, event, settings, session, user: User) -> bool:
                 forwarded = await _forward_attachment(client, event, chat.user.platform_user_id, settings)
                 if not forwarded:
                     await _send(client, chat_id=event.chat_id, text='Не удалось переслать вложение. Отправьте его еще раз.')
+            case = await latest_open_case(session, chat.user.id)
+            if case:
+                schedule_crm_sync(
+                    settings,
+                    case.id,
+                    chat.user.id,
+                    'manager_reply_sent',
+                    {'note': f'\u0421\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435 \u043c\u0435\u043d\u0435\u0434\u0436\u0435\u0440\u0430: {saved[:500]}'},
+                )
             return True
     chat = await get_user_active_session(session, user.id)
     if not chat:

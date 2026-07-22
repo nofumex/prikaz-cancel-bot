@@ -33,6 +33,8 @@ class User(Base):
     first_consultation_reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime)
     reminder_delivery_blocked_at: Mapped[datetime | None] = mapped_column(DateTime)
     reminder_delivery_error: Mapped[str | None] = mapped_column(Text)
+    inactivity_offer_sent_at: Mapped[datetime | None] = mapped_column(DateTime)
+    inactivity_offer_dismissed_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 

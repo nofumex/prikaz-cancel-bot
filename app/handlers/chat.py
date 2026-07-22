@@ -54,6 +54,24 @@ async def cb_start_chat(callback: CallbackQuery, bot: Bot, session: AsyncSession
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("chat:inactivity:dismiss:"))
+async def cb_dismiss_inactivity(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+    from datetime import datetime
+
+    chat = await get_session(session, int(callback.data.split(":")[-1]))
+    if not chat or chat.user_id != current_user.id:
+        await callback.answer("Предложение не найдено", show_alert=True)
+        return
+    if chat.manager_id:
+        await callback.answer("Менеджер уже подключился к чату", show_alert=True)
+        return
+    current_user.inactivity_offer_dismissed_at = datetime.utcnow()
+    await close_session(session, chat)
+    await session.commit()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Хорошо, помощь не требуется")
+
+
 @router.callback_query(F.data.startswith("chat:session:"))
 async def cb_connect_chat(callback: CallbackQuery, bot: Bot, session: AsyncSession, current_user: User) -> None:
     if not current_user.is_manager:
@@ -122,7 +140,7 @@ async def end_chat(event: Message | CallbackQuery, bot: Bot, session: AsyncSessi
 
 
 @router.message(F.text)
-async def relay_chat_message(message: Message, bot: Bot, session: AsyncSession, current_user: User) -> None:
+async def relay_chat_message(message: Message, bot: Bot, session: AsyncSession, current_user: User, settings) -> None:
     if message.text.startswith("/"):
         return
     if current_user.is_manager:
@@ -132,6 +150,15 @@ async def relay_chat_message(message: Message, bot: Bot, session: AsyncSession, 
             await save_message(session, chat, current_user, message.text, "manager")
             if chat.user.telegram_id:
                 await bot.send_message(chat.user.telegram_id, f"<b>Менеджер:</b>\n{h(message.text)}", reply_markup=chat_end_menu())
+            case = await latest_open_case(session, chat.user.id)
+            if case:
+                schedule_crm_sync(
+                    settings,
+                    case.id,
+                    chat.user.id,
+                    "manager_reply_sent",
+                    {"note": f"\u0421\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435 \u043c\u0435\u043d\u0435\u0434\u0436\u0435\u0440\u0430: {message.text[:500]}"},
+                )
             return
     chat = await get_user_active_session(session, current_user.id)
     if not chat:

@@ -142,6 +142,10 @@ def connect_chat_keyboard(session_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[btn("Подключиться в чат", f"chat:session:{session_id}")]])
 
 
+def inactivity_offer_keyboard(session_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[btn("Не требуется", f"chat:inactivity:dismiss:{session_id}")]])
+
+
 def admin_panel(payments_enabled: bool = True) -> InlineKeyboardMarkup:
     payment_text = "💳 Оплата: ВКЛ" if payments_enabled else "🧪 Оплата: ВЫКЛ"
     return InlineKeyboardMarkup(
