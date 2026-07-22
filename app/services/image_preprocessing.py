@@ -24,7 +24,11 @@ def assess_order_image(order_photo_path: str | Path) -> ImageQuality:
         with Image.open(order_photo_path) as source:
             image = ImageOps.exif_transpose(source)
             width, height = image.size
-            if min(width, height) < 600 or width * height < 700_000:
+            # Telegram commonly downsizes tall screenshots to ~500-600 px in
+            # width. They still contain enough document pixels for OCR, so do
+            # not reject them solely for missing the old 600 px short-side
+            # threshold. Truly tiny inputs remain blocked by both limits.
+            if min(width, height) < 400 or width * height < 500_000:
                 return ImageQuality(False, "Изображение слишком маленькое; сфотографируйте весь приказ ближе.", width, height)
             sample = image.convert("L")
             sample.thumbnail((900, 900))
