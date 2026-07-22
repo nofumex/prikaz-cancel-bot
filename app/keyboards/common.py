@@ -94,6 +94,13 @@ def confirm_extraction() -> InlineKeyboardMarkup:
     )
 
 
+def ocr_field_confirmation(field_name: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn("✅ Подтвердить", f"case:ocr_confirm:{field_name}"), btn("✏️ Исправить", f"case:ocr_edit:{field_name}")],
+        ]
+    )
+
 def edit_fields_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[

@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.enums import CaseStatus, PaymentStatus
-from app.keyboards.common import case_menu, confirm_extraction, debtor_name_fix_menu, document_details_menu, documents_menu, edit_fields_menu, envelope_choice, main_menu, order_rephoto_menu, phone_request_keyboard, paid_date_required_menu, paid_document_actions, paid_edit_fields_menu, paid_review_menu, restore_reason_menu
+from app.keyboards.common import case_menu, confirm_extraction, debtor_name_fix_menu, document_details_menu, documents_menu, edit_fields_menu, envelope_choice, main_menu, ocr_field_confirmation, order_rephoto_menu, phone_request_keyboard, paid_date_required_menu, paid_document_actions, paid_edit_fields_menu, paid_review_menu, restore_reason_menu
 from app.models import Case, Payment, User
 from app.services.amocrm import get_amocrm_service
 from app.services.crm_background import schedule_crm_sync
@@ -46,6 +46,13 @@ from app.services.legal_data import (
 )
 from app.services.llm import extract_envelope_date, extract_order_amounts, extract_order_data
 from app.services.order_background import start_order_extraction, wait_order_extraction
+from app.services.order_confirmation import (
+    apply_confirmation_answer,
+    confirmation_crop,
+    confirmation_text,
+    next_confirmation,
+    reduce_and_validate,
+)
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
 from app.services.paid_correction import correction_allowed, paid_regeneration_requires_new_date, record_corrected_field, regenerate_paid_case
 from app.services.received_date import received_date_prompt_text, save_received_date, validate_received_date
@@ -66,6 +73,7 @@ class CaseStates(StatesGroup):
     waiting_manual_date = State()
     waiting_manual_fields = State()
     waiting_field_value = State()
+    waiting_ocr_field_value = State()
     waiting_payment_contact = State()
     waiting_restore_reason = State()
     waiting_restore_reason_custom = State()
@@ -290,6 +298,8 @@ async def _continue_after_received_date(
         await message.answer(date_error + "\n\n" + manual_received_date_prompt_text())
         return
     extracted = normalize_order_data(json.loads(case.extracted_json or "{}"))
+    if await _send_pending_ocr_confirmation(message, state, case, extracted):
+        return
     if settings.show_user_confirmation_step:
         await state.clear()
         await message.answer(extraction_preview(extracted, case.received_date, [], case.deadline_date), reply_markup=confirm_extraction())
@@ -568,6 +578,8 @@ async def receive_payment_contact(message: Message, state: FSMContext, session: 
         await _deliver_prepared_preview(message, state, session, settings, current_user, case)
         return
     extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    if await _send_pending_ocr_confirmation(message, state, case, extracted):
+        return
     if settings.show_user_confirmation_step:
         await state.clear()
         await message.answer(extraction_preview(extracted, case.received_date, [], case.deadline_date), reply_markup=confirm_extraction())
@@ -629,6 +641,47 @@ async def receive_envelope_photo(message: Message, bot: Bot, state: FSMContext, 
     await _extract_and_process_order(message, state, session, settings, case, current_user)
 
 
+async def _send_pending_ocr_confirmation(message: Message, state: FSMContext, case: Case, data: dict) -> bool:
+    step = next_confirmation(data)
+    if step is None:
+        return False
+    crop = confirmation_crop(case.order_photo_path, step, case_id=case.id) if case.order_photo_path else None
+    keyboard = ocr_field_confirmation(step.field_name)
+    text = confirmation_text(step)
+    if crop and crop.exists():
+        await message.answer_photo(FSInputFile(crop), caption=text, reply_markup=keyboard)
+    else:
+        await message.answer(text, reply_markup=keyboard)
+    await state.update_data(case_id=case.id, ocr_field=step.field_name)
+    return True
+
+
+async def _continue_after_ocr_confirmation(
+    message: Message, state: FSMContext, session: AsyncSession, settings: Settings, user: User, case: Case,
+) -> None:
+    data = normalize_order_data(json.loads(case.extracted_json or "{}"))
+    outcome = reduce_and_validate(data, case.received_date)
+    case.extracted_json = json.dumps(outcome.data, ensure_ascii=False)
+    case.missing_fields = json.dumps(list(outcome.missing_fields), ensure_ascii=False)
+    case.status = CaseStatus.PROCESSING.value if outcome.ready or outcome.next_step else CaseStatus.WAITING_ORDER_REPHOTO.value
+    await session.commit()
+    if outcome.next_step and await _send_pending_ocr_confirmation(message, state, case, outcome.data):
+        return
+    if not outcome.ready:
+        await state.update_data(case_id=case.id)
+        await state.set_state(CaseStates.waiting_order_rephoto)
+        await _send_order_rephoto_prompt(message, list(outcome.missing_fields), attempts=case.order_rephoto_attempts)
+        return
+    await state.clear()
+    if not case.received_date:
+        await state.update_data(case_id=case.id)
+        await state.set_state(CaseStates.waiting_manual_date)
+        await message.answer(received_date_prompt_text())
+    elif normalize_phone(user.phone):
+        await _generate_documents_flow(message, session, settings, user, case, state=state, bot=message.bot)
+    else:
+        await _request_payment_contact(message, state, case)
+
 async def _extract_and_process_order(
     message: Message,
     state: FSMContext,
@@ -649,6 +702,25 @@ async def _extract_and_process_order(
     if name_result and name_result.confidence >= 0.85 and name_result.normalized:
         extracted["debtor_full_name"] = name_result.normalized
 
+    pending = next_confirmation(extracted)
+    if extracted.get("_pipeline_status") == "technical_fail":
+        missing = list(extracted.get("_simple_validation_errors") or ["technical_ocr_fail"])
+        case.extracted_json = json.dumps(extracted, ensure_ascii=False)
+        case.missing_fields = json.dumps(missing, ensure_ascii=False)
+        case.status = CaseStatus.WAITING_ORDER_REPHOTO.value
+        await session.commit()
+        await state.set_state(CaseStates.waiting_order_rephoto)
+        await _send_order_rephoto_prompt(message, missing, attempts=case.order_rephoto_attempts)
+        return
+    if pending:
+        outcome = reduce_and_validate(extracted, case.received_date)
+        extracted = outcome.data
+        case.extracted_json = json.dumps(extracted, ensure_ascii=False)
+        case.missing_fields = json.dumps(list(outcome.missing_fields), ensure_ascii=False)
+        case.status = CaseStatus.PROCESSING.value
+        await session.commit()
+        await _send_pending_ocr_confirmation(message, state, case, extracted)
+        return
     missing = [field for field in missing_order_fields(extracted, case.received_date) if field != 'received_date']
     case.extracted_json = json.dumps(extracted, ensure_ascii=False)
     case.missing_fields = json.dumps(missing, ensure_ascii=False)
@@ -695,6 +767,56 @@ async def _extract_and_process_order(
         return
     await _request_payment_contact(message, state, case)
 
+
+@router.callback_query(F.data.startswith("case:ocr_confirm:"))
+async def confirm_ocr_field(callback: CallbackQuery, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    case = await latest_open_case(session, current_user.id)
+    if not case:
+        await callback.answer("Заявка не найдена")
+        return
+    field_name = callback.data.rsplit(":", 1)[-1]
+    data = normalize_order_data(json.loads(case.extracted_json or "{}"))
+    record = (data.get("_field_provenance") or {}).get(field_name)
+    if not isinstance(record, dict) or record.get("status") != "disputed":
+        await callback.answer("Поле уже подтверждено")
+        return
+    value = record.get("extracted_value") or record.get("raw_ocr_value") or ""
+    outcome = apply_confirmation_answer(data, field_name, value, case.received_date)
+    case.extracted_json = json.dumps(outcome.data, ensure_ascii=False)
+    case.missing_fields = json.dumps(list(outcome.missing_fields), ensure_ascii=False)
+    await session.commit()
+    await callback.answer("Подтверждено")
+    await _continue_after_ocr_confirmation(callback.message, state, session, settings, current_user, case)
+
+
+@router.callback_query(F.data.startswith("case:ocr_edit:"))
+async def edit_ocr_field(callback: CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User) -> None:
+    case = await latest_open_case(session, current_user.id)
+    if not case:
+        await callback.answer("Заявка не найдена")
+        return
+    field_name = callback.data.rsplit(":", 1)[-1]
+    await state.update_data(case_id=case.id, ocr_field=field_name)
+    await state.set_state(CaseStates.waiting_ocr_field_value)
+    await callback.message.answer(f"Введите исправленное значение для поля «{FIELD_LABELS.get(field_name, field_name)}».")
+    await callback.answer()
+
+
+@router.message(CaseStates.waiting_ocr_field_value)
+async def save_ocr_field_value(message: Message, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    state_data = await state.get_data()
+    case = await session.get(Case, state_data.get("case_id"))
+    value = (message.text or "").strip()
+    if case is None or not value:
+        await message.answer("Введите непустое значение текстом.")
+        return
+    field_name = state_data["ocr_field"]
+    data = normalize_order_data(json.loads(case.extracted_json or "{}"))
+    outcome = apply_confirmation_answer(data, field_name, value, case.received_date)
+    case.extracted_json = json.dumps(outcome.data, ensure_ascii=False)
+    case.missing_fields = json.dumps(list(outcome.missing_fields), ensure_ascii=False)
+    await session.commit()
+    await _continue_after_ocr_confirmation(message, state, session, settings, current_user, case)
 
 @router.callback_query(F.data == "case:rephoto_order")
 async def choose_rephoto_order(callback: CallbackQuery, state: FSMContext, session: AsyncSession, current_user: User) -> None:
@@ -818,9 +940,14 @@ async def process_field_value(message: Message, state: FSMContext, session: Asyn
         await message.answer("Значение не должно быть пустым. Напишите новое значение текстом.")
         return
     extracted = normalize_order_data(json.loads(case.extracted_json or "{}"))
-    extracted[field] = value
-    extracted = normalize_order_data(extracted)
-    missing = missing_order_fields(extracted, case.received_date)
+    if field in (extracted.get("_field_provenance") or {}):
+        outcome = apply_confirmation_answer(extracted, field, value, case.received_date)
+        extracted = outcome.data
+        missing = list(outcome.missing_fields)
+    else:
+        extracted[field] = value
+        extracted = normalize_order_data(extracted)
+        missing = missing_order_fields(extracted, case.received_date)
     case.extracted_json = json.dumps(extracted, ensure_ascii=False)
     case.missing_fields = json.dumps(missing, ensure_ascii=False)
     case.status = CaseStatus.NEEDS_REVIEW.value if missing else CaseStatus.PROCESSING.value

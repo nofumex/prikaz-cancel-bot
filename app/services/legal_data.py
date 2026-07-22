@@ -53,7 +53,10 @@ FIELD_LABELS = {
     "debtor_address": "Адрес должника",
     "creditor_name": "Взыскатель",
     "creditor_address": "Адрес взыскателя",
+    "creditor_legal_address": "Юридический адрес взыскателя",
+    "creditor_correspondence_address": "Адрес взыскателя для корреспонденции",
     "case_number": "Номер дела",
+    "uid": "УИД",
     "order_date": "Дата приказа",
     "debt_contract": "Договор/основание долга",
     "debt_period": "Период задолженности",
@@ -183,6 +186,15 @@ def normalize_case_identifiers(case_number: object | None, uid: object | None) -
     if not normalized_uid and uid_text and _UID_PATTERN.fullmatch(clean_uid(uid_text)):
         normalized_uid = clean_uid(uid_text).replace("М", "M").replace("м", "M").replace("С", "S").replace("с", "S")
     elif not normalized_uid and uid_text and re.fullmatch(r"\d{18,}", clean_uid(uid_text)):
+        normalized_uid = clean_uid(uid_text)
+    elif (
+        not normalized_uid and uid_text
+        and re.search(r"[^\d]", clean_uid(uid_text))
+        and re.search(r"\d", clean_uid(uid_text))
+        and canonical_identifier(uid_text) != canonical_identifier(normalized_case)
+    ):
+        # Preserve explicitly assigned non-standard court UIDs; never rewrite
+        # them into a case number merely because they miss the common pattern.
         normalized_uid = clean_uid(uid_text)
     if normalized_case and normalized_uid and canonical_identifier(normalized_case) == canonical_identifier(normalized_uid):
         normalized_uid = ""
@@ -485,6 +497,21 @@ def structured_debt_basis_facts(value: object | None) -> dict[str, str]:
 
 
 def normalize_order_data(data: dict) -> dict:
+    # document_value is selected by the evidence reducer; legacy normalization
+    # must not rewrite it or stringify its nested provenance.
+    if clean_text((data or {}).get("_document_values_locked")) == "1":
+        normalized = {
+            str(key): (value if isinstance(value, (dict, list)) else clean_text(value))
+            for key, value in (data or {}).items()
+        }
+        full_name = clean_text(normalized.get("debtor_full_name"))
+        if full_name:
+            normalized["debtor_name_raw"] = clean_text(normalized.get("debtor_name_raw")) or full_name
+            normalized["debtor_short_name"] = make_short_name(full_name)
+        court_name = clean_text(normalized.get("court_name"))
+        if court_name and not normalized.get("court_addressee"):
+            normalized["court_addressee"] = f"Мировому судье {court_name}"
+        return normalized
     normalized = {str(key): clean_text(value) for key, value in (data or {}).items()}
     case_number, uid = normalize_case_identifiers(normalized.get("case_number"), normalized.get("uid"))
     normalized["case_number"] = case_number
@@ -689,11 +716,27 @@ def validate_amounts(data: dict) -> AmountValidationResult:
 
 def validate_before_generation(data: dict, received_date: date | None) -> ValidationResult:
     missing = missing_order_fields(data, received_date)
+    if clean_text((data or {}).get("_document_values_locked")) == "1":
+        provenance = data.get("_field_provenance") if isinstance(data.get("_field_provenance"), dict) else {}
+        blocking_fields = {
+            "court_name", "court_address", "judge", "debtor_full_name", "debtor_address",
+            "creditor_name", "creditor_legal_address", "creditor_correspondence_address",
+            "case_number", "uid", "order_date", "debt_contract", "debt_period",
+            "debt_amount", "state_duty", "total_amount",
+        }
+        disputed = [
+            FIELD_LABELS.get(name, name) for name, record in provenance.items()
+            if name in blocking_fields and isinstance(record, dict) and record.get("status") == "disputed"
+        ]
+        if disputed:
+            missing = list(dict.fromkeys([*missing, *disputed, "Подтверждение спорных полей"]))
     bad = []
     for key, value in normalize_order_data(data).items():
-        if key in VALIDATION_SKIP_KEYS:
+        if key in VALIDATION_SKIP_KEYS or key.startswith("_"):
             continue
         found = bad_tokens_in_text(f"{key}: {value}")
+        if clean_text((data or {}).get("_document_values_locked")) == "1" and key in {"court_address", "debtor_address", "creditor_address"}:
+            found = [token for token in found if token != "в городе Москва"]
         bad.extend(found)
     normalized = normalize_order_data(data)
     debtor = normalized.get("debtor_full_name", "")
@@ -702,6 +745,6 @@ def validate_before_generation(data: dict, received_date: date | None) -> Valida
         confidence = float(normalized.get("debtor_name_confidence") or 0)
     except (TypeError, ValueError):
         confidence = 0.0
-    if looks_like_dative_full_name(debtor) and confidence < 0.85:
+    if clean_text(normalized.get("_document_values_locked")) != "1" and looks_like_dative_full_name(debtor) and confidence < 0.85:
         bad.append("debtor_full_name:dative")
     return ValidationResult(ok=not missing and not bad, missing=missing, bad_tokens=sorted(set(bad)))

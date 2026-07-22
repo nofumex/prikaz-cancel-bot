@@ -107,6 +107,12 @@ def confirm_extraction() -> MaxKeyboard:
     ]
 
 
+def ocr_field_confirmation(field_name: str) -> MaxKeyboard:
+    return [[
+        btn("✅ Подтвердить", f"case:ocr_confirm:{field_name}"),
+        btn("✏️ Исправить", f"case:ocr_edit:{field_name}"),
+    ]]
+
 def edit_fields_menu() -> MaxKeyboard:
     return [
         [btn("⚖️ Суд", "case:field:court_name"), btn("📍 Адрес суда", "case:field:court_address")],

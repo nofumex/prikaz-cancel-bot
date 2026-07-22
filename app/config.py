@@ -134,6 +134,8 @@ class Settings:
     order_adjudicator_model: str = ""
     tesseract_ai_enabled: bool = True
     tesseract_ai_model: str = ""
+    order_recognition_mode: str = "tesseract_text"
+    order_crop_vision_enabled: bool = False
 
     @property
     def staff_ids(self) -> set[int]:
@@ -235,5 +237,7 @@ def get_settings() -> Settings:
         order_verifier_model=(getenv("ORDER_VERIFIER_MODEL") or getenv("VISION_MODEL") or "gpt-4.1-mini").strip(),
         order_adjudicator_model=(getenv("ORDER_ADJUDICATOR_MODEL") or getenv("AI_REVIEW_MODEL") or getenv("TEXT_MODEL") or "gpt-4.1").strip(),
         tesseract_ai_enabled=_parse_bool(getenv("TESSERACT_AI_ENABLED"), True),
-        tesseract_ai_model=(getenv("TESSERACT_AI_MODEL") or "gpt-5.4-mini").strip(),
+        tesseract_ai_model=(getenv("TESSERACT_AI_MODEL") or "gpt-4.1-mini").strip(),
+        order_recognition_mode=(getenv("ORDER_RECOGNITION_MODE") or "tesseract_text").strip().lower(),
+        order_crop_vision_enabled=_parse_bool(getenv("ORDER_CROP_VISION_ENABLED"), False),
     )

@@ -27,6 +27,9 @@ from app.services.document_background import start_document_preparation, wait_st
 from app.services.legal_data import FIELD_LABELS, is_deadline_missed, missing_order_fields, normalize_debtor_name_fields, normalize_order_data, suggest_nominative_full_name, validate_before_generation
 from app.services.llm import extract_envelope_date, extract_order_data
 from app.services.order_background import start_order_extraction, wait_order_extraction
+from app.services.order_confirmation import (
+    apply_confirmation_answer, confirmation_crop, confirmation_text, next_confirmation, reduce_and_validate,
+)
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
 from app.services.paid_correction import correction_allowed, paid_regeneration_requires_new_date, record_corrected_field, regenerate_paid_case
 from app.services.received_date import received_date_prompt_text, save_received_date, validate_received_date
@@ -45,6 +48,7 @@ STATE_ORDER_REPHOTO = "max_waiting_order_rephoto"
 STATE_ENVELOPE = "max_waiting_envelope"
 STATE_MANUAL_DATE = "max_waiting_manual_date"
 STATE_FIELD_VALUE = "max_waiting_field_value"
+STATE_OCR_FIELD_VALUE = "max_waiting_ocr_field_value"
 STATE_PAYMENT_CONTACT = 'max_waiting_payment_contact'
 STATE_RESTORE_REASON = 'max_waiting_restore_reason'
 STATE_PAID_FIELD = 'max_waiting_paid_field'
@@ -475,6 +479,33 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             await _set_state(session, event, STATE_ENVELOPE, {"case_id": case.id})
             await _send(client, event, "Отправьте фото конверта так, чтобы были видны штампы с датами.")
             return
+        if data and data.startswith("case:ocr_confirm:"):
+            case = await latest_open_case(session, user.id)
+            if not case:
+                await _send(client, event, "Заявка не найдена.")
+                return
+            field_name = data.rsplit(":", 1)[-1]
+            extracted = normalize_order_data(json.loads(case.extracted_json or "{}"))
+            record = (extracted.get("_field_provenance") or {}).get(field_name)
+            if not isinstance(record, dict) or record.get("status") != "disputed":
+                await _send(client, event, "Поле уже подтверждено.")
+                return
+            value = record.get("extracted_value") or record.get("raw_ocr_value") or ""
+            outcome = apply_confirmation_answer(extracted, field_name, value, case.received_date)
+            case.extracted_json = json.dumps(outcome.data, ensure_ascii=False)
+            case.missing_fields = json.dumps(list(outcome.missing_fields), ensure_ascii=False)
+            await session.commit()
+            await _continue_after_ocr_confirmation(client, event, session, settings, user, case)
+            return
+        if data and data.startswith("case:ocr_edit:"):
+            case = await latest_open_case(session, user.id)
+            if not case:
+                await _send(client, event, "Заявка не найдена.")
+                return
+            field_name = data.rsplit(":", 1)[-1]
+            await _set_state(session, event, STATE_OCR_FIELD_VALUE, {"case_id": case.id, "field": field_name})
+            await _send(client, event, f"Введите исправленное значение для поля «{FIELD_LABELS.get(field_name, field_name)}».")
+            return
         if data == "case:review":
             if not (user.is_admin or settings.show_user_confirmation_step):
                 await _send(client, event, "Эта функция недоступна.")
@@ -664,6 +695,23 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             return
         if current_state in {STATE_ENVELOPE, STATE_MANUAL_DATE} and event.text:
             await _handle_manual_date(client, event, session, settings, user, event.text)
+            return
+        if current_state == STATE_OCR_FIELD_VALUE and event.text:
+            state_data = await _state_data(session, event)
+            if state_data.get("awaiting_action"):
+                await _send(client, event, "Нажмите «Подтвердить» или «Исправить».")
+                return
+            case = await session.get(Case, state_data.get("case_id"))
+            value = event.text.strip()
+            if case is None or not value:
+                await _send(client, event, "Введите непустое значение текстом.")
+                return
+            extracted = normalize_order_data(json.loads(case.extracted_json or "{}"))
+            outcome = apply_confirmation_answer(extracted, state_data["field"], value, case.received_date)
+            case.extracted_json = json.dumps(outcome.data, ensure_ascii=False)
+            case.missing_fields = json.dumps(list(outcome.missing_fields), ensure_ascii=False)
+            await session.commit()
+            await _continue_after_ocr_confirmation(client, event, session, settings, user, case)
             return
         if current_state == STATE_FIELD_VALUE and event.text:
             await _handle_field_value(client, event, session, user, event.text)
@@ -893,6 +941,40 @@ async def _handle_manual_date(client: MaxBotClient, event: IncomingEvent, sessio
     return
 
 
+async def _send_pending_ocr_confirmation(client: MaxBotClient, event: IncomingEvent, session, case: Case, data: dict) -> bool:
+    step = next_confirmation(data)
+    if step is None:
+        return False
+    await _set_state(session, event, STATE_OCR_FIELD_VALUE, {"case_id": case.id, "field": step.field_name, "awaiting_action": True})
+    crop = confirmation_crop(case.order_photo_path, step, case_id=case.id) if case.order_photo_path else None
+    if crop and crop.exists():
+        await client.send_image(event.chat_id, crop)
+    await _send(client, event, confirmation_text(step), keyboards.ocr_field_confirmation(step.field_name))
+    return True
+
+
+async def _continue_after_ocr_confirmation(client, event, session, settings: Settings, user: User, case: Case) -> None:
+    data = normalize_order_data(json.loads(case.extracted_json or "{}"))
+    outcome = reduce_and_validate(data, case.received_date)
+    case.extracted_json = json.dumps(outcome.data, ensure_ascii=False)
+    case.missing_fields = json.dumps(list(outcome.missing_fields), ensure_ascii=False)
+    case.status = CaseStatus.PROCESSING.value if outcome.ready or outcome.next_step else CaseStatus.WAITING_ORDER_REPHOTO.value
+    await session.commit()
+    if outcome.next_step and await _send_pending_ocr_confirmation(client, event, session, case, outcome.data):
+        return
+    if not outcome.ready:
+        await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})
+        await _send_order_rephoto_prompt(client, event, list(outcome.missing_fields), attempts=case.order_rephoto_attempts)
+        return
+    await _clear_state(session, event)
+    if not case.received_date:
+        await _set_state(session, event, STATE_MANUAL_DATE, {"case_id": case.id})
+        await _send(client, event, received_date_prompt_text())
+    elif normalize_phone(user.phone):
+        await _generate_documents(client, event, session, settings, user, case)
+    else:
+        await _request_payment_contact(client, event, session, case)
+
 async def _extract_and_process_order(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User, case: Case) -> None:
     await _clear_state(session, event)
     await _send(client, event, "🔎 Считываю приказ и собираю данные для заявления.")
@@ -903,7 +985,15 @@ async def _extract_and_process_order(client: MaxBotClient, event: IncomingEvent,
         extracted = {}
     extracted = normalize_order_data(extracted)
     extracted, _ = normalize_debtor_name_fields(extracted)
-    missing = [field for field in missing_order_fields(extracted, case.received_date) if field != 'received_date']
+    pending_confirmation = next_confirmation(extracted)
+    if extracted.get("_pipeline_status") == "technical_fail":
+        missing = list(extracted.get("_simple_validation_errors") or ["technical_ocr_fail"])
+    elif pending_confirmation:
+        outcome = reduce_and_validate(extracted, case.received_date)
+        extracted = outcome.data
+        missing = list(outcome.missing_fields)
+    else:
+        missing = [field for field in missing_order_fields(extracted, case.received_date) if field != 'received_date']
     case.extracted_json = json.dumps(extracted, ensure_ascii=False)
     case.missing_fields = json.dumps(missing, ensure_ascii=False)
     if missing:
@@ -914,6 +1004,9 @@ async def _extract_and_process_order(client: MaxBotClient, event: IncomingEvent,
         case.status = CaseStatus.PROCESSING.value
     await session.commit()
     schedule_crm_sync(settings, case.id, user.id, "ocr_completed", {"note": "MAX: OCR завершен"})
+    if pending_confirmation:
+        await _send_pending_ocr_confirmation(client, event, session, case, extracted)
+        return
     if missing:
         await _send_order_rephoto_prompt(client, event, missing, attempts=case.order_rephoto_attempts)
         schedule_crm_sync(settings, case.id, user.id, "document_qa_failed", {"note": "MAX: не удалось прочитать обязательные поля приказа"})
@@ -963,9 +1056,14 @@ async def _handle_field_value(client: MaxBotClient, event: IncomingEvent, sessio
     case = await session.get(Case, state_data["case_id"])
     field = state_data["field"]
     extracted = normalize_order_data(json.loads(case.extracted_json or "{}"))
-    extracted[field] = value.strip()
-    extracted = normalize_order_data(extracted)
-    missing = missing_order_fields(extracted, case.received_date)
+    if field in (extracted.get("_field_provenance") or {}):
+        outcome = apply_confirmation_answer(extracted, field, value.strip(), case.received_date)
+        extracted = outcome.data
+        missing = list(outcome.missing_fields)
+    else:
+        extracted[field] = value.strip()
+        extracted = normalize_order_data(extracted)
+        missing = missing_order_fields(extracted, case.received_date)
     case.extracted_json = json.dumps(extracted, ensure_ascii=False)
     case.missing_fields = json.dumps(missing, ensure_ascii=False)
     case.status = CaseStatus.NEEDS_REVIEW.value if missing else CaseStatus.PROCESSING.value
@@ -977,6 +1075,8 @@ async def _handle_field_value(client: MaxBotClient, event: IncomingEvent, sessio
 
 async def _generate_documents(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User, case: Case) -> None:
     data = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    if await _send_pending_ocr_confirmation(client, event, session, case, data):
+        return
     if is_deadline_missed(case.deadline_date) and not data.get('restore_reason'):
         await _set_state(session, event, STATE_RESTORE_REASON, {'case_id': case.id})
         await _send(client, event, 'Срок подачи уже пропущен. Выберите причину для восстановления срока.', keyboards.restore_reason_menu())

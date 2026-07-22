@@ -10,6 +10,7 @@ venv/
 storage/photos/*
 storage/documents/*
 storage/debug/*
+storage/ocr_cache/*
 !storage/photos/.gitkeep
 !storage/documents/.gitkeep
 

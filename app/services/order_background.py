@@ -12,6 +12,7 @@ from app.models import Case, User
 from app.services.crm_background import schedule_crm_sync
 from app.services.legal_data import missing_order_fields, normalize_debtor_name_fields, normalize_order_data
 from app.services.llm import extract_order_data
+from app.services.order_confirmation import next_confirmation, reduce_and_validate
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,15 @@ async def _extract_and_store(settings: Settings, case_id: int, user_id: int) -> 
         extracted, name_result = normalize_debtor_name_fields(extracted)
         if name_result and name_result.confidence >= 0.85 and name_result.normalized:
             extracted["debtor_full_name"] = name_result.normalized
-        missing = [field for field in missing_order_fields(extracted, case.received_date) if field != "received_date"]
+        pending_confirmation = next_confirmation(extracted)
+        if extracted.get("_pipeline_status") == "technical_fail":
+            missing = list(extracted.get("_simple_validation_errors") or ["technical_ocr_fail"])
+        elif pending_confirmation:
+            outcome = reduce_and_validate(extracted, case.received_date)
+            extracted = outcome.data
+            missing = list(outcome.missing_fields)
+        else:
+            missing = [field for field in missing_order_fields(extracted, case.received_date) if field != "received_date"]
         case.extracted_json = json.dumps(extracted, ensure_ascii=False)
         case.missing_fields = json.dumps(missing, ensure_ascii=False)
         if missing:
