@@ -1,5 +1,5 @@
 from app.services.legal_data import clean_text
-from app.services.tesseract_ai import _debt_period_from_ocr
+from app.services.tesseract_ai import _debt_period_from_ocr, _order_date_from_ocr
 from app.utils import parse_russian_date
 
 
@@ -18,3 +18,9 @@ def test_debt_period_falls_back_to_tesseract_sentence():
 
 def test_ai_missing_marker_is_not_rendered_into_document():
     assert clean_text("MISSING") == ""
+    assert clean_text("address MISSING") == "address"
+
+
+def test_order_date_falls_back_to_tesseract_text():
+    text = "СУДЕБНЫЙ ПРИКАЗ 29 июня 2026 г. Производство №2-1252/2026"
+    assert _order_date_from_ocr(text) == "29.06.2026"

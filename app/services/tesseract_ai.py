@@ -820,6 +820,18 @@ def _debt_period_from_ocr(text: str) -> str:
     return _normalize_debt_period(" ".join(match.groups())) if match else ""
 
 
+def _order_date_from_ocr(text: str) -> str:
+    months = (
+        "января|февраля|марта|апреля|мая|июня|июля|"
+        "августа|сентября|октября|ноября|декабря"
+    )
+    match = re.search(rf"\b\d{{1,2}}\s+(?:{months})\s+\d{{4}}\s*г?\.?​?", text, re.IGNORECASE)
+    if not match:
+        return ""
+    parsed = parse_russian_date(match.group(0).replace("г.", "").replace("г", "").strip())
+    return parsed.strftime("%d.%m.%Y") if parsed else ""
+
+
 def _format_ok(field_name: str, value: str) -> bool:
     if not value:
         return False
@@ -1494,6 +1506,9 @@ def _simple_extraction_data(payload: dict[str, Any], ocr: TesseractOcrResult) ->
     values["debtor_short_name"] = make_short_name(values["debtor_full_name"])
 
     parsed_date = parse_russian_date(values["order_date"])
+    if not parsed_date:
+        fallback_order_date = _order_date_from_ocr(ocr.text)
+        parsed_date = parse_russian_date(fallback_order_date)
     if parsed_date:
         values["order_date"] = parsed_date.strftime("%d.%m.%Y")
     values["debt_period"] = _normalize_debt_period(values["debt_period"])
