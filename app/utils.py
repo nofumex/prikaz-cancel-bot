@@ -75,8 +75,12 @@ def parse_russian_date(raw: str | None) -> date | None:
             return date(year, month, day)
         except ValueError:
             return None
-    if re.fullmatch(r'\d{4}-\d{1,2}-\d{1,2}', text):
-        return None
+    iso = re.fullmatch(r'(\d{4})-(\d{1,2})-(\d{1,2})', text)
+    if iso:
+        try:
+            return date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+        except ValueError:
+            return None
     months = {
         "января": 1,
         "февраля": 2,

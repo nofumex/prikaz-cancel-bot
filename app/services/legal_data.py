@@ -86,7 +86,10 @@ def clean_text(value: object | None) -> str:
     # Normalize Latin OCR homoglyphs only inside common legal abbreviations.
     text = re.sub(r"\b[ОO]{3}\b", "ООО", text, flags=re.IGNORECASE)
     text = re.sub(r"\b[ПP][КK][ОOЮ]\b", "ПКО", text, flags=re.IGNORECASE)
-    return text.strip(" \t\r\n,;")
+    text = text.strip(" \t\r\n,;")
+    if text.casefold() in {"missing", "none", "null", "n/a", "unknown"}:
+        return ""
+    return text
 
 
 def normalize_address_text(value: object | None) -> str:
@@ -721,7 +724,7 @@ def validate_before_generation(data: dict, received_date: date | None) -> Valida
         blocking_fields = {
             "court_name", "court_address", "judge", "debtor_full_name", "debtor_address",
             "creditor_name", "creditor_legal_address", "creditor_correspondence_address",
-            "case_number", "uid", "order_date", "debt_contract", "debt_period",
+            "case_number", "uid", "order_date", "debt_contract",
             "debt_amount", "state_duty", "total_amount",
         }
         disputed = [

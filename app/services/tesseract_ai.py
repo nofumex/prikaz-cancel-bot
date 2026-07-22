@@ -807,6 +807,19 @@ def _normalize_debt_period(value: str) -> str:
         return ""
     return f"с {parsed[0].strftime('%d.%m.%Y')} по {parsed[1].strftime('%d.%m.%Y')}"
 
+def _debt_period_from_ocr(text: str) -> str:
+    # Anchor the two dates to the phrase "period from ... to ..." so dates
+    # elsewhere in the order (birth, contract, signature) cannot interfere.
+    match = re.search(
+        r"\b\u043f\u0435\u0440\u0438\u043e\u0434\s+\u0441\s+"
+        r"(\d{1,2}[./]\d{1,2}[./]\d{2,4})\s*(?:\u0433\.?\s*)?"
+        r"\u043f\u043e\s+(\d{1,2}[./]\d{1,2}[./]\d{2,4})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return _normalize_debt_period(" ".join(match.groups())) if match else ""
+
+
 def _format_ok(field_name: str, value: str) -> bool:
     if not value:
         return False
@@ -1484,6 +1497,8 @@ def _simple_extraction_data(payload: dict[str, Any], ocr: TesseractOcrResult) ->
     if parsed_date:
         values["order_date"] = parsed_date.strftime("%d.%m.%Y")
     values["debt_period"] = _normalize_debt_period(values["debt_period"])
+    if not values["debt_period"]:
+        values["debt_period"] = _debt_period_from_ocr(ocr.text)
     for name in ("debt_amount", "state_duty", "total_amount"):
         amount = money_to_decimal(values[name])
         if amount is not None:
@@ -1501,7 +1516,7 @@ def _simple_extraction_data(payload: dict[str, Any], ocr: TesseractOcrResult) ->
     required = (
         "court_name", "court_address", "judge", "debtor_full_name",
         "debtor_address", "creditor_name", "creditor_address", "case_number",
-        "order_date", "debt_contract", "debt_period", "debt_amount",
+        "order_date", "debt_contract", "debt_amount",
         "state_duty", "total_amount",
     )
     issues.extend(f"missing:{name}" for name in required if not values.get(name))
