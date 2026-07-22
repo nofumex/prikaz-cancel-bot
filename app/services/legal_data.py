@@ -89,6 +89,8 @@ def clean_text(value: object | None) -> str:
     text = text.strip(" \t\r\n,;")
     if text.casefold() in {"missing", "none", "null", "n/a", "unknown"}:
         return ""
+    text = re.sub(r"\bMISSING\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip(" ,;")
     return text
 
 

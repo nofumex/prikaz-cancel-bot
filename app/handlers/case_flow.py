@@ -704,7 +704,7 @@ async def _extract_and_process_order(
 
     pending = next_confirmation(extracted)
     if extracted.get("_pipeline_status") == "technical_fail":
-        missing = list(extracted.get("_simple_validation_errors") or ["technical_ocr_fail"])
+        missing = [item for item in (extracted.get("_simple_validation_errors") or ["technical_ocr_fail"]) if item != "missing:debt_period"]
         case.extracted_json = json.dumps(extracted, ensure_ascii=False)
         case.missing_fields = json.dumps(missing, ensure_ascii=False)
         case.status = CaseStatus.WAITING_ORDER_REPHOTO.value

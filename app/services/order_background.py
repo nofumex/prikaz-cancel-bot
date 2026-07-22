@@ -48,7 +48,7 @@ async def _extract_and_store(settings: Settings, case_id: int, user_id: int) -> 
             extracted["debtor_full_name"] = name_result.normalized
         pending_confirmation = next_confirmation(extracted)
         if extracted.get("_pipeline_status") == "technical_fail":
-            missing = list(extracted.get("_simple_validation_errors") or ["technical_ocr_fail"])
+            missing = [item for item in (extracted.get("_simple_validation_errors") or ["technical_ocr_fail"]) if item != "missing:debt_period"]
         elif pending_confirmation:
             outcome = reduce_and_validate(extracted, case.received_date)
             extracted = outcome.data
