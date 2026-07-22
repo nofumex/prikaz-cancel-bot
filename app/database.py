@@ -108,6 +108,20 @@ async def _upgrade_sqlite_schema(conn) -> None:
             "UPDATE users SET first_consultation_reminder_sent_at = CURRENT_TIMESTAMP WHERE first_consultation_reminder_sent_at IS NULL"
         )
 
+    # One-time rollout cutoff: users that existed before this feature must not
+    # receive an inactivity offer immediately after deployment.
+    await conn.exec_driver_sql("CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+    rollout = await conn.exec_driver_sql("SELECT 1 FROM app_migrations WHERE name = 'inactivity_offer_rollout_v1'")
+    if rollout.fetchone() is None:
+        await conn.exec_driver_sql("UPDATE users SET inactivity_offer_sent_at = CURRENT_TIMESTAMP WHERE inactivity_offer_sent_at IS NULL")
+        await conn.exec_driver_sql("INSERT INTO app_migrations(name) VALUES ('inactivity_offer_rollout_v1')")
+
+    await _sqlite_add_columns(
+        conn,
+        "chat_sessions",
+        [("inactivity_notification_refs", "inactivity_notification_refs TEXT")],
+    )
+
     await conn.exec_driver_sql(
         """
         CREATE TABLE IF NOT EXISTS openai_usages (

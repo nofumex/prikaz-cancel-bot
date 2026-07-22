@@ -16,6 +16,7 @@ from app.services.chat import (
     get_user_active_session,
     open_session,
     save_message,
+    delete_inactivity_notifications,
 )
 from app.services.crm_background import schedule_crm_sync
 from app.services.users import get_staff
@@ -110,6 +111,7 @@ async def handle_chat_update(client, event, settings, session, user: User) -> bo
             await _send(client, chat_id=event.chat_id, text='Менеджер уже подключился к чату.')
         else:
             user.inactivity_offer_dismissed_at = datetime.utcnow()
+            await delete_inactivity_notifications(chat, settings, max_client=client)
             await close_session(session, chat)
             await session.commit()
             await _send(client, chat_id=event.chat_id, text='Хорошо, помощь не требуется.')

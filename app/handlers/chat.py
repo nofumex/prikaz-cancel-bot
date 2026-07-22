@@ -17,6 +17,7 @@ from app.services.chat import (
     get_user_active_session,
     open_session,
     save_message,
+    delete_inactivity_notifications,
 )
 from app.services.users import get_staff
 from app.texts import manager_request_text
@@ -55,7 +56,7 @@ async def cb_start_chat(callback: CallbackQuery, bot: Bot, session: AsyncSession
 
 
 @router.callback_query(F.data.startswith("chat:inactivity:dismiss:"))
-async def cb_dismiss_inactivity(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
+async def cb_dismiss_inactivity(callback: CallbackQuery, bot: Bot, session: AsyncSession, current_user: User, settings) -> None:
     from datetime import datetime
 
     chat = await get_session(session, int(callback.data.split(":")[-1]))
@@ -66,6 +67,7 @@ async def cb_dismiss_inactivity(callback: CallbackQuery, session: AsyncSession, 
         await callback.answer("Менеджер уже подключился к чату", show_alert=True)
         return
     current_user.inactivity_offer_dismissed_at = datetime.utcnow()
+    await delete_inactivity_notifications(chat, settings, bot=bot)
     await close_session(session, chat)
     await session.commit()
     await callback.message.edit_reply_markup(reply_markup=None)

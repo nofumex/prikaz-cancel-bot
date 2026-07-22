@@ -192,6 +192,9 @@ async def _mark_payment_paid(session: AsyncSession, payment: Payment, raw: dict 
         if not case.delivered_at:
             case.status = CaseStatus.PAID.value
         case.paid_at = case.paid_at or paid_at
+        from app.config import get_settings
+        from app.services.chat import close_inactivity_sessions
+        await close_inactivity_sessions(session, case.user_id, get_settings())
     await session.commit()
     if case:
         await session.refresh(case)

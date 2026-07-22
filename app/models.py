@@ -166,6 +166,7 @@ class ChatSession(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     connected_at: Mapped[datetime | None] = mapped_column(DateTime)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    inactivity_notification_refs: Mapped[str | None] = mapped_column(Text)
 
     user: Mapped[User] = relationship(foreign_keys=[user_id], lazy="selectin")
     manager: Mapped[User | None] = relationship(foreign_keys=[manager_id], lazy="selectin")

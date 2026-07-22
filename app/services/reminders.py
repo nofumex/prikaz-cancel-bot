@@ -25,7 +25,7 @@ from app.services.cases import (
 from app.services.crm_background import schedule_crm_sync
 from app.services.app_settings import reminder_settings
 from app.texts import no_order_deadline_reminder_text, post_payment_court_followup_text, unpaid_document_reminder_text
-from app.services.chat import open_session
+from app.services.chat import add_inactivity_notification_ref, open_session
 from app.services.users import get_staff
 
 INACTIVITY_TEXT = "Видим, что у вас возникли сложности с использованием сервиса. В ближайшее время с вами свяжется наша служба поддержки и поможет разобраться."
@@ -55,11 +55,16 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
                     if user.platform == "telegram" and bot is not None:
                         for staff in await get_staff(session, "telegram"):
                             if staff.telegram_id and staff.admin_notifications_enabled:
-                                await bot.send_message(staff.telegram_id, notice, reply_markup=connect_chat_keyboard(chat.id))
+                                message = await bot.send_message(staff.telegram_id, notice, reply_markup=connect_chat_keyboard(chat.id))
+                                add_inactivity_notification_ref(chat, "telegram", message.message_id, staff.telegram_id)
                     elif user.platform == "max":
                         for staff in await get_staff(session, "max"):
                             if staff.admin_notifications_enabled:
-                                await _send_max_message(settings, notice, max_keyboards.connect_chat_keyboard(chat.id), user_id=staff.platform_user_id)
+                                response = await _send_max_message(settings, notice, max_keyboards.connect_chat_keyboard(chat.id), user_id=staff.platform_user_id)
+                                message = response.get("message", response)
+                                message_id = message.get("body", {}).get("mid") or message.get("mid") or message.get("message_id")
+                                if message_id:
+                                    add_inactivity_notification_ref(chat, "max", message_id, staff.platform_user_id)
                     case = await latest_open_case(session, user.id)
                     if case:
                         schedule_crm_sync(settings, case.id, user.id, "manager_requested", {"note": "Бездействие пользователя 10 минут: менеджеру предложено подключиться"})
@@ -224,11 +229,11 @@ def _is_terminal_max_delivery_error(exc: MaxApiError) -> bool:
     return exc.status == 403 and (exc.code == 'chat.denied' or 'dialog.suspended' in text)
 
 
-async def _send_max_message(settings, text: str, keyboard=None, *, chat_id: str | int | None = None, user_id: str | int | None = None) -> None:
+async def _send_max_message(settings, text: str, keyboard=None, *, chat_id: str | int | None = None, user_id: str | int | None = None) -> dict:
     async with MaxBotClient(
         settings.max_bot_token,
         settings.max_api_base_url,
         upload_retry_attempts=settings.max_upload_retry_attempts,
         upload_retry_base_seconds=settings.max_upload_retry_base_seconds,
     ) as client:
-        await client.send_message(chat_id=chat_id, user_id=user_id, text=text, keyboard=keyboard)
+        return await client.send_message(chat_id=chat_id, user_id=user_id, text=text, keyboard=keyboard)
