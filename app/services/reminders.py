@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramForbiddenError
 
 from app.adapters.max import keyboards as max_keyboards
 from app.adapters.max.client import MaxApiError, MaxBotClient
@@ -185,6 +186,13 @@ async def _send_case_message(settings, bot: Bot | None, case: Case, text: str, *
             await bot.send_message(case.user.telegram_id, text, reply_markup=telegram_markup)
             return True
         return False
+    except TelegramForbiddenError as exc:
+        case.reminder_delivery_blocked_at = datetime.utcnow()
+        case.reminder_delivery_error = str(exc)[:1000]
+        case.user.reminder_delivery_blocked_at = case.reminder_delivery_blocked_at
+        case.user.reminder_delivery_error = case.reminder_delivery_error
+        logger.warning("Telegram reminders disabled: bot blocked by user case_id=%s user_id=%s", case.id, case.user_id)
+        return False
     except MaxApiError as exc:
         if _is_terminal_max_delivery_error(exc):
             case.reminder_delivery_blocked_at = datetime.utcnow()
@@ -209,6 +217,11 @@ async def _send_user_message(settings, bot: Bot | None, user: User, text: str, *
         if bot is not None and user.telegram_id:
             await bot.send_message(user.telegram_id, text, reply_markup=telegram_markup)
             return True
+        return False
+    except TelegramForbiddenError as exc:
+        user.reminder_delivery_blocked_at = datetime.utcnow()
+        user.reminder_delivery_error = str(exc)[:1000]
+        logger.warning("Telegram reminders disabled: bot blocked by user user_id=%s", user.id)
         return False
     except MaxApiError as exc:
         if _is_terminal_max_delivery_error(exc):
