@@ -18,6 +18,7 @@ from app.services.chat import (
     save_message,
     delete_inactivity_notifications,
 )
+from app.services.chat_crm_sync import schedule_incoming_user_message_crm_sync
 from app.services.crm_background import schedule_crm_sync
 from app.services.users import get_staff
 from app.utils import full_name, h, username_text
@@ -216,7 +217,16 @@ async def _relay_message(client, event, settings, session, user: User) -> bool:
                 except Exception:
                     logger.exception('Failed to forward pending MAX chat attachment to user_id=%s', target)
         await _send(client, chat_id=event.chat_id, text='Сообщение сохранено. Менеджер подключится, как только освободится.', keyboard=keyboards.chat_end_menu())
-    case = await latest_open_case(session, user.id)
-    if case:
-        schedule_crm_sync(settings, case.id, user.id, 'manager_message_sent', {'note': saved[:500]})
+    if event.text and event.text.strip():
+        case = await latest_open_case(session, user.id)
+        schedule_incoming_user_message_crm_sync(
+            settings,
+            platform="max",
+            user=user,
+            case_id=case.id if case else None,
+            text=event.text,
+            chat_session_id=chat.id,
+            external_message_id=event.message_id or None,
+            message_datetime=None,
+        )
     return True

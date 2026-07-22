@@ -40,6 +40,7 @@ DEDUPED_EVENTS = {
     "payment_created",
     "payment_paid",
     "documents_delivered",
+    "user_message_received",
 }
 
 
@@ -56,6 +57,9 @@ def crm_event_dedupe_key(case_id: int | None, event_type: str, payload: dict | N
         stable["payment"] = payload.get("payment") or payload.get("label") or payload.get("note")
     elif event_type in {"preview_generated", "documents_delivered", "user_started_bot"}:
         stable["case"] = case_id
+    elif event_type == "user_message_received":
+        stable["platform"] = payload.get("platform")
+        stable["external_message_id"] = payload.get("external_message_id")
     else:
         stable["payload"] = payload
     return json.dumps(stable, ensure_ascii=False, sort_keys=True, default=str)
@@ -770,7 +774,16 @@ class AmoCrmService:
                 .limit(1)
             )
             if existing.scalar_one_or_none() is not None:
-                logger.info("Skip duplicate CRM event case_id=%s event=%s key=%s", case.id, event_type, dedupe_key)
+                if event_type == "user_message_received":
+                    logger.info(
+                        "CRM sync skipped event=%s reason=duplicate case_id=%s platform=%s external_message_id=%s",
+                        event_type,
+                        case.id,
+                        payload.get("platform"),
+                        payload.get("external_message_id"),
+                    )
+                else:
+                    logger.info("Skip duplicate CRM event case_id=%s event=%s key=%s", case.id, event_type, dedupe_key)
                 return
 
         if not self.is_enabled():

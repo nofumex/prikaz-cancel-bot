@@ -90,6 +90,14 @@ async def run_crm_sync_job(
                 raise
             except Exception as exc:
                 last_error = _safe_error(exc)
+                if event_type == "user_message_received":
+                    logger.exception(
+                        "CRM sync failed event=%s case_id=%s platform=%s external_message_id=%s",
+                        event_type,
+                        case_id,
+                        (payload or {}).get("platform"),
+                        (payload or {}).get("external_message_id"),
+                    )
                 if attempt < attempts:
                     await asyncio.sleep(max(0, settings.crm_sync_retry_base_seconds) * attempt)
     duration_ms = int((time.monotonic() - start) * 1000)

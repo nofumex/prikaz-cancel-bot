@@ -7,8 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.keyboards.common import chat_end_menu, connect_chat_keyboard, main_menu, manager_panel
 from app.models import User
-from app.services.crm_background import schedule_crm_sync
 from app.services.cases import latest_open_case
+from app.services.chat_crm_sync import schedule_incoming_user_message_crm_sync
+from app.services.crm_background import schedule_crm_sync
 from app.services.chat import (
     close_session,
     connect_manager,
@@ -171,3 +172,15 @@ async def relay_chat_message(message: Message, bot: Bot, session: AsyncSession, 
         await bot.send_message(chat.manager.telegram_id, f"{full_name(current_user)} ({username_text(current_user)}):\n{h(message.text)}", reply_markup=manager_panel())
     else:
         await message.answer("Сообщение сохранено. Менеджер подключится, как только освободится.", reply_markup=chat_end_menu())
+    case = await latest_open_case(session, current_user.id)
+    schedule_incoming_user_message_crm_sync(
+        settings,
+        platform="telegram",
+        user=current_user,
+        case_id=case.id if case else None,
+        text=message.text,
+        chat_session_id=chat.id,
+        external_message_id=f"{message.chat.id}:{message.message_id}",
+        message_datetime=message.date,
+        is_bot=bool(message.from_user and message.from_user.is_bot),
+    )
