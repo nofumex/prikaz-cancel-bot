@@ -92,7 +92,14 @@ async def _clear_state(session, event: IncomingEvent) -> None:
 def _missing_order_labels(missing: list[str]) -> list[str]:
     labels: list[str] = []
     for field in missing:
-        if field == "case_number_or_uid":
+        if field == "not_court_order":
+            labels.append("документ не распознан как судебный приказ")
+        elif field == "ocr_insufficient":
+            labels.append("текст судебного приказа")
+        elif field.startswith("missing_render:"):
+            render_field = f"render_{field.split(':', 1)[1]}"
+            labels.append(FIELD_LABELS.get(render_field, "обязательное поле заявления"))
+        elif field == "case_number_or_uid":
             labels.append("номер дела или УИД")
         elif field == "state_duty_or_total_amount":
             labels.append("госпошлина или итоговая сумма")
@@ -1118,7 +1125,19 @@ async def _generate_documents(client: MaxBotClient, event: IncomingEvent, sessio
     case.instruction_path = str(instruction)
     case.status = CaseStatus.PREVIEW_READY.value
     await session.commit()
-    schedule_crm_sync(settings, case.id, user.id, "preview_generated", {"note": "MAX: preview сформирован"})
+    schedule_crm_sync(
+        settings,
+        case.id,
+        user.id,
+        "preview_generated",
+        {
+            "note": "MAX: preview сформирован",
+            "files": [
+                {"path": case.full_doc_path or "", "caption": "Полный DOCX"},
+                {"path": case.preview_pdf_path or case.preview_doc_path or "", "caption": "Preview PDF"},
+            ],
+        },
+    )
     preview_file = preview_pdf or preview_docx
     if not payments_enabled():
         if preview_file:
