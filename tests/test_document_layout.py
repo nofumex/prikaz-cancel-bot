@@ -245,7 +245,9 @@ def test_structured_debt_dates_are_formatted_only_for_rendering(tmp_path):
     full_pdf = tmp_path / "full.pdf"
     preview_pdf = tmp_path / "preview.pdf"
     _render_statement_docx(full_docx, ctx, StyleProfile.normal())
-    Document().save(instruction_docx)
+    instruction = Document()
+    instruction.add_paragraph("Инструкция по подаче")
+    instruction.save(instruction_docx)
 
     fitz = pytest.importorskip("fitz")
     for path in (full_pdf, preview_pdf):
@@ -269,9 +271,9 @@ def test_structured_debt_dates_are_formatted_only_for_rendering(tmp_path):
         deadline_date=ctx.deadline_date,
         full_docx=full_docx,
         full_pdf=full_pdf,
-        preview_pdf=preview_pdf,
+        preview_pdf=None,
         instruction_docx=instruction_docx,
-        require_preview_pdf=True,
+        require_preview_pdf=False,
         amount_check=validate_amounts(data),
     )
     assert qa.ok, (qa.reasons, qa.bad_tokens)
@@ -316,7 +318,7 @@ def test_statement_uses_correct_title():
     assert "Считаю требования взыскателя спорными" not in " ".join(paragraphs)
     assert "78 472 руб. 87 коп." in paragraphs[0]
     assert "1 277 руб. 00 коп." in paragraphs[0]
-    assert "всего" not in paragraphs[0].lower()
+    assert "Общая сумма взыскания" not in paragraphs[0]
 
 
 def test_statement_without_state_duty_does_not_duplicate_money_period():

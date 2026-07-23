@@ -5,7 +5,7 @@ from datetime import date
 from app.enums import CaseStatus
 from app.services.cases import set_received_date
 from app.services.crm_background import schedule_crm_sync
-from app.utils import parse_russian_date
+from app.utils import parse_russian_date, parse_structured_date
 
 DATE_PARSE_ERROR = 'Не удалось понять дату. Введите дату в формате ДД.ММ.ГГГГ, например 10.07.2026'
 
@@ -31,7 +31,7 @@ def validate_received_date(case, raw: str | None, *, today: date | None = None) 
         import json
 
         try:
-            order_date = parse_russian_date((json.loads(extracted) or {}).get('order_date'))
+            order_date = parse_structured_date((json.loads(extracted) or {}).get('order_date'))
         except (TypeError, ValueError):
             order_date = None
     if order_date and received < order_date:

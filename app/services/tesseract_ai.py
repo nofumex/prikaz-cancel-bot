@@ -29,9 +29,8 @@ from app.services.legal_data import (
     make_short_name,
     money_to_decimal,
     normalize_address_text,
-    parse_russian_date,
 )
-from app.utils import ensure_dir
+from app.utils import ensure_dir, parse_structured_date
 
 _TESSERACT_LANE = asyncio.Lock()
 PIPELINE_VERSION = "tesseract-text-v3"
@@ -802,7 +801,7 @@ def _normalize_debt_period(value: str) -> str:
     matches = re.findall(r"(?<!\d)(\d{1,2}[./]\d{1,2}[./]\d{2,4})(?!\d)", value)
     if len(matches) != 2:
         return ""
-    parsed = [parse_russian_date(item) for item in matches]
+    parsed = [parse_structured_date(item) for item in matches]
     if any(item is None for item in parsed):
         return ""
     return f"с {parsed[0].strftime('%d.%m.%Y')} по {parsed[1].strftime('%d.%m.%Y')}"
@@ -828,7 +827,7 @@ def _order_date_from_ocr(text: str) -> str:
     match = re.search(rf"\b\d{{1,2}}\s+(?:{months})\s+\d{{4}}\s*г?\.?​?", text, re.IGNORECASE)
     if not match:
         return ""
-    parsed = parse_russian_date(match.group(0).replace("г.", "").replace("г", "").strip())
+    parsed = parse_structured_date(match.group(0).replace("г.", "").replace("г", "").strip())
     return parsed.strftime("%d.%m.%Y") if parsed else ""
 
 
@@ -844,7 +843,7 @@ def _format_ok(field_name: str, value: str) -> bool:
             and re.fullmatch(r"[0-9A-Za-zА-Яа-яЁё_/-]+", value)
         )
     if field_name == "order_date":
-        return parse_russian_date(value) is not None and bool(re.search(r"\d{4}", value))
+        return parse_structured_date(value) is not None and bool(re.search(r"\d{4}", value))
     if field_name == "debt_period":
         return bool(_normalize_debt_period(value))
     if field_name in {"debt_amount", "interest", "penalty", "state_duty", "total_amount"}:
@@ -862,7 +861,7 @@ def _normalized_value(field_name: str, extracted: str, proposed: str) -> str:
     if field_name == "uid":
         return clean_uid(extracted)
     if field_name == "order_date":
-        parsed = parse_russian_date(extracted)
+        parsed = parse_structured_date(extracted)
         return parsed.strftime("%d.%m.%Y") if parsed else ""
     if field_name == "debt_period":
         return _normalize_debt_period(extracted)
@@ -1505,10 +1504,10 @@ def _simple_extraction_data(payload: dict[str, Any], ocr: TesseractOcrResult) ->
     values["debtor_name_raw"] = values["debtor_full_name"]
     values["debtor_short_name"] = make_short_name(values["debtor_full_name"])
 
-    parsed_date = parse_russian_date(values["order_date"])
+    parsed_date = parse_structured_date(values["order_date"])
     if not parsed_date:
         fallback_order_date = _order_date_from_ocr(ocr.text)
-        parsed_date = parse_russian_date(fallback_order_date)
+        parsed_date = parse_structured_date(fallback_order_date)
     if parsed_date:
         values["order_date"] = parsed_date.strftime("%d.%m.%Y")
     values["debt_period"] = _normalize_debt_period(values["debt_period"])

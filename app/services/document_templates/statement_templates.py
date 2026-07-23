@@ -4,24 +4,14 @@ import re
 from dataclasses import dataclass
 from datetime import date
 
+from app.services.document_render_contract import (
+    MONTHS_GENITIVE,
+    date_long_text,
+    dates_long_in_text,
+    select_creditor_address_for_render,
+)
 from app.services.legal_data import clean_case_number, clean_uid, is_deadline_missed, keep_house_number_together, normalize_address_text
 from app.services.name_normalizer import make_short_name
-from app.utils import parse_russian_date
-
-MONTHS_GENITIVE = [
-    "января",
-    "февраля",
-    "марта",
-    "апреля",
-    "мая",
-    "июня",
-    "июля",
-    "августа",
-    "сентября",
-    "октября",
-    "ноября",
-    "декабря",
-]
 
 
 @dataclass(frozen=True)
@@ -44,22 +34,6 @@ def _required(data: dict, key: str) -> str:
 
 def _optional(data: dict, key: str) -> str:
     return str(data.get(key) or "").strip()
-
-
-def date_long_text(raw: str | date) -> str:
-    parsed = raw if isinstance(raw, date) else parse_russian_date(raw)
-    if not parsed:
-        return raw
-    return f"{parsed.day} {MONTHS_GENITIVE[parsed.month - 1]} {parsed.year} года"
-
-
-def dates_long_in_text(raw: str) -> str:
-    """Format standalone structured dates while preserving surrounding legal text."""
-    return re.sub(
-        r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[./]\d{1,2}[./]\d{4})\b",
-        lambda match: date_long_text(match.group(0)),
-        raw,
-    )
 
 
 def signature_date_text(document_date: date) -> str:
@@ -129,7 +103,7 @@ def build_header_lines(ctx: StatementContext) -> list[str]:
     if debtor_address:
         lines.append(f"адрес: {normalize_address_line(debtor_address)}")
     lines.extend(["", "Взыскатель:", _required(data, "creditor_name")])
-    creditor_address = _optional(data, "creditor_address")
+    _, creditor_address = select_creditor_address_for_render(data)
     if creditor_address:
         lines.append(normalize_creditor_address(creditor_address))
     case_number = clean_case_number(_optional(data, "case_number"))
@@ -156,6 +130,7 @@ def _case_identifier_short(data: dict) -> str:
 
 def _contract_inline(value: str) -> str:
     value = dates_long_in_text(re.sub(r"\s+", " ", value).strip(" ,.;"))
+    value = re.sub(r"\bзаключ[её]нный\b", "заключённому", value, flags=re.IGNORECASE)
     lower = value.lower()
     if lower.startswith("по "):
         return value[3:].strip()
@@ -200,7 +175,9 @@ def _period_inline(value: str) -> str:
 
 def _money_body_phrase(data: dict) -> str:
     state_duty_raw = _optional(data, "state_duty")
-    state_duty = state_duty_raw.rstrip(".") if state_duty_raw else ""
+    state_duty = state_duty_raw if state_duty_raw else ""
+    interest = _optional(data, "interest")
+    penalty = _optional(data, "penalty")
     debt = _required(data, "debt_amount").rstrip(".") + ("." if state_duty else "")
     total = _optional(data, "total_amount").rstrip(".")
     contract = _structured_debt_basis_inline(data)
@@ -215,8 +192,14 @@ def _money_body_phrase(data: dict) -> str:
         base = f"{base} {' '.join(fragments)}"
     base = f"{base} в размере {debt}"
     base = re.sub(r"по договор №", "по договору №", base)
+    if interest:
+        base = f"{base}, процентов в размере {interest}"
+    if penalty:
+        base = f"{base}, неустойки в размере {penalty}"
     if state_duty:
         base = f"{base}, а также расходов по оплате государственной пошлины в размере {state_duty}"
+    if total and _optional(data, "amount_render_mode") == "explicit_total":
+        base = f"{base}. Общая сумма взыскания составляет {total}"
     return base
 
 

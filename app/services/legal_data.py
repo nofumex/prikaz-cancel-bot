@@ -12,7 +12,7 @@ from app.services.name_normalizer import (
     make_short_name,
     normalize_person_name_from_ocr,
 )
-from app.utils import parse_russian_date
+from app.utils import parse_russian_date, parse_structured_date
 
 
 BAD_DOCUMENT_TOKENS = [
@@ -541,7 +541,10 @@ def normalize_order_data(data: dict) -> dict:
             normalized.get("judge_name") or normalized.get("judge"),
         ))
     if normalized.get("debt_contract"):
-        normalized.update(structured_debt_basis_facts(normalized["debt_contract"]))
+        derived_basis = structured_debt_basis_facts(normalized["debt_contract"])
+        for key, value in derived_basis.items():
+            if value and not normalized.get(key):
+                normalized[key] = value
     for key in ("debt_amount", "state_duty", "total_amount"):
         if normalized.get(key):
             normalized[key] = clean_money_text(normalized[key])
@@ -556,7 +559,7 @@ def normalize_order_data(data: dict) -> dict:
         if inferred_state > 0:
             normalized["state_duty"] = format_money_rub_kop(inferred_state)
     for key in ("order_date",):
-        parsed = parse_russian_date(normalized.get(key))
+        parsed = parse_structured_date(normalized.get(key))
         if parsed:
             normalized[key] = parsed.strftime("%d.%m.%Y")
     return normalized
@@ -650,11 +653,18 @@ OUTPUT_DOCUMENT_ONLY_BAD_TOKENS = {
 
 
 def bad_tokens_in_structured_text(text: str) -> list[str]:
-    """Keep rendered-document checks out of extraction and normalized data."""
-    return [
-        token for token in bad_tokens_in_text(text)
-        if token not in OUTPUT_DOCUMENT_ONLY_BAD_TOKENS
-    ]
+    """Structured data permits source prose; only objective sentinels block."""
+    found: list[str] = []
+    for name, pattern in (
+        ("MISSING", r"\bMISSING\b"),
+        ("None", r"\bNone\b"),
+        ("null", r"\bnull\b"),
+        ("template_braces", r"\{\{|\}\}"),
+        ("question_placeholder", r"\?{4,}"),
+    ):
+        if re.search(pattern, text, re.IGNORECASE):
+            found.append(name)
+    return found
 
 
 def bad_tokens_in_preview_text(text: str) -> list[str]:
@@ -715,6 +725,8 @@ class AmountValidationResult:
 def validate_amounts(data: dict) -> AmountValidationResult:
     normalized = normalize_order_data(data)
     debt = money_to_decimal(normalized.get("debt_amount"))
+    interest = money_to_decimal(normalized.get("interest"))
+    penalty = money_to_decimal(normalized.get("penalty"))
     state_duty = money_to_decimal(normalized.get("state_duty"))
     total = money_to_decimal(normalized.get("total_amount"))
     errors: list[str] = []
@@ -726,7 +738,9 @@ def validate_amounts(data: dict) -> AmountValidationResult:
         errors.append("total_amount: не удалось распознать итоговую сумму")
     computed_total = None
     if debt is not None and state_duty is not None:
-        computed_total = (debt + state_duty).quantize(Decimal("0.01"))
+        computed_total = (
+            debt + (interest or Decimal("0")) + (penalty or Decimal("0")) + state_duty
+        ).quantize(Decimal("0.01"))
         if total is not None and abs(total - computed_total) > Decimal("0.01"):
             errors.append("amount_mismatch")
     return AmountValidationResult(

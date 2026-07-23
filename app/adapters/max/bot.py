@@ -37,7 +37,7 @@ from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaReceiptContactRequired
 from app.services.users import get_or_create_platform_user
 from app.texts import case_summary, help_text, manual_received_date_prompt_text, payment_text, profile_text, welcome_text
-from app.utils import ensure_dir, h, normalize_phone, normalize_receipt_contact, parse_russian_date
+from app.utils import ensure_dir, h, normalize_phone, normalize_receipt_contact, parse_russian_date, parse_structured_date
 
 DATE_PROMPT = received_date_prompt_text()
 
@@ -877,7 +877,7 @@ async def _handle_envelope_image(client: MaxBotClient, event: IncomingEvent, ses
     await _send(client, event, "✅ Конверт принят. Считываю дату и приказ, это может занять минуту.")
     try:
         envelope = await extract_envelope_date(settings, session, case_id=case.id, user_id=user.id, envelope_photo_path=str(path))
-        received = parse_russian_date(envelope.get("latest_date_normalized") or envelope.get("latest_date"))
+        received = parse_structured_date(envelope.get("latest_date_normalized") or envelope.get("latest_date"))
     except Exception:
         logger.exception("MAX envelope extraction failed")
         received = None

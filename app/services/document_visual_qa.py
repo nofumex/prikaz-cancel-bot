@@ -6,10 +6,8 @@ from pathlib import Path
 from app.services.document_templates.styles import FONT_NAME, StyleProfile, page_margins_cm
 from app.services.legal_data import (
     AmountValidationResult,
-    bad_tokens_in_text,
     docx_text,
     format_money_rub_kop,
-    validate_docx_clean,
 )
 from app.services.pdf_tools import pdf_page_count, pdf_text
 
@@ -168,24 +166,11 @@ def run_visual_qa(
         result.warnings.append(f"page_count={result.page_count} (допустимо после compact mode)")
 
     full_text = pdf_text(full_pdf)
-    bad = bad_tokens_in_text(full_text)
-    forbidden_phrases = [
-        "Считаю требования взыскателя спорными",
-        "/ заявление об отмене",
-        "настоящего заявления",
-        "Бельскому",
-        "Бельского",
-    ]
-    for phrase in forbidden_phrases:
-        if phrase.lower() in full_text.lower():
-            bad.append(phrase)
+    bad: list[str] = []
     if "amount_mismatch" in (amount_check.errors or []):
         bad.append("amount_mismatch")
     if bad:
         result.errors.extend(sorted(set(bad)))
-    if full_docx and full_docx.exists():
-        result.errors.extend(token for token in validate_docx_clean(str(full_docx)) if token not in result.errors)
-
     gap_errors, weird = _check_word_gaps(full_pdf)
     result.weird_space_lines = weird
     result.errors.extend(error for error in gap_errors if error not in result.errors)

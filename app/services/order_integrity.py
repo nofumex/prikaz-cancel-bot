@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.services.legal_data import clean_case_number, money_to_decimal, normalize_order_data
-from app.utils import parse_russian_date
+from app.utils import parse_structured_date
 
 
 # Fields that can change the legal meaning of the generated statement.  They are
@@ -111,7 +111,7 @@ def canonical_field_value(field: str, value: Any) -> str:
         parsed = money_to_decimal(value)
         return f"{parsed:.2f}" if parsed is not None else _canonical_text(value)
     if field == "order_date":
-        parsed = parse_russian_date(value)
+        parsed = parse_structured_date(value)
         return parsed.isoformat() if parsed else _canonical_text(value)
     if field == "case_number":
         text = clean_case_number(value)

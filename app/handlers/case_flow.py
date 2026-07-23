@@ -59,7 +59,7 @@ from app.services.received_date import received_date_prompt_text, save_received_
 from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaError, YooKassaReceiptContactRequired
 from app.texts import case_summary, manual_received_date_prompt_text, payment_text
-from app.utils import ensure_dir, h, normalize_phone, normalize_receipt_contact, parse_russian_date
+from app.utils import ensure_dir, h, normalize_phone, normalize_receipt_contact, parse_russian_date, parse_structured_date
 
 router = Router(name="case_flow")
 logger = logging.getLogger(__name__)
@@ -605,7 +605,7 @@ async def receive_envelope_photo(message: Message, bot: Bot, state: FSMContext, 
     await message.answer("✅ Конверт принят. Считываю самую позднюю дату штампа и данные приказа, это может занять минуту.")
     try:
         envelope = await extract_envelope_date(settings, session, case_id=case.id, user_id=current_user.id, envelope_photo_path=str(path))
-        received = parse_russian_date(envelope.get("latest_date_normalized") or envelope.get("latest_date"))
+        received = parse_structured_date(envelope.get("latest_date_normalized") or envelope.get("latest_date"))
         if not received:
             await state.set_state(CaseStates.waiting_manual_date)
             await message.answer(

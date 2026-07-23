@@ -34,7 +34,7 @@ from app.services.tesseract_ai import (
     extract_fast_tesseract_text,
     extract_order_data_from_tesseract_ai,
 )
-from app.utils import ensure_dir, parse_russian_date
+from app.utils import ensure_dir, parse_structured_date
 
 logger = logging.getLogger(__name__)
 
@@ -1137,7 +1137,7 @@ async def extract_envelope_date(
         await record_openai_usage(settings, session, case_id=case_id, user_id=user_id, operation="envelope_ocr", model=settings.vision_model, success=False, error_message=str(exc))
         raise
     await record_openai_usage(settings, session, case_id=case_id, user_id=user_id, operation="envelope_ocr", model=result.model, result=result, success=True)
-    latest = parse_russian_date(str(result.data.get("latest_date") or ""))
+    latest = parse_structured_date(str(result.data.get("latest_date") or ""))
     data = dict(result.data)
     data["latest_date_normalized"] = latest.isoformat() if latest else ""
     return data

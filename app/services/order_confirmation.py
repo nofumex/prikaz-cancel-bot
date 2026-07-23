@@ -94,8 +94,6 @@ def reduce_and_validate(data: dict[str, Any], received_date: date | None) -> Con
             updated[name] = value
         else:
             updated.pop(name, None)
-    if updated.get("creditor_legal_address"):
-        updated["creditor_address"] = updated["creditor_legal_address"]
     if updated.get("debtor_full_name"):
         # Compatibility alias is still sourced from the immutable provenance.
         debtor = provenance.get("debtor_full_name") or {}

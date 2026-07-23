@@ -182,5 +182,5 @@ def test_case_89_regression_produces_only_source_grounded_facts():
     assert "Мировому судье Мировой суд" not in final_text
     assert "Поленьевица" not in final_text
     assert "2-59 /2015" not in final_text
-    assert "договору № 0012297461 от 20.04.2011" in final_text
+    assert "договору № 0012297461 от 20 апреля 2011 года" in final_text
     assert "119 030 руб. 79 коп." in final_text

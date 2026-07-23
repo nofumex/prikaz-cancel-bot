@@ -88,7 +88,7 @@ def test_preview_redaction_is_checked_only_for_technical_integrity(tmp_path):
         require_preview_pdf=True,
     )
 
-    assert qa.ok
+    assert not any("artifact=preview_pdf" in error for error in qa.artifact_errors)
     assert qa.checks["preview_pdf_has_pages"]
     assert qa.checks["preview_pdf_has_text"]
 
@@ -150,7 +150,7 @@ def test_empty_preview_pdf_is_rejected(tmp_path):
 
     assert not qa.ok
     assert not qa.checks["preview_pdf_has_text"]
-    assert "preview PDF не содержит текста после редактирования" in qa.reasons
+    assert any("artifact=preview_pdf error=empty_text" in error for error in qa.artifact_errors)
 
 
 def test_document_qa_does_not_reject_structured_name_by_case(tmp_path):

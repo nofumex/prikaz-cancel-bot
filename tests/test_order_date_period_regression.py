@@ -1,10 +1,10 @@
 from app.services.legal_data import clean_text
 from app.services.tesseract_ai import _debt_period_from_ocr, _order_date_from_ocr
-from app.utils import parse_russian_date
+from app.utils import parse_structured_date
 
 
 def test_iso_order_date_from_ai_is_accepted():
-    assert parse_russian_date("2026-06-29").strftime("%d.%m.%Y") == "29.06.2026"
+    assert parse_structured_date("2026-06-29").strftime("%d.%m.%Y") == "29.06.2026"
 
 
 def test_debt_period_falls_back_to_tesseract_sentence():

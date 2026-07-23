@@ -407,6 +407,11 @@ def create_case_documents(
         "document_qa_ok": qa.ok,
         "document_qa_errors": qa.reasons,
         "document_qa_bad_tokens": qa.bad_tokens,
+        "document_qa_missing_fields": qa.missing_fields,
+        "document_qa_integrity_errors": qa.integrity_errors,
+        "document_qa_output_format_errors": qa.output_format_errors,
+        "document_qa_artifact_errors": qa.artifact_errors,
+        "document_qa_warnings": qa.warnings,
         "visual_qa_ok": visual_qa.ok,
         "visual_qa_errors": visual_qa.errors,
         "visual_qa_warnings": visual_qa.warnings,
@@ -417,7 +422,7 @@ def create_case_documents(
         "amounts": visual_qa.amounts,
     }
     if not qa.ok:
-        raise ValueError("Документ не прошел QA: " + "; ".join(qa.reasons or qa.bad_tokens))
+        raise ValueError("Документ не прошел QA: " + "; ".join(qa.blocking_errors))
     if not visual_qa.ok:
         raise ValueError("Документ не прошел visual QA: " + "; ".join(visual_qa.errors))
 

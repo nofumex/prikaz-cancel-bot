@@ -75,12 +75,6 @@ def parse_russian_date(raw: str | None) -> date | None:
             return date(year, month, day)
         except ValueError:
             return None
-    iso = re.fullmatch(r'(\d{4})-(\d{1,2})-(\d{1,2})', text)
-    if iso:
-        try:
-            return date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
-        except ValueError:
-            return None
     months = {
         "января": 1,
         "февраля": 2,
@@ -95,7 +89,7 @@ def parse_russian_date(raw: str | None) -> date | None:
         "ноября": 11,
         "декабря": 12,
     }
-    for fmt in ("%d.%m.%Y", "%d-%m-%Y", "%Y-%m-%d"):
+    for fmt in ("%d.%m.%Y", "%d-%m-%Y"):
         try:
             return datetime.strptime(text, fmt).date()
         except ValueError:
@@ -104,6 +98,18 @@ def parse_russian_date(raw: str | None) -> date | None:
     if match and match.group(2) in months:
         return date(int(match.group(3)), months[match.group(2)], int(match.group(1)))
     return None
+
+
+def parse_structured_date(raw: str | None) -> date | None:
+    """Parse internal extracted dates, including ISO; user input stays Russian-only."""
+    if raw:
+        iso = re.fullmatch(r"\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*", raw)
+        if iso:
+            try:
+                return date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+            except ValueError:
+                return None
+    return parse_russian_date(raw)
 
 
 def deadline_from_received(received: date) -> date:

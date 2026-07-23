@@ -21,9 +21,7 @@ from app.services.legal_data import (
     format_money_rub_kop,
     is_deadline_missed,
     missing_order_fields,
-    normalize_debtor_name_fields,
     normalize_order_data,
-    suggest_nominative_full_name,
     validate_before_generation,
 )
 from app.services.llm import review_generated_document
@@ -441,7 +439,5 @@ def extraction_preview(
         lines.append(f"<b>Срок подачи:</b> до {deadline_date.strftime('%d.%m.%Y')}")
     if missing:
         lines.extend(["", "⚠️ <b>Не распознано:</b> " + ", ".join(h(FIELD_LABELS.get(field, field)) for field in missing)])
-    suggested = suggest_nominative_full_name(data.get("debtor_full_name")) if include_name_debug else None
-    if suggested and suggested != data.get("debtor_full_name"):
-        lines.append(f"💡 Возможно, ФИО в заявлении лучше указать: <b>{h(suggested)}</b>")
+    del include_name_debug  # Structured debtor_full_name is the source of truth.
     return "\n".join(lines)
