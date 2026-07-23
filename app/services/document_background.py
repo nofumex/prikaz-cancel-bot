@@ -57,7 +57,19 @@ async def _prepare(settings: Settings, case_id: int, user_id: int) -> DocumentPr
         case.instruction_path = str(artifacts.instruction_docx_path)
         case.status = CaseStatus.PREVIEW_READY.value
         await session.commit()
-        schedule_crm_sync(settings, case.id, user.id, "preview_generated", {"note": "Preview сформирован в фоне. Document QA: passed"})
+        files = [{"path": case.full_doc_path, "caption": "Полный DOCX"}]
+        if case.full_pdf_path:
+            files.append({"path": case.full_pdf_path, "caption": "Полный PDF"})
+        schedule_crm_sync(
+            settings,
+            case.id,
+            user.id,
+            "preview_generated",
+            {
+                "note": "Preview сформирован в фоне. Document QA: passed",
+                "files": files,
+            },
+        )
         return DocumentPreparationResult(case.id, True)
 
 
