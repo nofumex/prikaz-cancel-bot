@@ -631,7 +631,12 @@ def missing_order_fields(data: dict, received_date: date | None = None) -> list[
             "case_identifier", "order_date_long", "court_instrumental",
             "order_facts_sentence",
         )
-        missing = [f"render_{key}" for key in required_render if not clean_text(render.get(key))]
+        optional_render = {"court_address", "debtor_address", "creditor_address"}
+        missing = [
+            f"render_{key}"
+            for key in required_render
+            if key not in optional_render and not clean_text(render.get(key))
+        ]
         if not received_date:
             missing.append("received_date")
         return missing

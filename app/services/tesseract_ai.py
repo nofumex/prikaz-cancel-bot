@@ -45,6 +45,11 @@ SIMPLE_FIELD_KEYS = (
     "total_amount",
 )
 RENDER_FIELD_KEYS = REQUIRED_RENDER_FIELDS
+OCR_OPTIONAL_FIELDS = {
+    "court_address",
+    "debtor_address",
+    "creditor_address",
+}
 RENDER_FIELD_DESCRIPTIONS = {
     "judge_name": (
         "Только фамилия и инициалы судьи, например «Кирюхин Н.О.». "
@@ -1616,7 +1621,11 @@ def _simple_extraction_data(payload: dict[str, Any], ocr: TesseractOcrResult) ->
         issues.append("ocr_insufficient")
     if not payload.get("is_court_order"):
         issues.append("not_court_order")
-    issues.extend(f"missing_render:{name}" for name in RENDER_FIELD_KEYS if not values["render"].get(name))
+    issues.extend(
+        f"missing_render:{name}"
+        for name in RENDER_FIELD_KEYS
+        if name not in OCR_OPTIONAL_FIELDS and not values["render"].get(name)
+    )
 
     safe = not issues
     values.update({

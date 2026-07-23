@@ -56,6 +56,11 @@ REQUIRED_RENDER_FIELDS = (
     "case_identifier", "order_date_long", "court_instrumental",
     "order_facts_sentence",
 )
+CONDITIONAL_HEADER_FIELDS = {
+    "court_address",
+    "debtor_address",
+    "creditor_address",
+}
 
 
 def render_value(data: dict, name: str) -> str:
@@ -66,7 +71,11 @@ def render_value(data: dict, name: str) -> str:
 
 
 def missing_render_fields(data: dict) -> list[str]:
-    return [name for name in REQUIRED_RENDER_FIELDS if not render_value(data, name)]
+    return [
+        name
+        for name in REQUIRED_RENDER_FIELDS
+        if name not in CONDITIONAL_HEADER_FIELDS and not render_value(data, name)
+    ]
 
 
 @dataclass(frozen=True)
@@ -145,21 +154,20 @@ def normalize_creditor_address(address: str) -> str:
 def build_header_lines(ctx: StatementContext) -> list[str]:
     data = ctx.data
     if not missing_render_fields(data):
-        return [
-            render_value(data, "court_addressee"),
-            render_value(data, "court_address"),
-            f"Судья: {render_value(data, 'judge_name')}",
-            "",
-            "Должник:",
-            render_value(data, "debtor_full_name"),
-            render_value(data, "debtor_address"),
-            "",
-            "Взыскатель:",
-            render_value(data, "creditor_name"),
-            render_value(data, "creditor_address"),
-            "",
-            render_value(data, "case_identifier"),
-        ]
+        lines = [render_value(data, "court_addressee")]
+        court_address = render_value(data, "court_address")
+        if court_address:
+            lines.append(court_address)
+        lines.extend([f"Судья: {render_value(data, 'judge_name')}", "", "Должник:", render_value(data, "debtor_full_name")])
+        debtor_address = render_value(data, "debtor_address")
+        if debtor_address:
+            lines.append(debtor_address)
+        lines.extend(["", "Взыскатель:", render_value(data, "creditor_name")])
+        creditor_address = render_value(data, "creditor_address")
+        if creditor_address:
+            lines.append(creditor_address)
+        lines.extend(["", render_value(data, "case_identifier")])
+        return lines
     debtor_full_name = _required(data, "debtor_full_name")
     court_addressee = data.get("court_addressee") or normalize_court_addressee(_required(data, "court_name"))
     lines = [court_addressee]
