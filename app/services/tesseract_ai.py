@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.services.image_preprocessing import assess_order_image, prepare_order_ocr_image
+from app.services.document_templates.statement_templates import LLM_STATEMENT_TEMPLATE, REQUIRED_RENDER_FIELDS
 from app.services.legal_data import (
     clean_case_number,
     clean_money_text,
@@ -37,35 +38,69 @@ PIPELINE_VERSION = "tesseract-text-v3"
 CROP_PREPROCESSING_VERSION = "field-crop-v2"
 
 SIMPLE_FIELD_KEYS = (
-    "court_name", "court_address", "judge", "debtor_name_printed",
-    "debtor_name_nominative", "debtor_address", "creditor_name",
+    "court_name", "court_address", "judge", "debtor_name_raw",
+    "debtor_full_name", "debtor_address", "creditor_name",
     "creditor_address", "case_number", "uid", "order_date",
     "debt_contract", "debt_period", "debt_amount", "state_duty",
     "total_amount",
 )
+RENDER_FIELD_KEYS = REQUIRED_RENDER_FIELDS
 
 SIMPLE_ORDER_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
+        "document_kind": {"type": "string", "enum": ["court_order", "other", "unclear"]},
         "is_court_order": {"type": "boolean"},
-        **{name: {"type": "string"} for name in SIMPLE_FIELD_KEYS},
+        "document_type_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "document_type_reason": {"type": "string"},
+        "facts": {
+            "type": "object", "additionalProperties": False,
+            "properties": {name: {"type": "string"} for name in SIMPLE_FIELD_KEYS},
+            "required": list(SIMPLE_FIELD_KEYS),
+        },
+        "render": {
+            "type": "object", "additionalProperties": False,
+            "properties": {name: {"type": "string"} for name in RENDER_FIELD_KEYS},
+            "required": list(RENDER_FIELD_KEYS),
+        },
     },
-    "required": ["is_court_order", *SIMPLE_FIELD_KEYS],
+    "required": [
+        "document_kind", "is_court_order", "document_type_confidence",
+        "document_type_reason", "facts", "render",
+    ],
 }
 
-SIMPLE_ORDER_INSTRUCTIONS = """
-You receive the complete Tesseract OCR text of a Russian court order. Extract it
-into the fixed JSON object for an application cancelling that court order.
-Never invent values. debtor_name_printed preserves the printed grammatical
-case; debtor_name_nominative contains the same full name in nominative case.
-judge is surname and initials only. uid is allowed only immediately after an
-explicit UID label; taxpayer IDs, debtor identifiers, case numbers and
-proceeding numbers are never UID. If no explicit UID exists, return an empty
-uid. Return one postal address per party without bank or tax details. Normalize
-dates, the debt period, and Russian ruble/kopeck amounts. If total_amount is not
-printed but debt_amount and state_duty are unambiguous, calculate their sum.
-Return empty strings for genuinely absent values and JSON only.
+SIMPLE_ORDER_INSTRUCTIONS = f"""
+На входе полный OCR-текст уже подтвержденного российского судебного приказа.
+Перед тобой также находится полный фактический шаблон заявления, используемый
+renderer-ом, с названиями и расположением всех динамических ячеек:
+
+--- ШАБЛОН ---
+{LLM_STATEMENT_TEMPLATE}
+--- КОНЕЦ ШАБЛОНА ---
+
+Верни один JSON по строгой схеме. Сначала извлеки чистые факты в facts, затем на
+основании тех же фактов и контекста placeholders подготовь render для прямой
+вставки в шаблон. facts и render относятся к одному документу и не противоречат
+друг другу. facts содержит только факты из приказа, без склонения ради шаблона,
+литературной переработки и готовых предложений. debtor_name_raw сохраняет
+напечатанную форму, debtor_full_name — ФИО в именительном падеже, judge —
+фамилию и инициалы. uid допустим только после явной метки УИД.
+
+render содержит окончательные строки: выбери нужные падежи, предлоги и
+грамматику. Даты пиши словами: «3 июля 2026 года». court_addressee — готовая
+строка «Мировому судье ...»; court_instrumental — «мировым судьёй ...»;
+judge_name — значение строки «Судья: ...»; debtor_short_name — готовая подпись;
+case_identifier — готовая строка с номером дела/производства и УИД, если он
+есть; order_facts_sentence — полностью готовое первое предложение с датой,
+судом, номером, взыскателем, договором, периодом и суммами. Python вставит
+render без изменений.
+
+Не добавляй в render паспорт, дату рождения, ИНН, КПП, ОГРН, БИК, счета и иные
+ненужные реквизиты. Не выдумывай и не заполняй догадкой. Если значение
+отсутствует или не читается, верни пустую строку. Никаких None, null, MISSING,
+комментариев или пояснений внутри значений.
 """.strip()
 
 ORDER_FIELD_KEYS = (
@@ -1498,11 +1533,14 @@ def _llm_input(ocr: TesseractOcrResult) -> str:
 
 
 def _simple_extraction_data(payload: dict[str, Any], ocr: TesseractOcrResult) -> tuple[dict[str, Any], list[str]]:
-    values = {name: clean_text(payload.get(name)) for name in SIMPLE_FIELD_KEYS}
-    values["debtor_full_name"] = values.pop("debtor_name_nominative") or values["debtor_name_printed"]
-    printed_name = values.pop("debtor_name_printed")
-    values["debtor_name_raw"] = values["debtor_full_name"]
-    values["debtor_short_name"] = make_short_name(values["debtor_full_name"])
+    facts = payload.get("facts") if isinstance(payload.get("facts"), dict) else {}
+    render = payload.get("render") if isinstance(payload.get("render"), dict) else {}
+    values = {name: clean_text(facts.get(name)) for name in SIMPLE_FIELD_KEYS}
+    values["debtor_name_raw"] = values["debtor_name_raw"] or values["debtor_full_name"]
+    printed_name = values["debtor_name_raw"]
+    values["judge_name"] = values.get("judge", "")
+    values["render"] = {name: clean_text(render.get(name)) for name in RENDER_FIELD_KEYS}
+    values.update({f"render_{name}": values["render"][name] for name in RENDER_FIELD_KEYS})
 
     parsed_date = parse_structured_date(values["order_date"])
     if not parsed_date:
@@ -1527,17 +1565,7 @@ def _simple_extraction_data(payload: dict[str, Any], ocr: TesseractOcrResult) ->
         issues.append("ocr_insufficient")
     if not payload.get("is_court_order"):
         issues.append("not_court_order")
-    required = (
-        "court_name", "court_address", "judge", "debtor_full_name",
-        "debtor_address", "creditor_name", "creditor_address", "case_number",
-        "order_date", "debt_contract", "debt_amount",
-        "state_duty", "total_amount",
-    )
-    issues.extend(f"missing:{name}" for name in required if not values.get(name))
-    amounts = {name: money_to_decimal(values[name]) for name in ("debt_amount", "state_duty", "total_amount")}
-    if all(amount is not None for amount in amounts.values()):
-        if amounts["debt_amount"] + amounts["state_duty"] != amounts["total_amount"]:
-            issues.append("arithmetic")
+    issues.extend(f"missing_render:{name}" for name in RENDER_FIELD_KEYS if not values["render"].get(name))
 
     safe = not issues
     values.update({

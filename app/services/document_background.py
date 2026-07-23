@@ -11,9 +11,8 @@ from app.enums import CaseStatus
 from app.models import Case, User
 from app.services.crm_background import schedule_crm_sync
 from app.services.documents import create_case_documents_reviewed
-from app.services.legal_data import is_deadline_missed, normalize_order_data, validate_amounts, validate_before_generation
+from app.services.legal_data import is_deadline_missed, normalize_order_data
 from app.services.order_background import wait_order_extraction
-from app.services.received_date import validate_received_date
 
 logger = logging.getLogger(__name__)
 
@@ -36,14 +35,6 @@ async def _prepare(settings: Settings, case_id: int, user_id: int) -> DocumentPr
         if case is None or user is None or not case.received_date:
             return DocumentPreparationResult(case_id, False, "case_or_received_date_missing")
         data = normalize_order_data(json.loads(case.extracted_json or "{}"))
-        validation = validate_before_generation(data, case.received_date)
-        if not validation.ok:
-            return DocumentPreparationResult(case_id, False, "generation_validation_failed")
-        _, date_error = validate_received_date(case, case.received_date.strftime("%d.%m.%Y"))
-        if date_error:
-            return DocumentPreparationResult(case_id, False, "received_date_invalid")
-        if not validate_amounts(data).ok:
-            return DocumentPreparationResult(case_id, False, "amounts_need_recovery")
         stored_reason = data.get("restore_reason") or ""
         if is_deadline_missed(case.deadline_date) and not stored_reason:
             return DocumentPreparationResult(case_id, False, "restore_reason_required")

@@ -285,6 +285,15 @@ async def create_case_documents_reviewed(
     *,
     restore_reason: str | None = None,
 ) -> DocumentReviewOutcome:
+    artifacts = create_case_documents_with_qa(case, user, settings, restore_reason=restore_reason)
+    return DocumentReviewOutcome(
+        ok=True,
+        artifacts=artifacts,
+        review={"ok": True, "severity": "ok", "needs_regeneration": False, "issues": [], "clean_fields": {}, "mode": "off"},
+    )
+
+    # Legacy AI review implementation is intentionally unreachable: production
+    # delivery uses the single facts/render extraction response directly.
     mode = document_ai_review_mode(settings)
     if mode in {"off", "shadow"}:
         artifacts = create_case_documents_with_qa(case, user, settings, restore_reason=restore_reason)

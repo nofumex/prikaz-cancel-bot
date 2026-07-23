@@ -38,7 +38,7 @@ from app.utils import ensure_dir, parse_structured_date
 
 logger = logging.getLogger(__name__)
 
-ORDER_EXTRACTION_CACHE_VERSION = "v7-tesseract-text"
+ORDER_EXTRACTION_CACHE_VERSION = "v8-tesseract-render"
 _order_cache_locks: dict[str, asyncio.Lock] = {}
 
 

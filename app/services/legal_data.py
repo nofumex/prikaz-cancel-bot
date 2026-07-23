@@ -62,6 +62,18 @@ FIELD_LABELS = {
     "received_date": "Дата получения",
     "case_number_or_uid": "Номер дела или УИД",
     "state_duty_or_total_amount": "Госпошлина или итоговая сумма",
+    "render_court_addressee": "Адресат суда",
+    "render_court_address": "Адрес суда",
+    "render_judge_name": "Имя судьи",
+    "render_debtor_full_name": "ФИО должника",
+    "render_debtor_short_name": "Имя должника для подписи",
+    "render_debtor_address": "Адрес должника",
+    "render_creditor_name": "Взыскатель",
+    "render_creditor_address": "Адрес взыскателя",
+    "render_case_identifier": "Номер дела или производства",
+    "render_order_date_long": "Дата судебного приказа",
+    "render_court_instrumental": "Наименование суда",
+    "render_order_facts_sentence": "Сведения о судебном приказе",
 }
 
 REQUIRED_FIELDS = [
@@ -611,6 +623,18 @@ def is_deadline_missed(deadline: date | None, today: date | None = None) -> bool
 
 def missing_order_fields(data: dict, received_date: date | None = None) -> list[str]:
     normalized = normalize_order_data(data)
+    render = normalized.get("render")
+    if isinstance(render, dict):
+        required_render = (
+            "court_addressee", "court_address", "judge_name", "debtor_full_name",
+            "debtor_short_name", "debtor_address", "creditor_name", "creditor_address",
+            "case_identifier", "order_date_long", "court_instrumental",
+            "order_facts_sentence",
+        )
+        missing = [f"render_{key}" for key in required_render if not clean_text(render.get(key))]
+        if not received_date:
+            missing.append("received_date")
+        return missing
     missing = [key for key in REQUIRED_FIELDS if not normalized.get(key)]
     if not (normalized.get("case_number") or normalized.get("uid")):
         missing.append("case_number_or_uid")

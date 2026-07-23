@@ -13,6 +13,61 @@ from app.services.document_render_contract import (
 from app.services.legal_data import clean_case_number, clean_uid, is_deadline_missed, keep_house_number_together, normalize_address_text
 from app.services.name_normalizer import make_short_name
 
+LLM_STATEMENT_TEMPLATE = """{{render_court_addressee}}
+{{render_court_address}}
+Судья: {{render_judge_name}}
+
+Должник:
+{{render_debtor_full_name}}
+{{render_debtor_address}}
+
+Взыскатель:
+{{render_creditor_name}}
+{{render_creditor_address}}
+
+{{render_case_identifier}}
+
+ВОЗРАЖЕНИЯ
+относительно исполнения судебного приказа
+
+{{render_order_facts_sentence}}
+
+Копия судебного приказа получена мной {{received_date_long}}.
+
+С судебным приказом не согласен, возражаю относительно его исполнения в полном объеме.
+
+На основании изложенного, руководствуясь статьями 128, 129 ГПК РФ,
+
+ПРОШУ:
+
+Отменить судебный приказ от {{render_order_date_long}},
+вынесенный {{render_court_instrumental}}
+по делу/производству {{render_case_identifier}}.
+
+Приложения:
+Копия судебного приказа от {{render_order_date_long}}.
+
+{{signature_date_long}}    _____________    /{{render_debtor_short_name}}/
+"""
+
+REQUIRED_RENDER_FIELDS = (
+    "court_addressee", "court_address", "judge_name", "debtor_full_name",
+    "debtor_short_name", "debtor_address", "creditor_name", "creditor_address",
+    "case_identifier", "order_date_long", "court_instrumental",
+    "order_facts_sentence",
+)
+
+
+def render_value(data: dict, name: str) -> str:
+    render = data.get("render")
+    if isinstance(render, dict):
+        return str(render.get(name) or "").strip()
+    return str(data.get(f"render_{name}") or "").strip()
+
+
+def missing_render_fields(data: dict) -> list[str]:
+    return [name for name in REQUIRED_RENDER_FIELDS if not render_value(data, name)]
+
 
 @dataclass(frozen=True)
 class StatementContext:
@@ -89,6 +144,22 @@ def normalize_creditor_address(address: str) -> str:
 
 def build_header_lines(ctx: StatementContext) -> list[str]:
     data = ctx.data
+    if not missing_render_fields(data):
+        return [
+            render_value(data, "court_addressee"),
+            render_value(data, "court_address"),
+            f"Судья: {render_value(data, 'judge_name')}",
+            "",
+            "Должник:",
+            render_value(data, "debtor_full_name"),
+            render_value(data, "debtor_address"),
+            "",
+            "Взыскатель:",
+            render_value(data, "creditor_name"),
+            render_value(data, "creditor_address"),
+            "",
+            render_value(data, "case_identifier"),
+        ]
     debtor_full_name = _required(data, "debtor_full_name")
     court_addressee = data.get("court_addressee") or normalize_court_addressee(_required(data, "court_name"))
     lines = [court_addressee]
@@ -261,6 +332,21 @@ def statement_restore_term(ctx: StatementContext) -> list[str]:
 
 
 def build_statement_paragraphs(ctx: StatementContext) -> list[str]:
+    if not missing_render_fields(ctx.data):
+        data = ctx.data
+        return [
+            render_value(data, "order_facts_sentence"),
+            f"Копия судебного приказа получена мной {date_long_text(ctx.received_date)}.",
+            "С судебным приказом не согласен, возражаю относительно его исполнения в полном объеме.",
+            "На основании изложенного, руководствуясь статьями 128, 129 ГПК РФ,",
+            "ПРОШУ:",
+            (
+                f"1. Отменить судебный приказ от {render_value(data, 'order_date_long')}, "
+                f"вынесенный {render_value(data, 'court_instrumental')} "
+                f"по делу/производству {render_value(data, 'case_identifier')}."
+            ),
+            "2. Направить мне копию определения об отмене судебного приказа по адресу, указанному в настоящих возражениях.",
+        ]
     restore_term = is_deadline_missed(ctx.deadline_date, ctx.document_date)
     if restore_term:
         return statement_restore_term(ctx)
@@ -269,7 +355,7 @@ def build_statement_paragraphs(ctx: StatementContext) -> list[str]:
 
 def build_attachments(ctx: StatementContext) -> list[str]:
     data = ctx.data
-    order_date = date_long_text(_required(data, "order_date"))
+    order_date = render_value(data, "order_date_long") or date_long_text(_required(data, "order_date"))
     items = [f"Копия судебного приказа от {order_date}."]
     if ctx.has_envelope:
         items.append("Копия почтового конверта, подтверждающего дату получения судебного приказа.")
@@ -284,6 +370,9 @@ def build_attachments(ctx: StatementContext) -> list[str]:
 
 
 def debtor_short_name(data: dict) -> str:
+    rendered = render_value(data, "debtor_short_name")
+    if rendered:
+        return rendered
     short = _optional(data, "debtor_short_name")
     if short:
         return short
