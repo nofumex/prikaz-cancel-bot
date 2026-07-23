@@ -53,6 +53,15 @@ def date_long_text(raw: str | date) -> str:
     return f"{parsed.day} {MONTHS_GENITIVE[parsed.month - 1]} {parsed.year} года"
 
 
+def dates_long_in_text(raw: str) -> str:
+    """Format standalone structured dates while preserving surrounding legal text."""
+    return re.sub(
+        r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[./]\d{1,2}[./]\d{4})\b",
+        lambda match: date_long_text(match.group(0)),
+        raw,
+    )
+
+
 def signature_date_text(document_date: date) -> str:
     return date_long_text(document_date)
 
@@ -146,7 +155,7 @@ def _case_identifier_short(data: dict) -> str:
 
 
 def _contract_inline(value: str) -> str:
-    value = re.sub(r"\s+", " ", value).strip(" ,.;")
+    value = dates_long_in_text(re.sub(r"\s+", " ", value).strip(" ,.;"))
     lower = value.lower()
     if lower.startswith("по "):
         return value[3:].strip()
@@ -176,12 +185,12 @@ def _structured_debt_basis_inline(data: dict) -> str:
     else:
         phrase = f"договору № {number}"
     if basis_date:
-        phrase += f" от {basis_date}"
+        phrase += f" от {date_long_text(basis_date)}"
     return phrase
 
 
 def _period_inline(value: str) -> str:
-    value = re.sub(r"\s+", " ", value).strip(" ,.;")
+    value = dates_long_in_text(re.sub(r"\s+", " ", value).strip(" ,.;"))
     value = re.sub(r"^(за\s+период|период|за)\s+", "", value, flags=re.IGNORECASE).strip(" ,.;")
     value = re.sub(r"\s+г$", " г.", value, flags=re.IGNORECASE)
     if not value.startswith("с "):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -213,6 +214,82 @@ def test_creditor_uses_genitive_or_neutral_phrase():
     ctx = StatementContext(data=genitive, received_date=date(2026, 6, 19),
                            deadline_date=date(2026, 6, 29), document_date=date(2026, 6, 24))
     assert "в пользу АО «Почта Банка»" in build_statement_paragraphs(ctx)[0]
+
+
+def test_structured_debt_dates_are_formatted_only_for_rendering(tmp_path):
+    from app.services.legal_data import docx_text
+
+    data = normalize_order_data({
+        **BELSKY_DATA,
+        "order_date": "2026-07-03",
+        "debt_basis_number": "123456",
+        "debt_basis_date": "2026-02-04",
+        "debt_basis_type": "credit_agreement",
+        "debt_period": "с 2026-02-04 по 2026-03-05",
+    })
+    # normalize_order_data derives debt basis from debt_contract; these are the
+    # authoritative structured values supplied to StatementContext.
+    data.update({
+        "debt_basis_number": "123456",
+        "debt_basis_date": "2026-02-04",
+        "debt_basis_type": "credit_agreement",
+    })
+    ctx = StatementContext(
+        data=data,
+        received_date=date(2026, 7, 10),
+        deadline_date=date(2099, 7, 20),
+        document_date=date(2026, 7, 11),
+    )
+    full_docx = tmp_path / "dates.docx"
+    instruction_docx = tmp_path / "instruction.docx"
+    full_pdf = tmp_path / "full.pdf"
+    preview_pdf = tmp_path / "preview.pdf"
+    _render_statement_docx(full_docx, ctx, StyleProfile.normal())
+    Document().save(instruction_docx)
+
+    fitz = pytest.importorskip("fitz")
+    for path in (full_pdf, preview_pdf):
+        pdf = fitz.open()
+        page = pdf.new_page()
+        page.insert_text((72, 72), "rendered document")
+        pdf.save(path)
+        pdf.close()
+
+    text = docx_text(str(full_docx))
+    assert "от 4 февраля 2026 года" in text
+    assert "с 4 февраля 2026 года по 5 марта 2026 года" in text
+    assert "3 июля 2026 года" in text
+    assert "2026-02-04" not in text
+    assert "2026-07-03" not in text
+    assert data["debt_basis_date"] == "2026-02-04"
+
+    qa = run_document_qa(
+        data=data,
+        received_date=ctx.received_date,
+        deadline_date=ctx.deadline_date,
+        full_docx=full_docx,
+        full_pdf=full_pdf,
+        preview_pdf=preview_pdf,
+        instruction_docx=instruction_docx,
+        require_preview_pdf=True,
+        amount_check=validate_amounts(data),
+    )
+    assert qa.ok, (qa.reasons, qa.bad_tokens)
+
+
+def test_known_date_fields_are_not_interpolated_raw_in_templates():
+    import app.services.document_templates.renderer as renderer_module
+    import app.services.document_templates.statement_templates as templates_module
+
+    templates_source = inspect.getsource(templates_module)
+    renderer_source = inspect.getsource(renderer_module)
+
+    assert 'f" от {basis_date}"' not in templates_source
+    assert "ctx.received_date.strftime" not in templates_source
+    assert "ctx.deadline_date.strftime" not in templates_source
+    assert "case.deadline_date.strftime" not in renderer_source
+    assert 'date_long_text(_required(data, "order_date"))' in templates_source
+    assert "date_long_text(basis_date)" in templates_source
 
 
 def test_attachments_with_manual_date():
