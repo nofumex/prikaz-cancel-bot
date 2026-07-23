@@ -30,10 +30,6 @@ BAD_DOCUMENT_TOKENS = [
     "Дата подачи: поставить от руки",
     "Подпись: поставить от руки",
     "Считаю требования взыскателя спорными",
-    "Бельскому Владимиру Геннадьевичу",
-    "Бельского Владимира Геннадьевича",
-    "Бельскому В.Г.",
-    "Бельского В.Г.",
     "№5",
     "в городе Москва",
     "по договор №",
@@ -64,7 +60,6 @@ FIELD_LABELS = {
     "state_duty": "Госпошлина",
     "total_amount": "Итого ко взысканию",
     "received_date": "Дата получения",
-    "debtor_full_name:dative": "ФИО должника в именительном падеже",
     "case_number_or_uid": "Номер дела или УИД",
     "state_duty_or_total_amount": "Госпошлина или итоговая сумма",
 }
@@ -391,14 +386,14 @@ def normalize_debtor_name_fields(data: dict) -> tuple[dict, NameNormalizationRes
         llm_confidence = float(data.get("debtor_full_name_confidence") or 0)
     except (TypeError, ValueError):
         llm_confidence = 0.0
-    if llm_name and llm_confidence >= 0.85 and not is_probably_not_nominative(llm_name):
+    if llm_name:
         updated["debtor_full_name"] = llm_name
         result = NameNormalizationResult(
             raw=raw or llm_name,
             normalized=llm_name,
             short_name=make_short_name(llm_name),
             confidence=llm_confidence,
-            warnings=["llm_nominative"],
+            warnings=["structured_llm_value"],
         )
     elif result.confidence >= 0.85:
         updated["debtor_full_name"] = result.normalized
@@ -515,7 +510,8 @@ def normalize_order_data(data: dict) -> dict:
             normalized["debtor_short_name"] = make_short_name(full_name)
         court_name = clean_text(normalized.get("court_name"))
         if court_name and not normalized.get("court_addressee"):
-            normalized["court_addressee"] = f"Мировому судье {court_name}"
+            normalized["court_addressee"] = normalize_court_forms(court_name)["court_addressee"]
+        normalized["judge_name"] = clean_text(normalized.get("judge_name") or normalized.get("judge"))
         return normalized
     normalized = {str(key): clean_text(value) for key, value in (data or {}).items()}
     case_number, uid = normalize_case_identifiers(normalized.get("case_number"), normalized.get("uid"))
@@ -540,7 +536,10 @@ def normalize_order_data(data: dict) -> dict:
         normalized["court_name"] = court_forms["court_name"]
         normalized["court_addressee"] = court_forms["court_addressee"]
         normalized["court_instrumental"] = court_forms["court_instrumental"]
-        normalized.update(structured_court_facts(normalized["court_name"], normalized.get("judge")))
+        normalized.update(structured_court_facts(
+            normalized["court_name"],
+            normalized.get("judge_name") or normalized.get("judge"),
+        ))
     if normalized.get("debt_contract"):
         normalized.update(structured_debt_basis_facts(normalized["debt_contract"]))
     for key in ("debt_amount", "state_duty", "total_amount"):
@@ -634,6 +633,12 @@ def bad_tokens_in_text(text: str) -> list[str]:
     for token in BAD_DOCUMENT_TOKENS:
         if token.lower() in lower:
             found.append(token)
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", text):
+        found.append("iso_date")
+    if re.search(r"Копия судебного приказа от\s+\d{1,2}\.\d{1,2}\.\d{4}", text, re.IGNORECASE):
+        found.append("numeric_attachment_date")
+    if re.search(r"Мировому судье\s+(?:Мировой судья|Судебный участок)", text, re.IGNORECASE):
+        found.append("duplicated_court_addressee")
     return found
 
 
@@ -743,13 +748,4 @@ def validate_before_generation(data: dict, received_date: date | None) -> Valida
         if clean_text((data or {}).get("_document_values_locked")) == "1" and key in {"court_address", "debtor_address", "creditor_address"}:
             found = [token for token in found if token != "в городе Москва"]
         bad.extend(found)
-    normalized = normalize_order_data(data)
-    debtor = normalized.get("debtor_full_name", "")
-    confidence = 0.0
-    try:
-        confidence = float(normalized.get("debtor_name_confidence") or 0)
-    except (TypeError, ValueError):
-        confidence = 0.0
-    if clean_text(normalized.get("_document_values_locked")) != "1" and looks_like_dative_full_name(debtor) and confidence < 0.85:
-        bad.append("debtor_full_name:dative")
     return ValidationResult(ok=not missing and not bad, missing=missing, bad_tokens=sorted(set(bad)))

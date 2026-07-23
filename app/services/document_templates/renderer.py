@@ -346,7 +346,7 @@ def create_case_documents(
             raise ValueError(f"Не удалось создать PDF: {exc}") from exc
 
     page_count = pdf_page_count(full_pdf_path) if full_pdf_path else None
-    if not restore_term and page_count and page_count > 1:
+    if page_count and page_count > 1:
         profile = StyleProfile.compact()
         _render_statement_docx(full_docx, ctx, profile)
         _strip_missing_placeholder(full_docx)
@@ -374,7 +374,7 @@ def create_case_documents(
     if settings.enable_pdf_preview and full_pdf_path is not None:
         preview_pdf_path = create_preview_pdf(full_pdf_path, preview_pdf)
 
-    deadline = case.deadline_date.strftime("%d.%m.%Y") if case.deadline_date else "уточняется"
+    deadline = date_long_text(case.deadline_date) if case.deadline_date else "уточняется"
     _build_instruction_doc(instruction_path, deadline=deadline, restore_term=restore_term)
 
     from app.services.documents import extraction_preview

@@ -46,15 +46,15 @@ def _optional(data: dict, key: str) -> str:
     return str(data.get(key) or "").strip()
 
 
-def date_long_text(raw: str) -> str:
-    parsed = parse_russian_date(raw)
+def date_long_text(raw: str | date) -> str:
+    parsed = raw if isinstance(raw, date) else parse_russian_date(raw)
     if not parsed:
         return raw
     return f"{parsed.day} {MONTHS_GENITIVE[parsed.month - 1]} {parsed.year} года"
 
 
 def signature_date_text(document_date: date) -> str:
-    return f"«{document_date.day:02d}» {MONTHS_GENITIVE[document_date.month - 1]} {document_date.year} г."
+    return date_long_text(document_date)
 
 
 def normalize_address_line(text: str) -> str:
@@ -108,21 +108,18 @@ def build_header_lines(ctx: StatementContext) -> list[str]:
     data = ctx.data
     debtor_full_name = _required(data, "debtor_full_name")
     court_addressee = data.get("court_addressee") or normalize_court_addressee(_required(data, "court_name"))
-    lines = [
-        court_addressee,
-        "",
-        "Должник:",
-        debtor_full_name,
-        "",
-        "Взыскатель:",
-        _required(data, "creditor_name"),
-    ]
+    lines = [court_addressee]
     court_address = _optional(data, "court_address")
     if court_address:
-        lines.insert(1, normalize_court_address_line(court_address))
+        lines.append(normalize_court_address_line(court_address))
+    judge_name = _optional(data, "judge_name") or _optional(data, "judge")
+    if judge_name:
+        lines.append(f"Судья: {judge_name}")
+    lines.extend(["", "Должник:", debtor_full_name])
     debtor_address = _optional(data, "debtor_address")
     if debtor_address:
-        lines.insert(5, f"адрес: {normalize_address_line(debtor_address)}")
+        lines.append(f"адрес: {normalize_address_line(debtor_address)}")
+    lines.extend(["", "Взыскатель:", _required(data, "creditor_name")])
     creditor_address = _optional(data, "creditor_address")
     if creditor_address:
         lines.append(normalize_creditor_address(creditor_address))
@@ -220,10 +217,16 @@ def statement_in_time(ctx: StatementContext) -> list[str]:
     case_identifier = _case_identifier_short(data)
     order_date_long = date_long_text(_required(data, "order_date"))
     creditor = _required(data, "creditor_name")
-    received_long = date_long_text(ctx.received_date.strftime("%d.%m.%Y"))
+    creditor_genitive = _optional(data, "creditor_name_genitive")
+    creditor_phrase = (
+        f"в пользу {creditor_genitive}"
+        if creditor_genitive
+        else f"по заявлению взыскателя — {creditor}"
+    )
+    received_long = date_long_text(ctx.received_date)
     money_part = _money_body_phrase(data)
     return [
-        f"{order_date_long} {court_body} вынесен судебный приказ по делу/производству {case_identifier}, о взыскании с меня в пользу {creditor} {money_part}.",
+        f"{order_date_long} {court_body} вынесен судебный приказ по делу/производству {case_identifier}, о взыскании с меня {creditor_phrase} {money_part}.",
         f"Копия судебного приказа получена мной {received_long}.",
         "С судебным приказом не согласен, возражаю относительно его исполнения в полном объеме.",
         "Настоящие возражения подаются в установленный законом срок.",
@@ -242,11 +245,17 @@ def statement_restore_term(ctx: StatementContext) -> list[str]:
     case_identifier = _case_identifier_short(data)
     order_date_long = date_long_text(_required(data, "order_date"))
     creditor = _required(data, "creditor_name")
-    received_long = date_long_text(ctx.received_date.strftime("%d.%m.%Y"))
-    deadline = ctx.deadline_date.strftime("%d.%m.%Y") if ctx.deadline_date else ""
+    creditor_genitive = _optional(data, "creditor_name_genitive")
+    creditor_phrase = (
+        f"в пользу {creditor_genitive}"
+        if creditor_genitive
+        else f"по заявлению взыскателя — {creditor}"
+    )
+    received_long = date_long_text(ctx.received_date)
+    deadline = date_long_text(ctx.deadline_date) if ctx.deadline_date else ""
     money_part = _money_body_phrase(data)
     return [
-        f"{order_date_long} {court_body} вынесен судебный приказ по делу/производству {case_identifier}, о взыскании с меня в пользу {creditor} {money_part}.",
+        f"{order_date_long} {court_body} вынесен судебный приказ по делу/производству {case_identifier}, о взыскании с меня {creditor_phrase} {money_part}.",
         f"Копия судебного приказа получена мной {received_long}.",
         f"Десятидневный срок подачи возражений истек {deadline}. {ctx.restore_reason}",
         "Прошу восстановить пропущенный процессуальный срок.",
@@ -268,7 +277,7 @@ def build_statement_paragraphs(ctx: StatementContext) -> list[str]:
 
 def build_attachments(ctx: StatementContext) -> list[str]:
     data = ctx.data
-    order_date = _required(data, "order_date")
+    order_date = date_long_text(_required(data, "order_date"))
     items = [f"Копия судебного приказа от {order_date}."]
     if ctx.has_envelope:
         items.append("Копия почтового конверта, подтверждающего дату получения судебного приказа.")

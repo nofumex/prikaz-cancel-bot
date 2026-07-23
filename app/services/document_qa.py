@@ -11,8 +11,8 @@ from app.services.legal_data import (
     VALIDATION_SKIP_KEYS,
     bad_tokens_in_preview_text,
     bad_tokens_in_text,
+    docx_text,
     is_deadline_missed,
-    looks_like_dative_full_name,
     missing_order_fields,
     normalize_order_data,
     validate_docx_clean,
@@ -67,12 +67,6 @@ def run_document_qa(
     if missing:
         reasons.append("не заполнены обязательные поля: " + ", ".join(FIELD_LABELS.get(f, f) for f in missing))
 
-    debtor = normalized.get("debtor_full_name", "")
-    raw_debtor = str(data.get("debtor_full_name") or data.get("debtor_name_raw") or "")
-    if looks_like_dative_full_name(raw_debtor) or looks_like_dative_full_name(debtor):
-        bad.append("debtor_full_name:dative")
-        reasons.append("подозрительное ФИО должника")
-
     if is_deadline_missed(deadline_date) and not restore_reason:
         reasons.append("срок пропущен, но не указана причина восстановления")
 
@@ -81,7 +75,21 @@ def run_document_qa(
         reasons.append("amount_mismatch: суммы долга, госпошлины и итога не согласованы")
 
     if full_docx and full_docx.exists():
-        bad.extend(validate_docx_clean(str(full_docx)))
+        full_text = docx_text(str(full_docx))
+        bad.extend(bad_tokens_in_text(full_text))
+        judge_name = str(normalized.get("judge_name") or normalized.get("judge") or "").strip()
+        if judge_name and judge_name not in full_text:
+            bad.append("missing_judge_name")
+        for field_name in ("debtor_address", "creditor_address"):
+            value = str(normalized.get(field_name) or "").strip()
+            expected = value.split(";", 1)[0].strip()
+            comparable_text = full_text.replace("\xa0", " ")
+            if expected and expected.replace("\xa0", " ") not in comparable_text:
+                bad.append(f"missing_{field_name}")
+        creditor = str(normalized.get("creditor_name") or "").strip()
+        creditor_genitive = str(normalized.get("creditor_name_genitive") or "").strip()
+        if creditor and not creditor_genitive and f"в пользу {creditor}" in full_text:
+            bad.append("creditor_name_used_without_genitive")
     if full_pdf and full_pdf.exists():
         try:
             bad.extend(bad_tokens_in_text(pdf_text(full_pdf)))

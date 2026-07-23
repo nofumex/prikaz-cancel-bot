@@ -29,7 +29,7 @@ def test_document_qa_rejects_bad_tokens(tmp_path):
     assert "old_statement_title" in qa.bad_tokens
 
 
-def test_document_qa_rejects_dative_name(tmp_path):
+def test_document_qa_does_not_reject_structured_name_by_case(tmp_path):
     docx = tmp_path / "dative.docx"
     _write_docx(docx, "Бельскому Владимиру Геннадьевичу")
     qa = run_document_qa(
@@ -42,7 +42,7 @@ def test_document_qa_rejects_dative_name(tmp_path):
         instruction_docx=None,
         require_preview_pdf=False,
     )
-    assert not qa.ok
+    assert "debtor_full_name:dative" not in qa.bad_tokens
 
 
 def test_document_qa_rejects_debtor_header_ocr_noise(tmp_path):
@@ -87,7 +87,7 @@ def test_document_qa_accepts_feminine_nominative_name(tmp_path):
     assert "debtor_full_name:dative" not in qa.bad_tokens
 
 
-def test_document_qa_rejects_feminine_dative_name(tmp_path):
+def test_document_qa_does_not_infer_feminine_name_case(tmp_path):
     name = "\u041a\u0430\u0440\u0438\u043c\u043e\u0432\u043e\u0439 \u0415\u043b\u0435\u043d\u0435 \u0412\u0438\u043a\u0442\u043e\u0440\u043e\u0432\u043d\u0435"
     docx = tmp_path / "female_dat.docx"
     _write_docx(docx, name)
@@ -101,4 +101,20 @@ def test_document_qa_rejects_feminine_dative_name(tmp_path):
         instruction_docx=docx,
         require_preview_pdf=False,
     )
-    assert "debtor_full_name:dative" in qa.bad_tokens
+    assert "debtor_full_name:dative" not in qa.bad_tokens
+
+
+def test_document_qa_accepts_sizykh_name(tmp_path):
+    name = "Сизых Инна Юрьевна"
+    docx = tmp_path / "sizykh.docx"
+    _write_docx(docx, name)
+    qa = run_document_qa(
+        data={"court_name": "x", "debtor_full_name": name, "creditor_name": "x",
+              "case_number": "1", "order_date": "01.01.2020",
+              "debt_amount": "1", "state_duty": "1"},
+        received_date=date(2026, 6, 19),
+        deadline_date=date(2026, 6, 29),
+        full_docx=docx, full_pdf=None, preview_pdf=None,
+        instruction_docx=docx, require_preview_pdf=False,
+    )
+    assert "debtor_full_name:dative" not in qa.bad_tokens

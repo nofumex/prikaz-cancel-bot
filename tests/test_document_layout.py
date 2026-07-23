@@ -10,7 +10,7 @@ from app.config import Settings
 from app.models import Case, User
 from app.services.document_qa import run_document_qa
 from app.services.document_templates.renderer import _render_statement_docx, create_case_documents
-from app.services.document_templates.statement_templates import StatementContext, build_attachments, build_header_lines, build_statement_paragraphs
+from app.services.document_templates.statement_templates import StatementContext, build_attachments, build_header_lines, build_statement_paragraphs, normalize_court_addressee
 from app.services.document_templates.styles import A4_HEIGHT, A4_WIDTH, MARGIN_LEFT, StyleProfile
 from app.services.document_visual_qa import run_visual_qa
 from app.services.legal_data import legal_deadline_from_received, normalize_order_data, validate_amounts
@@ -180,6 +180,39 @@ def test_attachments_with_envelope():
     items = build_attachments(ctx)
     assert any("конверта" in item for item in items)
     assert any("настоящих возражений" in item for item in items)
+    assert "Копия судебного приказа от 18 января 2021 года." in items
+
+
+@pytest.mark.parametrize("court_name", [
+    "Мировой судья судебного участка № 61 Тверской области",
+    "Судебный участок № 3 Сургутского судебного района",
+    "Судебный участок № 93 Лазаревского внутригородского района",
+])
+def test_court_addressee_has_single_grammatical_prefix(court_name):
+    result = normalize_court_addressee(court_name)
+    assert result.startswith("Мировому судье судебного участка")
+    assert "Мировому судье Мировой судья" not in result
+    assert "Мировому судье Судебный участок" not in result
+
+
+@pytest.mark.parametrize("judge_field", ["judge_name", "judge"])
+def test_header_outputs_canonical_or_legacy_judge(judge_field):
+    data = normalize_order_data({**BELSKY_DATA, judge_field: "Ларионова Е.Ф."})
+    ctx = StatementContext(data=data, received_date=date(2026, 6, 19),
+                           deadline_date=date(2026, 6, 29), document_date=date(2026, 6, 24))
+    assert "Судья: Ларионова Е.Ф." in build_header_lines(ctx)
+
+
+def test_creditor_uses_genitive_or_neutral_phrase():
+    base = normalize_order_data(BELSKY_DATA)
+    ctx = StatementContext(data=base, received_date=date(2026, 6, 19),
+                           deadline_date=date(2026, 6, 29), document_date=date(2026, 6, 24))
+    assert "по заявлению взыскателя — АО «Почта Банк»" in build_statement_paragraphs(ctx)[0]
+
+    genitive = {**base, "creditor_name_genitive": "АО «Почта Банка»"}
+    ctx = StatementContext(data=genitive, received_date=date(2026, 6, 19),
+                           deadline_date=date(2026, 6, 29), document_date=date(2026, 6, 24))
+    assert "в пользу АО «Почта Банка»" in build_statement_paragraphs(ctx)[0]
 
 
 def test_attachments_with_manual_date():
