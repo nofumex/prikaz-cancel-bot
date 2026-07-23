@@ -1086,8 +1086,16 @@ async def _generate_documents(client: MaxBotClient, event: IncomingEvent, sessio
         case.status = CaseStatus.NEEDS_REVIEW.value
         case.missing_fields = json.dumps(validation.missing, ensure_ascii=False)
         await session.commit()
-        await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})
-        await _send_order_rephoto_prompt(client, event, validation.missing, attempts=case.order_rephoto_attempts)
+        if validation.missing:
+            await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})
+            await _send_order_rephoto_prompt(client, event, validation.missing, attempts=case.order_rephoto_attempts)
+        else:
+            await _send(
+                client,
+                event,
+                "Документ не прошёл автоматическую QA-проверку: "
+                + ", ".join(validation.bad_tokens),
+            )
         return
     # Keep MAX and Telegram on the same amount-integrity path. The helper is
     # imported lazily to avoid coupling the adapter modules at import time.

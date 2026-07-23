@@ -111,17 +111,20 @@ def reduce_and_validate(data: dict[str, Any], received_date: date | None) -> Con
     unresolved = list(dict.fromkeys(unresolved))
     updated["_pipeline_status"] = "awaiting_user_confirmation"
     validation = validate_before_generation(updated, received_date)
-    missing = [FIELD_LABELS.get(item, item) for item in validation.missing if item != "received_date"] + list(validation.bad_tokens)
+    missing = [FIELD_LABELS.get(item, item) for item in validation.missing if item != "received_date"]
     if updated.get("_document_kind") != "court_order":
         missing.append("Документ не является судебным приказом")
     missing.extend(FIELD_LABELS.get(name, name) for name in unresolved)
     missing = list(dict.fromkeys(missing))
-    ready = not missing and not unresolved and updated.get("_document_kind") == "court_order"
+    ready = validation.ok and not missing and not unresolved and updated.get("_document_kind") == "court_order"
     updated["_pipeline_status"] = "ready" if ready else "awaiting_user_confirmation"
     # Re-run with the final status so callers cannot observe a provisional-ready result.
     final_validation = validate_before_generation(updated, received_date)
     ignored = {"received_date", "Подтверждение спорных полей"}
-    final_missing = list(dict.fromkeys([*missing, *(FIELD_LABELS.get(item, item) for item in final_validation.missing if item not in ignored), *final_validation.bad_tokens]))
+    final_missing = list(dict.fromkeys([
+        *missing,
+        *(FIELD_LABELS.get(item, item) for item in final_validation.missing if item not in ignored),
+    ]))
     return ConfirmationResult(updated, final_validation, tuple(final_missing), ready, next_confirmation(updated))
 
 

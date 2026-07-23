@@ -101,3 +101,15 @@ def test_disputed_mandatory_field_always_blocks_ready() -> None:
     assert not result.ready
     assert result.data["_pipeline_status"] == "awaiting_user_confirmation"
     assert result.next_step is None
+
+
+def test_qa_tokens_are_never_reported_as_missing_fields() -> None:
+    data = _data()
+    data["order_date"] = "2026-06-05"
+    data["_field_provenance"]["order_date"] = _record("order_date", "2026-06-05")
+
+    result = apply_confirmation_answer(data, "case_number", "02-1388/2026", date(2026, 6, 19))
+
+    assert "iso_date" in result.validation.bad_tokens
+    assert "iso_date" not in result.missing_fields
+    assert not result.ready

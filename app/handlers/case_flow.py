@@ -1069,14 +1069,20 @@ async def _generate_documents_flow(
     data = normalize_order_data(json.loads(case.extracted_json or "{}"))
     validation = validate_before_generation(data, case.received_date)
     if not validation.ok:
-        issues = list(validation.missing) + list(validation.bad_tokens)
-        case.missing_fields = json.dumps(issues, ensure_ascii=False)
+        missing = list(validation.missing)
+        case.missing_fields = json.dumps(missing, ensure_ascii=False)
         case.status = CaseStatus.NEEDS_REVIEW.value
         await session.commit()
-        if state is not None:
-            await state.update_data(case_id=case.id)
-            await state.set_state(CaseStates.waiting_order_rephoto)
-        await _send_order_rephoto_prompt(message, issues, attempts=case.order_rephoto_attempts)
+        if missing:
+            if state is not None:
+                await state.update_data(case_id=case.id)
+                await state.set_state(CaseStates.waiting_order_rephoto)
+            await _send_order_rephoto_prompt(message, missing, attempts=case.order_rephoto_attempts)
+        else:
+            await message.answer(
+                "Документ не прошёл автоматическую QA-проверку: "
+                + ", ".join(validation.bad_tokens)
+            )
         return False
     stored_reason = restore_reason or data.get("restore_reason") or ""
     if is_deadline_missed(case.deadline_date) and not stored_reason:
