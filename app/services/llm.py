@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 from difflib import SequenceMatcher
 import json
 import logging
@@ -37,30 +36,6 @@ from app.services.tesseract_ai import (
 from app.utils import ensure_dir, parse_structured_date
 
 logger = logging.getLogger(__name__)
-
-ORDER_EXTRACTION_CACHE_VERSION = "v8-tesseract-render"
-_order_cache_locks: dict[str, asyncio.Lock] = {}
-
-
-def _order_cache_path(order_photo_path: str) -> Path:
-    digest = hashlib.sha256(Path(order_photo_path).read_bytes()).hexdigest()
-    return ensure_dir("storage/ocr_cache") / f"order_{ORDER_EXTRACTION_CACHE_VERSION}_{digest}.json"
-
-
-def _read_order_cache(path: Path) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        data = payload.get("data") if isinstance(payload, dict) else None
-        return normalize_order_data(data) if isinstance(data, dict) else None
-    except (OSError, ValueError, TypeError):
-        return None
-
-
-def _write_order_cache(path: Path, data: dict[str, Any]) -> None:
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"version": ORDER_EXTRACTION_CACHE_VERSION, "data": data}, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
-
 
 DEFAULT_MODEL_PRICING = {
     "gpt-5.4-mini": {
@@ -693,25 +668,10 @@ async def extract_order_data(
     user_id: int | None,
     order_photo_path: str,
 ) -> dict[str, Any]:
-    cache_path = _order_cache_path(order_photo_path)
-    cached = _read_order_cache(cache_path)
-    if cached is not None:
-        return cached
-    lock = _order_cache_locks.setdefault(cache_path.name, asyncio.Lock())
-    try:
-        async with lock:
-            cached = _read_order_cache(cache_path)
-            if cached is not None:
-                return cached
-            data = await _extract_order_data_uncached(
-                settings, session, case_id=case_id, user_id=user_id, order_photo_path=order_photo_path
-            )
-            normalized = normalize_order_data(data)
-            _write_order_cache(cache_path, normalized)
-            return normalized
-    finally:
-        if _order_cache_locks.get(cache_path.name) is lock and not lock.locked():
-            _order_cache_locks.pop(cache_path.name, None)
+    data = await _extract_order_data_uncached(
+        settings, session, case_id=case_id, user_id=user_id, order_photo_path=order_photo_path
+    )
+    return normalize_order_data(data)
 
 
 async def _extract_order_data_tesseract_fast(

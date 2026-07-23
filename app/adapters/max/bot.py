@@ -24,7 +24,7 @@ from app.services.crm_background import schedule_crm_sync
 from app.services.document_delivery import deliver_documents_to_case_platform
 from app.services.documents import MANUAL_REVIEW_USER_TEXT, create_case_documents_reviewed, extraction_preview
 from app.services.document_background import start_document_preparation, wait_started_document_preparation
-from app.services.legal_data import FIELD_LABELS, is_deadline_missed, missing_order_fields, normalize_debtor_name_fields, normalize_order_data, suggest_nominative_full_name, validate_before_generation
+from app.services.legal_data import FIELD_LABELS, is_deadline_missed, missing_order_fields, normalize_debtor_name_fields, normalize_order_data, suggest_nominative_full_name
 from app.services.llm import extract_envelope_date, extract_order_data
 from app.services.order_background import start_order_extraction, wait_order_extraction
 from app.services.order_confirmation import (
@@ -98,8 +98,6 @@ def _missing_order_labels(missing: list[str]) -> list[str]:
             labels.append("госпошлина или итоговая сумма")
         elif field == "received_date":
             labels.append("дата получения")
-        elif field == "amount_mismatch":
-            labels.append("суммы задолженности не совпали")
         else:
             labels.append(FIELD_LABELS.get(field, field))
     return labels
@@ -1081,43 +1079,13 @@ async def _generate_documents(client: MaxBotClient, event: IncomingEvent, sessio
         await _set_state(session, event, STATE_RESTORE_REASON, {'case_id': case.id})
         await _send(client, event, 'Срок подачи уже пропущен. Выберите причину для восстановления срока.', keyboards.restore_reason_menu())
         return
-    validation = validate_before_generation(data, case.received_date)
-    if not validation.ok:
+    missing = missing_order_fields(data, case.received_date)
+    if missing:
         case.status = CaseStatus.NEEDS_REVIEW.value
-        case.missing_fields = json.dumps(validation.missing, ensure_ascii=False)
-        await session.commit()
-        if validation.missing:
-            await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})
-            await _send_order_rephoto_prompt(client, event, validation.missing, attempts=case.order_rephoto_attempts)
-        else:
-            await _send(
-                client,
-                event,
-                "Документ не прошёл автоматическую QA-проверку: "
-                + ", ".join(validation.bad_tokens),
-            )
-        return
-    # Keep MAX and Telegram on the same amount-integrity path. The helper is
-    # imported lazily to avoid coupling the adapter modules at import time.
-    from app.handlers.case_flow import _resolve_amount_mismatch
-
-    data, amount_check, _, _ = await _resolve_amount_mismatch(
-        settings,
-        session,
-        case,
-        user,
-        data,
-    )
-    if not amount_check.ok:
-        case.status = CaseStatus.NEEDS_REVIEW.value
+        case.missing_fields = json.dumps(missing, ensure_ascii=False)
         await session.commit()
         await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})
-        await _send(
-            client,
-            event,
-            "Суммы приказа требуют повторной проверки. Отправьте фото ещё раз или исправьте поля после оплаты.",
-            keyboards.order_rephoto_menu(),
-        )
+        await _send_order_rephoto_prompt(client, event, missing, attempts=case.order_rephoto_attempts)
         return
     try:
         review_outcome = await create_case_documents_reviewed(case, user, settings, session)

@@ -27,24 +27,15 @@ from app.services.cases import create_case, generated_case_for_user, generated_c
 from app.services.documents import MANUAL_REVIEW_USER_TEXT, create_case_documents_reviewed, extraction_preview
 from app.services.document_background import start_document_preparation, wait_started_document_preparation
 from app.services.app_settings import payments_enabled
-from app.services.amount_recovery import (
-    AmountRecoveryResult,
-    format_amount_mismatch_admin_report,
-    recover_amounts_from_mismatch,
-    save_amount_debug_snapshot,
-)
 from app.services.legal_data import (
     FIELD_LABELS,
-    AmountValidationResult,
     is_deadline_missed,
     missing_order_fields,
     normalize_debtor_name_fields,
     normalize_order_data,
     suggest_nominative_full_name,
-    validate_amounts,
-    validate_before_generation,
 )
-from app.services.llm import extract_envelope_date, extract_order_amounts, extract_order_data
+from app.services.llm import extract_envelope_date, extract_order_data
 from app.services.order_background import start_order_extraction, wait_order_extraction
 from app.services.order_confirmation import (
     apply_confirmation_answer,
@@ -112,8 +103,6 @@ def _missing_order_labels(missing: list[str]) -> list[str]:
             labels.append("госпошлина или итоговая сумма")
         elif field == "received_date":
             labels.append("дата получения")
-        elif field == "amount_mismatch":
-            labels.append("суммы задолженности не совпали")
         else:
             labels.append(FIELD_LABELS.get(field, field))
     return labels
@@ -978,82 +967,6 @@ async def _notify_admin_qa_failure(bot: Bot, settings: Settings, case: Case, rea
             logger.exception("Failed to notify admin %s", admin_id)
 
 
-async def _notify_admin_amount_warning(bot: Bot, settings: Settings, case: Case, recovery: AmountRecoveryResult) -> None:
-    text = (
-        f"⚠️ Заявка #{case.id}: суммы автоматически восстановлены ({recovery.recovery_method}).\n"
-        f"Было: {recovery.old_debt_amount}\n"
-        f"Стало: {recovery.new_debt_amount}"
-    )
-    for admin_id in settings.admin_ids:
-        try:
-            await bot.send_message(admin_id, text)
-        except Exception:
-            logger.exception("Failed to notify admin %s about amount recovery", admin_id)
-
-
-async def _resolve_amount_mismatch(
-    settings: Settings,
-    session: AsyncSession,
-    case: Case,
-    current_user: User,
-    data: dict,
-    *,
-    bot: Bot | None = None,
-    force_retry: bool = False,
-) -> tuple[dict, AmountValidationResult, AmountRecoveryResult | None, dict | None]:
-    amount_check = validate_amounts(data)
-    if amount_check.ok and not force_retry:
-        return data, amount_check, None, None
-
-    retry_amounts: dict | None = None
-    recovery: AmountRecoveryResult | None = None
-
-    if settings.amount_retry_on_mismatch and case.order_photo_path and ("amount_mismatch" in amount_check.errors or force_retry):
-        try:
-            retry_amounts = await extract_order_amounts(
-                settings,
-                session,
-                case_id=case.id,
-                user_id=current_user.id,
-                order_photo_path=case.order_photo_path,
-            )
-        except Exception:
-            logger.exception("Targeted amount OCR failed for case %s", case.id)
-
-    if settings.auto_recover_amount_mismatch:
-        recovery = recover_amounts_from_mismatch(
-            data,
-            retry_amounts,
-            min_confidence=settings.auto_recover_amount_min_confidence,
-            auto_recover=True,
-        )
-        if recovery.applied:
-            data = recovery.order_data
-            case.extracted_json = json.dumps(data, ensure_ascii=False)
-            if session is not None:
-                await session.commit()
-            amount_check = validate_amounts(data)
-            save_amount_debug_snapshot(
-                case.id,
-                {
-                    "amount_recovery_applied": True,
-                    "recovery_method": recovery.recovery_method,
-                    "qa_report": recovery.qa_report,
-                },
-            )
-            if bot:
-                await _notify_admin_amount_warning(bot, settings, case, recovery)
-            logger.warning(
-                "Amount recovery applied for case %s method=%s old=%s new=%s",
-                case.id,
-                recovery.recovery_method,
-                recovery.old_debt_amount,
-                recovery.new_debt_amount,
-            )
-
-    return data, amount_check, recovery, retry_amounts
-
-
 async def _generate_documents_flow(
     message: Message,
     session: AsyncSession,
@@ -1067,54 +980,21 @@ async def _generate_documents_flow(
     remove_phone_keyboard: bool = False,
 ) -> bool:
     data = normalize_order_data(json.loads(case.extracted_json or "{}"))
-    validation = validate_before_generation(data, case.received_date)
-    if not validation.ok:
-        missing = list(validation.missing)
+    missing = missing_order_fields(data, case.received_date)
+    if missing:
         case.missing_fields = json.dumps(missing, ensure_ascii=False)
         case.status = CaseStatus.NEEDS_REVIEW.value
         await session.commit()
-        if missing:
-            if state is not None:
-                await state.update_data(case_id=case.id)
-                await state.set_state(CaseStates.waiting_order_rephoto)
-            await _send_order_rephoto_prompt(message, missing, attempts=case.order_rephoto_attempts)
-        else:
-            await message.answer(
-                "Документ не прошёл автоматическую QA-проверку: "
-                + ", ".join(validation.bad_tokens)
-            )
+        if state is not None:
+            await state.update_data(case_id=case.id)
+            await state.set_state(CaseStates.waiting_order_rephoto)
+        await _send_order_rephoto_prompt(message, missing, attempts=case.order_rephoto_attempts)
         return False
     stored_reason = restore_reason or data.get("restore_reason") or ""
     if is_deadline_missed(case.deadline_date) and not stored_reason:
         await message.answer(
             "Срок подачи уже пропущен. Выберите причину, чтобы подготовить возражения с ходатайством о восстановлении срока.",
             reply_markup=restore_reason_menu(),
-        )
-        return False
-
-    data, amount_check, recovery, retry_amounts = await _resolve_amount_mismatch(
-        settings, session, case, current_user, data, bot=bot
-    )
-    if not amount_check.ok:
-        admin_report = format_amount_mismatch_admin_report(
-            case.id,
-            normalize_order_data(json.loads(case.extracted_json or "{}")),
-            retry_amounts,
-            amount_check,
-            recovery,
-        )
-        case.status = CaseStatus.NEEDS_REVIEW.value
-        await session.commit()
-        schedule_crm_sync(settings, case.id, current_user.id, "document_qa_failed", {"note": admin_report[:65000]})
-        if bot:
-            await _notify_admin_qa_failure(bot, settings, case, admin_report)
-        if state is not None:
-            await state.update_data(case_id=case.id)
-            await state.set_state(CaseStates.waiting_order_rephoto)
-        await message.answer(
-            "Не удалось автоматически согласовать суммы по приказу.\n\n"
-            "Пожалуйста, сфотографируйте судебный приказ целиком ещё раз.",
-            reply_markup=order_rephoto_menu(),
         )
         return False
 
