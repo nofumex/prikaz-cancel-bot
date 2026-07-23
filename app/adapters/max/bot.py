@@ -677,7 +677,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             return
 
         if current_state in {STATE_ORDER_PHOTO, STATE_ORDER_REPHOTO} and has_attachment:
-            await _handle_order_image(client, event, session, settings, user, current_state=current_state)
+            await _handle_order_image(client, event, session, settings, user)
             return
         if current_state in {STATE_ORDER_PHOTO, STATE_ORDER_REPHOTO} and event.text:
             await _send(
@@ -807,8 +807,6 @@ async def _handle_order_image(
     session,
     settings: Settings,
     user: User,
-    *,
-    current_state: str,
 ) -> None:
     if event.document_name:
         suffix = Path(event.document_name).suffix.lower()
@@ -818,9 +816,8 @@ async def _handle_order_image(
             return
     data = await _state_data(session, event)
     case = await session.get(Case, data["case_id"])
-    if current_state == STATE_ORDER_PHOTO:
-        case.received_date = None
-        case.deadline_date = None
+    case.received_date = None
+    case.deadline_date = None
     try:
         path = await _download_event_image(client, event, case.id, "order", settings)
     except RuntimeError:
