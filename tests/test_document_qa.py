@@ -29,6 +29,27 @@ def test_document_qa_rejects_bad_tokens(tmp_path):
     assert "old_statement_title" in qa.bad_tokens
 
 
+def test_document_qa_rejects_iso_date_in_rendered_docx(tmp_path):
+    docx = tmp_path / "iso.docx"
+    _write_docx(docx, "Судебный приказ от 2026-07-03")
+    qa = run_document_qa(
+        data={
+            "court_name": "x", "debtor_full_name": "Иванов Иван Иванович",
+            "creditor_name": "x", "case_number": "1",
+            "order_date": "2026-07-03", "debt_amount": "1", "state_duty": "1",
+        },
+        received_date=date(2026, 7, 3),
+        deadline_date=date(2026, 7, 13),
+        full_docx=docx,
+        full_pdf=None,
+        preview_pdf=None,
+        instruction_docx=docx,
+        require_preview_pdf=False,
+    )
+
+    assert "iso_date" in qa.bad_tokens
+
+
 def test_document_qa_does_not_reject_structured_name_by_case(tmp_path):
     docx = tmp_path / "dative.docx"
     _write_docx(docx, "Бельскому Владимиру Геннадьевичу")

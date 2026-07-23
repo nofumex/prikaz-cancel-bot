@@ -642,6 +642,21 @@ def bad_tokens_in_text(text: str) -> list[str]:
     return found
 
 
+OUTPUT_DOCUMENT_ONLY_BAD_TOKENS = {
+    "iso_date",
+    "numeric_attachment_date",
+    "duplicated_court_addressee",
+}
+
+
+def bad_tokens_in_structured_text(text: str) -> list[str]:
+    """Keep rendered-document checks out of extraction and normalized data."""
+    return [
+        token for token in bad_tokens_in_text(text)
+        if token not in OUTPUT_DOCUMENT_ONLY_BAD_TOKENS
+    ]
+
+
 def bad_tokens_in_preview_text(text: str) -> list[str]:
     return [token for token in bad_tokens_in_text(text) if token not in PREVIEW_IGNORED_TOKENS]
 
@@ -744,7 +759,7 @@ def validate_before_generation(data: dict, received_date: date | None) -> Valida
     for key, value in normalize_order_data(data).items():
         if key in VALIDATION_SKIP_KEYS or key.startswith("_"):
             continue
-        found = bad_tokens_in_text(f"{key}: {value}")
+        found = bad_tokens_in_structured_text(f"{key}: {value}")
         if clean_text((data or {}).get("_document_values_locked")) == "1" and key in {"court_address", "debtor_address", "creditor_address"}:
             found = [token for token in found if token != "в городе Москва"]
         bad.extend(found)

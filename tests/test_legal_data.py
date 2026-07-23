@@ -12,6 +12,7 @@ from app.services.legal_data import (
     money_from_source_fragment,
     normalize_case_identifiers,
     normalize_order_data,
+    validate_before_generation,
 )
 
 
@@ -168,6 +169,25 @@ def test_bad_tokens_reject_debtor_header_ocr_noise():
     assert "\u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u043e\u043c\u0443" in bad
     assert "\u0443\u0440\u043e\u0436\u0435\u043d" in bad
     assert "\u043f\u0430\u0441\u043f\u043e\u0440\u0442" in bad
+
+
+def test_validate_before_generation_allows_internal_iso_dates():
+    result = validate_before_generation(
+        {
+            "court_name": "Судебный участок № 1",
+            "debtor_full_name": "Иванов Иван Иванович",
+            "creditor_name": "ООО «Банк»",
+            "case_number": "2-1/2026",
+            "order_date": "2026-07-03",
+            "debt_basis_date": "2026-02-04",
+            "debt_amount": "100 руб. 00 коп.",
+            "total_amount": "100 руб. 00 коп.",
+        },
+        date(2026, 7, 3),
+    )
+
+    assert "iso_date" not in result.bad_tokens
+    assert result.ok
 
 
 def test_debtor_address_supports_common_registration_markers():

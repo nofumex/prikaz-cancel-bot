@@ -10,6 +10,7 @@ from app.services.legal_data import (
     AmountValidationResult,
     VALIDATION_SKIP_KEYS,
     bad_tokens_in_preview_text,
+    bad_tokens_in_structured_text,
     bad_tokens_in_text,
     docx_text,
     is_deadline_missed,
@@ -109,8 +110,8 @@ def run_document_qa(
     for key, value in normalized.items():
         if key in VALIDATION_SKIP_KEYS:
             continue
-        bad.extend(bad_tokens_in_text(f"{key}: {value}"))
-    bad.extend(bad_tokens_in_text(card_text))
+        bad.extend(bad_tokens_in_structured_text(f"{key}: {value}"))
+    bad.extend(bad_tokens_in_structured_text(card_text))
 
     for token in BAD_DOCUMENT_TOKENS:
         if token in bad:
