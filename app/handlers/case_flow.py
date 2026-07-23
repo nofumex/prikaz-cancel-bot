@@ -381,18 +381,10 @@ async def _ensure_case_for_unscoped_order_upload(
     current_user: User,
 ) -> Case:
     case = await latest_open_case(session, current_user.id)
-    has_generated_documents = bool(
-        case
-        and (case.preview_pdf_path or case.preview_doc_path or case.full_doc_path or case.full_pdf_path)
-    )
-    must_start_new = bool(
-        case
-        and case.order_photo_path
-        and (
-            case.status != CaseStatus.WAITING_ORDER_REPHOTO.value
-            or has_generated_documents
-        )
-    )
+    # An upload without an active FSM step (for example, immediately after
+    # /start) is a new order. A real rephoto always has waiting_order_rephoto
+    # set explicitly by the rephoto button/flow.
+    must_start_new = bool(case and case.order_photo_path)
     if case is None or must_start_new:
         if must_start_new:
             case = await get_or_create_active_case(
@@ -434,12 +426,6 @@ async def receive_unscoped_order_photo(
     settings: Settings,
     current_user: User,
 ) -> None:
-    case = await latest_open_case(session, current_user.id)
-    if case and case.order_photo_path and not case.received_date:
-        await state.update_data(case_id=case.id)
-        await state.set_state(CaseStates.waiting_envelope_photo)
-        await receive_envelope_photo(message, bot, state, session, settings, current_user)
-        return
     await _ensure_case_for_unscoped_order_upload(message, state, session, settings, current_user)
     await receive_order_photo(message, bot, state, session, settings, current_user)
 
