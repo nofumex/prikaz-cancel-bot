@@ -9,7 +9,6 @@ from app.services.legal_data import (
     FIELD_LABELS,
     AmountValidationResult,
     VALIDATION_SKIP_KEYS,
-    bad_tokens_in_preview_text,
     bad_tokens_in_structured_text,
     bad_tokens_in_text,
     docx_text,
@@ -18,7 +17,7 @@ from app.services.legal_data import (
     normalize_order_data,
     validate_docx_clean,
 )
-from app.services.pdf_tools import pdf_text
+from app.services.pdf_tools import pdf_page_count, pdf_text
 
 
 @dataclass
@@ -98,11 +97,17 @@ def run_document_qa(
             reasons.append(f"не удалось прочитать полный PDF: {exc}")
     if preview_pdf and preview_pdf.exists():
         try:
-            preview_bad = bad_tokens_in_preview_text(pdf_text(preview_pdf))
-            bad.extend(preview_bad)
-            if preview_bad:
-                reasons.append("preview PDF содержит запрещённые токены")
+            preview_pages = pdf_page_count(preview_pdf)
+            checks["preview_pdf_has_pages"] = bool(preview_pages and preview_pages > 0)
+            if not checks["preview_pdf_has_pages"]:
+                reasons.append("preview PDF не содержит страниц")
+            preview_text = pdf_text(preview_pdf)
+            checks["preview_pdf_readable"] = True
+            checks["preview_pdf_has_text"] = bool(preview_text.strip())
+            if not checks["preview_pdf_has_text"]:
+                reasons.append("preview PDF не содержит текста после редактирования")
         except Exception as exc:
+            checks["preview_pdf_readable"] = False
             reasons.append(f"не удалось прочитать preview PDF: {exc}")
     if preview_docx and preview_docx.exists():
         bad.extend(token for token in validate_docx_clean(str(preview_docx)) if token != "▒")
@@ -116,6 +121,8 @@ def run_document_qa(
     for token in BAD_DOCUMENT_TOKENS:
         if token in bad:
             reasons.append(f"стоп-лист: {token}")
+    if bad:
+        reasons.append("bad_tokens: " + ", ".join(sorted(set(bad))))
 
     ok = not missing and not bad and all(checks.values()) and not (
         require_preview_pdf and not checks.get("preview_pdf_exists")

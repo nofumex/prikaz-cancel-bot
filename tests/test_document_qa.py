@@ -4,12 +4,24 @@ from pathlib import Path
 from docx import Document
 
 from app.services.document_qa import run_document_qa
+from app.services.pdf_tools import create_preview_pdf
 
 
 def _write_docx(path: Path, text: str) -> None:
     doc = Document()
     doc.add_paragraph(text)
     doc.save(path)
+
+
+def _write_pdf(path: Path, lines: list[str]) -> None:
+    import fitz
+
+    document = fitz.open()
+    page = document.new_page()
+    for index, line in enumerate(lines):
+        page.insert_text((72, 72 + index * 20), line)
+    document.save(path)
+    document.close()
 
 
 def test_document_qa_rejects_bad_tokens(tmp_path):
@@ -48,6 +60,97 @@ def test_document_qa_rejects_iso_date_in_rendered_docx(tmp_path):
     )
 
     assert "iso_date" in qa.bad_tokens
+    assert any("bad_tokens: iso_date" in reason for reason in qa.reasons)
+
+
+def test_preview_redaction_is_checked_only_for_technical_integrity(tmp_path):
+    full_docx = tmp_path / "full.docx"
+    instruction_docx = tmp_path / "instruction.docx"
+    full_pdf = tmp_path / "full.pdf"
+    preview_pdf = tmp_path / "preview.pdf"
+    _write_docx(full_docx, "Чистый пользовательский документ")
+    _write_docx(instruction_docx, "Инструкция")
+    _write_pdf(full_pdf, ["Первая строка", "Вторая строка", "Третья строка"])
+    create_preview_pdf(full_pdf, preview_pdf)
+
+    qa = run_document_qa(
+        data={
+            "court_name": "x", "debtor_full_name": "Иванов Иван Иванович",
+            "creditor_name": "x", "case_number": "1",
+            "order_date": "03.07.2026", "debt_amount": "1", "state_duty": "1",
+        },
+        received_date=date(2026, 7, 3),
+        deadline_date=date(2099, 7, 13),
+        full_docx=full_docx,
+        full_pdf=full_pdf,
+        preview_pdf=preview_pdf,
+        instruction_docx=instruction_docx,
+        require_preview_pdf=True,
+    )
+
+    assert qa.ok
+    assert qa.checks["preview_pdf_has_pages"]
+    assert qa.checks["preview_pdf_has_text"]
+
+
+def test_full_pdf_bad_token_is_still_rejected(tmp_path):
+    full_docx = tmp_path / "full.docx"
+    instruction_docx = tmp_path / "instruction.docx"
+    full_pdf = tmp_path / "full.pdf"
+    preview_pdf = tmp_path / "preview.pdf"
+    _write_docx(full_docx, "Чистый пользовательский документ")
+    _write_docx(instruction_docx, "Инструкция")
+    _write_pdf(full_pdf, ["MISSING"])
+    _write_pdf(preview_pdf, ["Технически целый preview"])
+
+    qa = run_document_qa(
+        data={
+            "court_name": "x", "debtor_full_name": "Иванов Иван Иванович",
+            "creditor_name": "x", "case_number": "1",
+            "order_date": "03.07.2026", "debt_amount": "1", "state_duty": "1",
+        },
+        received_date=date(2026, 7, 3),
+        deadline_date=date(2099, 7, 13),
+        full_docx=full_docx,
+        full_pdf=full_pdf,
+        preview_pdf=preview_pdf,
+        instruction_docx=instruction_docx,
+        require_preview_pdf=True,
+    )
+
+    assert not qa.ok
+    assert "MISSING" in qa.bad_tokens
+    assert any("bad_tokens: MISSING" in reason for reason in qa.reasons)
+
+
+def test_empty_preview_pdf_is_rejected(tmp_path):
+    full_docx = tmp_path / "full.docx"
+    instruction_docx = tmp_path / "instruction.docx"
+    full_pdf = tmp_path / "full.pdf"
+    preview_pdf = tmp_path / "empty-preview.pdf"
+    _write_docx(full_docx, "Чистый пользовательский документ")
+    _write_docx(instruction_docx, "Инструкция")
+    _write_pdf(full_pdf, ["Полный документ"])
+    _write_pdf(preview_pdf, [])
+
+    qa = run_document_qa(
+        data={
+            "court_name": "x", "debtor_full_name": "Иванов Иван Иванович",
+            "creditor_name": "x", "case_number": "1",
+            "order_date": "03.07.2026", "debt_amount": "1", "state_duty": "1",
+        },
+        received_date=date(2026, 7, 3),
+        deadline_date=date(2099, 7, 13),
+        full_docx=full_docx,
+        full_pdf=full_pdf,
+        preview_pdf=preview_pdf,
+        instruction_docx=instruction_docx,
+        require_preview_pdf=True,
+    )
+
+    assert not qa.ok
+    assert not qa.checks["preview_pdf_has_text"]
+    assert "preview PDF не содержит текста после редактирования" in qa.reasons
 
 
 def test_document_qa_does_not_reject_structured_name_by_case(tmp_path):
