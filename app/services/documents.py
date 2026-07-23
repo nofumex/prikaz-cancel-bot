@@ -29,7 +29,10 @@ from app.utils import h
 
 logger = logging.getLogger(__name__)
 
-MANUAL_REVIEW_USER_TEXT = "Документ требует ручной проверки специалистом. Мы проверим данные и подготовим заявление."
+MANUAL_REVIEW_USER_TEXT = (
+    "Не удалось сформировать заявление по этому фото. "
+    "Пожалуйста, сфотографируйте судебный приказ целиком ещё раз при хорошем освещении."
+)
 SAFE_AI_REVIEW_FIELDS = {
     "debtor_full_name",
     "debtor_address",

@@ -127,13 +127,6 @@ async def _send_order_rephoto_prompt(message: Message, missing: list[str], *, at
         "— лучше отправить как файл без сжатия.\n\n"
         "После нового фото я снова подготовлю заявление."
     )
-    if attempts >= max_attempts:
-        text = (
-            "Не удалось надежно прочитать приказ автоматически. Я передал заявку специалисту. "
-            "Мы поможем подготовить заявление вручную."
-        )
-        await message.answer(text, reply_markup=order_rephoto_menu())
-        return
     await message.answer(text, reply_markup=order_rephoto_menu())
 
 
@@ -327,6 +320,9 @@ async def receive_order_photo(message: Message, bot: Bot, state: FSMContext, ses
             session, current_user, chat_id=str(message.chat.id), force_new=True
         )
         await state.update_data(case_id=case.id)
+    if await state.get_state() == CaseStates.waiting_order_photo.state:
+        case.received_date = None
+        case.deadline_date = None
     path = await _download_photo(bot, message, case.id, 'order')
     await save_photo_path(session, case, 'order', path)
     schedule_crm_sync(settings, case.id, current_user.id, 'order_photo_uploaded', {
@@ -358,6 +354,9 @@ async def receive_order_document(message: Message, bot: Bot, state: FSMContext, 
             session, current_user, chat_id=str(message.chat.id), force_new=True
         )
         await state.update_data(case_id=case.id)
+    if await state.get_state() == CaseStates.waiting_order_photo.state:
+        case.received_date = None
+        case.deadline_date = None
     path = normalize_order_upload(await _download_document_image(bot, message, case.id, 'order'))
     await save_photo_path(session, case, 'order', path)
     schedule_crm_sync(settings, case.id, current_user.id, 'order_photo_uploaded', {

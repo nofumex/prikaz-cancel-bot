@@ -28,7 +28,9 @@ _tasks: dict[int, asyncio.Task[DocumentPreparationResult]] = {}
 
 
 async def _prepare(settings: Settings, case_id: int, user_id: int) -> DocumentPreparationResult:
-    await wait_order_extraction(settings, case_id, user_id)
+    extraction = await wait_order_extraction(settings, case_id, user_id)
+    if not extraction.ok or extraction.missing:
+        return DocumentPreparationResult(case_id, False, "required_render_fields_missing")
     async with SessionLocal() as session:
         case = await session.get(Case, case_id)
         user = await session.get(User, user_id)

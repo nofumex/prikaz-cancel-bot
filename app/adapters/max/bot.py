@@ -112,14 +112,6 @@ def _missing_order_labels(missing: list[str]) -> list[str]:
 
 async def _send_order_rephoto_prompt(client: MaxBotClient, event: IncomingEvent, missing: list[str], *, attempts: int = 0, max_attempts: int = 3) -> None:
     labels = "\n".join(f"— {label}" for label in _missing_order_labels(missing))
-    if attempts >= max_attempts:
-        await _send(
-            client,
-            event,
-            "Не удалось надежно прочитать приказ автоматически. Я передал заявку специалисту. Мы поможем подготовить заявление вручную.",
-            keyboards.order_rephoto_menu(),
-        )
-        return
     await _send(
         client,
         event,
@@ -685,7 +677,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             return
 
         if current_state in {STATE_ORDER_PHOTO, STATE_ORDER_REPHOTO} and has_attachment:
-            await _handle_order_image(client, event, session, settings, user)
+            await _handle_order_image(client, event, session, settings, user, current_state=current_state)
             return
         if current_state in {STATE_ORDER_PHOTO, STATE_ORDER_REPHOTO} and event.text:
             await _send(
@@ -809,7 +801,15 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
         await _send(client, event, welcome_text(settings.company_name), keyboards.main_menu())
 
 
-async def _handle_order_image(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User) -> None:
+async def _handle_order_image(
+    client: MaxBotClient,
+    event: IncomingEvent,
+    session,
+    settings: Settings,
+    user: User,
+    *,
+    current_state: str,
+) -> None:
     if event.document_name:
         suffix = Path(event.document_name).suffix.lower()
         allowed = {'.jpg', '.jpeg', '.png', '.webp', '.pdf', '.heic', '.heif'}
@@ -818,6 +818,9 @@ async def _handle_order_image(client: MaxBotClient, event: IncomingEvent, sessio
             return
     data = await _state_data(session, event)
     case = await session.get(Case, data["case_id"])
+    if current_state == STATE_ORDER_PHOTO:
+        case.received_date = None
+        case.deadline_date = None
     try:
         path = await _download_event_image(client, event, case.id, "order", settings)
     except RuntimeError:
