@@ -332,8 +332,34 @@ def statement_restore_term(ctx: StatementContext) -> list[str]:
 
 
 def build_statement_paragraphs(ctx: StatementContext) -> list[str]:
+    restore_term = is_deadline_missed(ctx.deadline_date, ctx.document_date)
     if not missing_render_fields(ctx.data):
         data = ctx.data
+        if restore_term:
+            order_date_long = render_value(data, "order_date_long")
+            court_instrumental = render_value(data, "court_instrumental")
+            case_identifier = render_value(data, "case_identifier")
+            deadline_long = date_long_text(ctx.deadline_date)
+            return [
+                render_value(data, "order_facts_sentence"),
+                f"Копия судебного приказа получена мной {date_long_text(ctx.received_date)}.",
+                f"Десятидневный срок подачи возражений истек {deadline_long}. {ctx.restore_reason}",
+                "Прошу восстановить пропущенный процессуальный срок.",
+                "С судебным приказом не согласен, возражаю относительно его исполнения в полном объеме.",
+                "На основании изложенного, руководствуясь статьями 112, 128, 129 ГПК РФ,",
+                "ПРОШУ:",
+                (
+                    f"1. Восстановить срок для подачи возражений относительно исполнения судебного приказа "
+                    f"от {order_date_long}, вынесенного {court_instrumental} "
+                    f"по делу/производству {case_identifier}."
+                ),
+                (
+                    f"2. Отменить судебный приказ от {order_date_long}, "
+                    f"вынесенный {court_instrumental} "
+                    f"по делу/производству {case_identifier}."
+                ),
+                "3. Направить мне копию определения об отмене судебного приказа по адресу, указанному в настоящих возражениях.",
+            ]
         return [
             render_value(data, "order_facts_sentence"),
             f"Копия судебного приказа получена мной {date_long_text(ctx.received_date)}.",
@@ -347,7 +373,6 @@ def build_statement_paragraphs(ctx: StatementContext) -> list[str]:
             ),
             "2. Направить мне копию определения об отмене судебного приказа по адресу, указанному в настоящих возражениях.",
         ]
-    restore_term = is_deadline_missed(ctx.deadline_date, ctx.document_date)
     if restore_term:
         return statement_restore_term(ctx)
     return statement_in_time(ctx)
