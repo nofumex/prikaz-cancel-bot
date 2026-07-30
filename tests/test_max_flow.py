@@ -111,3 +111,39 @@ async def test_max_order_without_received_date_prompts_for_date(monkeypatch):
     assert max_bot._set_state.await_count == 1
     assert max_bot.DATE_PROMPT in client.send_message.await_args_list[-1].kwargs["text"]
     assert max_bot.STATE_MANUAL_DATE in [call.args[2] for call in max_bot._set_state.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_max_generation_passes_custom_restore_reason(monkeypatch):
+    from app.adapters.max import bot as max_bot
+
+    reason = "Причина пропуска срока: не смогла войти в Госуслуги из-за сбоя интернета"
+    case = _case(
+        received_date=date(2021, 2, 1),
+        deadline_date=date(2021, 2, 11),
+        extracted_json=json.dumps(
+            {
+                **json.loads(_case().extracted_json),
+                "restore_reason": reason,
+            },
+            ensure_ascii=False,
+        ),
+    )
+    user = User(id=1, platform="max", platform_user_id="42")
+    event = IncomingEvent(platform_user_id="42", chat_id="chat-1", text=reason)
+    client = SimpleNamespace(send_message=AsyncMock())
+    session = SimpleNamespace(commit=AsyncMock())
+    settings = _make_settings(amocrm_enabled=False, admin_ids=set(), max_admin_ids=set())
+    create_documents = AsyncMock(
+        return_value=SimpleNamespace(ok=False, artifacts=None, admin_report="test stop")
+    )
+
+    monkeypatch.setattr(max_bot, "_send_pending_ocr_confirmation", AsyncMock(return_value=False))
+    monkeypatch.setattr(max_bot, "missing_order_fields", lambda *_args: [])
+    monkeypatch.setattr(max_bot, "create_case_documents_reviewed", create_documents)
+    monkeypatch.setattr(max_bot, "schedule_crm_sync", lambda *args, **kwargs: None)
+    monkeypatch.setattr(max_bot, "_notify_admin_document_review_failure", AsyncMock())
+
+    await max_bot._generate_documents(client, event, session, settings, user, case)
+
+    assert create_documents.await_args.kwargs["restore_reason"] == reason

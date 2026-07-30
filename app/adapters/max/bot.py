@@ -1082,7 +1082,8 @@ async def _generate_documents(client: MaxBotClient, event: IncomingEvent, sessio
     data = normalize_order_data(json.loads(case.extracted_json or '{}'))
     if await _send_pending_ocr_confirmation(client, event, session, case, data):
         return
-    if is_deadline_missed(case.deadline_date) and not data.get('restore_reason'):
+    stored_reason = data.get('restore_reason') or ''
+    if is_deadline_missed(case.deadline_date) and not stored_reason:
         await _set_state(session, event, STATE_RESTORE_REASON, {'case_id': case.id})
         await _send(client, event, 'Срок подачи уже пропущен. Выберите причину для восстановления срока.', keyboards.restore_reason_menu())
         return
@@ -1095,7 +1096,13 @@ async def _generate_documents(client: MaxBotClient, event: IncomingEvent, sessio
         await _send_order_rephoto_prompt(client, event, missing, attempts=case.order_rephoto_attempts)
         return
     try:
-        review_outcome = await create_case_documents_reviewed(case, user, settings, session)
+        review_outcome = await create_case_documents_reviewed(
+            case,
+            user,
+            settings,
+            session,
+            restore_reason=stored_reason or None,
+        )
     except Exception as exc:
         logger.exception("MAX document generation failed")
         case.status = CaseStatus.NEEDS_REVIEW.value
