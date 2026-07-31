@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -10,6 +11,76 @@ from app.services.amocrm import crm_event_dedupe_key
 
 def test_reconciliation_interval_is_fifteen_minutes():
     assert crm_reconciliation.CRM_RECONCILIATION_INTERVAL_SECONDS == 900
+
+
+@pytest.mark.asyncio
+async def test_completed_stage_reconciliation_is_not_started_again(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    try:
+        async with session_factory() as session:
+            user = User(platform="telegram", platform_user_id="99")
+            session.add(user)
+            await session.flush()
+            case = Case(user_id=user.id, status="waiting_envelope", amocrm_lead_id=777)
+            session.add(case)
+            await session.flush()
+            payload = {
+                "status_name_override": crm_reconciliation._status_for_case(case),
+                "force_status": True,
+                "reconciliation_version": crm_reconciliation.CRM_STAGE_RECONCILIATION_VERSION,
+                "note": f"Этап восстановлен по фактическому статусу заявки #{case.id}: {case.status}",
+            }
+            session.add(
+                CrmSyncLog(
+                    case_id=case.id,
+                    user_id=user.id,
+                    event_type="crm_stage_reconciliation",
+                    dedupe_key=crm_event_dedupe_key(case.id, "crm_stage_reconciliation", payload),
+                    amo_entity_type="lead",
+                    amo_entity_id=777,
+                    success=True,
+                )
+            )
+            session.add(
+                CrmSyncLog(
+                    case_id=case.id,
+                    user_id=user.id,
+                    event_type="user_started_bot",
+                    amo_entity_type="lead",
+                    amo_entity_id=777,
+                    success=True,
+                )
+            )
+            await session.commit()
+
+        calls = []
+
+        async def fake_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return True
+
+        monkeypatch.setattr(crm_reconciliation, "SessionLocal", session_factory)
+        monkeypatch.setattr(crm_reconciliation, "run_crm_sync_job", fake_run)
+
+        class FakeCrm:
+            async def list_pipeline_lead_ids(self):
+                return {777}, None
+
+        monkeypatch.setattr(crm_reconciliation, "get_amocrm_service", lambda settings: FakeCrm())
+
+        result = await crm_reconciliation.reconcile_missing_crm_data(
+            SimpleNamespace(amocrm_enabled=True)
+        )
+
+        assert result["stages_skipped"] == 1
+        assert result["stages_reconciled"] == 0
+        assert calls == []
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

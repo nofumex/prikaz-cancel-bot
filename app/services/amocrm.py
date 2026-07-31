@@ -461,6 +461,37 @@ class AmoCrmService:
             return False, None
         return not bool(data.get("is_deleted")), None
 
+    async def list_pipeline_lead_ids(self) -> tuple[set[int] | None, str | None]:
+        pipeline = await self.ensure_pipeline()
+        if not pipeline or not pipeline.get("id"):
+            return None, "amoCRM pipeline not found"
+        pipeline_id = int(pipeline["id"])
+        lead_ids: set[int] = set()
+        page = 1
+        while True:
+            data, error = await self.request(
+                "GET",
+                "/leads",
+                params={
+                    "filter[pipeline_id]": pipeline_id,
+                    "limit": 250,
+                    "page": page,
+                },
+            )
+            if error:
+                return None, error
+            if not isinstance(data, dict):
+                return None, "amoCRM returned an invalid leads list"
+            leads = data.get("_embedded", {}).get("leads", [])
+            lead_ids.update(
+                int(item["id"])
+                for item in leads
+                if item.get("id") and not item.get("is_deleted")
+            )
+            if len(leads) < 250:
+                return lead_ids, None
+            page += 1
+
     async def create_lead(self, case: Case, user: User, status_name: str, *, current_case_id: int | None = None) -> int | None:
         pipeline = await self.ensure_pipeline()
         if not pipeline:

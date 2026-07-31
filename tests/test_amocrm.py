@@ -337,6 +337,32 @@ async def test_empty_get_lead_response_means_lead_was_deleted():
 
 
 @pytest.mark.asyncio
+async def test_pipeline_lead_ids_are_loaded_in_pages():
+    service = AmoCrmService(_settings(amocrm_enabled=True))
+    requested_pages = []
+
+    async def fake_pipeline():
+        return {"id": 11037010}
+
+    async def fake_request(method, path, **kwargs):
+        page = kwargs["params"]["page"]
+        requested_pages.append(page)
+        if page == 1:
+            return {"_embedded": {"leads": [{"id": index} for index in range(1, 251)]}}, None
+        return {"_embedded": {"leads": [{"id": 999}]}}, None
+
+    service.ensure_pipeline = fake_pipeline
+    service.request = fake_request
+
+    lead_ids, error = await service.list_pipeline_lead_ids()
+
+    assert error is None
+    assert len(lead_ids) == 251
+    assert 999 in lead_ids
+    assert requested_pages == [1, 2]
+
+
+@pytest.mark.asyncio
 async def test_sync_case_event_exposes_amocrm_note_http_error():
     service = AmoCrmService(_settings(amocrm_enabled=True))
     case = Case(id=63, user_id=1, amocrm_lead_id=32404037)

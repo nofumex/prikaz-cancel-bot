@@ -11,7 +11,7 @@ from sqlalchemy import select
 from app.config import Settings
 from app.database import SessionLocal
 from app.models import Case, ChatMessage, ChatSession, CrmSyncLog, User
-from app.services.amocrm import crm_event_dedupe_key
+from app.services.amocrm import crm_event_dedupe_key, get_amocrm_service
 from app.services.cases import ensure_user_has_case, latest_case
 from app.services.chat_crm_sync import CHAT_MESSAGE_CRM_EVENT, build_chat_message_payload
 from app.services.crm_background import run_crm_sync_job
@@ -247,6 +247,7 @@ async def reconcile_missing_crm_data(settings: Settings) -> dict[str, int]:
         "history_events_replayed": 0,
         "history_events_failed": 0,
         "stages_reconciled": 0,
+        "stages_skipped": 0,
         "stages_failed": 0,
         "messages_retried": 0,
         "messages_failed": 0,
@@ -265,64 +266,112 @@ async def reconcile_missing_crm_data(settings: Settings) -> dict[str, int]:
             ).scalars()
         )
 
-    reconciliation_targets: list[tuple[int, int]] = []
-    for user_id in user_ids:
-        result["users_checked"] += 1
-        async with SessionLocal() as session:
-            user = await session.get(User, user_id)
-            if user is None:
-                continue
-            case = await latest_case(session, user.id)
-            if case is None:
-                case, _ = await ensure_user_has_case(session, user)
-            case_id = case.id
-            missing_lead = not (case.amocrm_lead_id or case.amo_lead_id)
-        if missing_lead:
-            repaired = await run_crm_sync_job(
-                settings,
-                case_id,
-                user_id,
-                "crm_reconciliation",
-                {"note": "Автовосстановление отсутствующей сделки CRM"},
-            )
-            if repaired:
-                result["deals_repaired"] += 1
-            else:
-                result["deals_failed"] += 1
-        stage_reconciled = await run_crm_sync_job(
-            settings,
-            case_id,
-            user_id,
-            "crm_stage_reconciliation",
-            {
-                "status_name_override": _status_for_case(case),
-                "force_status": True,
-                "reconciliation_version": CRM_STAGE_RECONCILIATION_VERSION,
-                "note": f"Этап восстановлен по фактическому статусу заявки #{case.id}: {case.status}",
-            },
+    crm = get_amocrm_service(settings)
+    remote_lead_ids, remote_leads_error = await crm.list_pipeline_lead_ids()
+    if remote_leads_error:
+        logger.warning(
+            "CRM reconciliation could not load active lead IDs; using local IDs only: %s",
+            remote_leads_error,
         )
-        if stage_reconciled:
-            result["stages_reconciled"] += 1
-        else:
-            result["stages_failed"] += 1
-        reconciliation_targets.append((user_id, case_id))
+
+    stage_workers = asyncio.Semaphore(3)
+
+    async def reconcile_user(user_id: int) -> tuple[int, int] | None:
+        async with stage_workers:
+            result["users_checked"] += 1
+            async with SessionLocal() as session:
+                user = await session.get(User, user_id)
+                if user is None:
+                    return None
+                case = await latest_case(session, user.id)
+                if case is None:
+                    case, _ = await ensure_user_has_case(session, user)
+                case_id = case.id
+                lead_id = case.amocrm_lead_id or case.amo_lead_id
+                missing_lead = not lead_id or (
+                    remote_lead_ids is not None and int(lead_id) not in remote_lead_ids
+                )
+                case_sync_failed = case.amocrm_synced is False and bool(case.amocrm_sync_error)
+                stage_payload = {
+                    "status_name_override": _status_for_case(case),
+                    "force_status": True,
+                    "reconciliation_version": CRM_STAGE_RECONCILIATION_VERSION,
+                    "note": f"Этап восстановлен по фактическому статусу заявки #{case.id}: {case.status}",
+                }
+                stage_key = crm_event_dedupe_key(case_id, "crm_stage_reconciliation", stage_payload)
+                stage_already_reconciled = bool(
+                    lead_id
+                    and not missing_lead
+                    and await session.scalar(
+                        select(CrmSyncLog.id)
+                        .where(
+                            CrmSyncLog.dedupe_key == stage_key,
+                            CrmSyncLog.success.is_(True),
+                            CrmSyncLog.amo_entity_id == int(lead_id),
+                        )
+                        .limit(1)
+                    )
+                )
+                needs_recovery = missing_lead or not stage_already_reconciled or case_sync_failed
+
+            if missing_lead:
+                repaired = await run_crm_sync_job(
+                    settings,
+                    case_id,
+                    user_id,
+                    "crm_reconciliation",
+                    {"note": "Автовосстановление отсутствующей сделки CRM"},
+                )
+                if repaired:
+                    result["deals_repaired"] += 1
+                else:
+                    result["deals_failed"] += 1
+
+            if stage_already_reconciled:
+                result["stages_skipped"] += 1
+            else:
+                stage_reconciled = await run_crm_sync_job(
+                    settings,
+                    case_id,
+                    user_id,
+                    "crm_stage_reconciliation",
+                    stage_payload,
+                )
+                if stage_reconciled:
+                    result["stages_reconciled"] += 1
+                else:
+                    result["stages_failed"] += 1
+            return (user_id, case_id) if needs_recovery else None
+
+    reconciliation_targets = [
+        target
+        for target in await asyncio.gather(*(reconcile_user(user_id) for user_id in user_ids))
+        if target is not None
+    ]
 
     # Files and timeline notes are slower than stage changes. Process them only
     # after every user has a deal and the correct visible pipeline stage.
-    for user_id, case_id in reconciliation_targets:
-        history_jobs = await _history_jobs_for_user(user_id, case_id)
-        for payload, _ in history_jobs:
-            replayed = await run_crm_sync_job(
-                settings,
-                case_id,
-                user_id,
-                "history_replay",
-                payload,
-            )
-            if replayed:
-                result["history_events_replayed"] += 1
-            else:
-                result["history_events_failed"] += 1
+    history_workers = asyncio.Semaphore(2)
+
+    async def replay_user_history(user_id: int, case_id: int) -> None:
+        async with history_workers:
+            history_jobs = await _history_jobs_for_user(user_id, case_id)
+            for payload, _ in history_jobs:
+                replayed = await run_crm_sync_job(
+                    settings,
+                    case_id,
+                    user_id,
+                    "history_replay",
+                    payload,
+                )
+                if replayed:
+                    result["history_events_replayed"] += 1
+                else:
+                    result["history_events_failed"] += 1
+
+    await asyncio.gather(
+        *(replay_user_history(user_id, case_id) for user_id, case_id in reconciliation_targets)
+    )
 
     pending_messages: list[tuple[int, int, dict, str, int | None]] = []
     async with SessionLocal() as session:
