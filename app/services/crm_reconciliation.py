@@ -18,6 +18,22 @@ from app.services.crm_background import run_crm_sync_job
 
 logger = logging.getLogger(__name__)
 
+_HISTORY_SOURCE_EVENTS: dict[str, frozenset[str]] = {
+    "started": frozenset({"user_started_bot"}),
+    "order_uploaded": frozenset({"order_photo_uploaded"}),
+    "envelope_uploaded": frozenset({"envelope_photo_uploaded"}),
+    "received_date": frozenset({"received_date_entered", "received_date_updated"}),
+    "documents_generated": frozenset({"preview_generated", "documents_delivered"}),
+    "payment_created": frozenset({"payment_created"}),
+    "paid": frozenset({"payment_paid"}),
+    "delivered": frozenset({"documents_delivered"}),
+    "reminders": frozenset({"reminder_sent", "payment_abandoned"}),
+}
+
+
+def _history_source_already_synced(suffix: str, successful_event_types: set[str]) -> bool:
+    return bool(_HISTORY_SOURCE_EVENTS.get(suffix, frozenset()) & successful_event_types)
+
 
 def _status_for_case(case: Case) -> str:
     if case.consultation_reminder_sent_at or case.post_payment_followup_sent_at:
@@ -49,7 +65,7 @@ def _existing_case_files(case: Case) -> list[dict[str, str]]:
     ]
 
 
-async def _history_jobs_for_user(user_id: int) -> list[tuple[dict, str]]:
+async def _history_jobs_for_user(user_id: int, target_case_id: int) -> list[tuple[dict, str]]:
     jobs: list[tuple[dict, str]] = []
     async with SessionLocal() as session:
         cases = list(
@@ -59,8 +75,40 @@ async def _history_jobs_for_user(user_id: int) -> list[tuple[dict, str]]:
                 )
             ).scalars()
         )
+        target_case = await session.get(Case, target_case_id)
+        target_lead_id = (
+            (target_case.amocrm_lead_id or target_case.amo_lead_id)
+            if target_case is not None
+            else None
+        )
+        case_ids = [case.id for case in cases]
+        successful_rows: list[tuple[int | None, str, str | None]] = []
+        if case_ids and target_lead_id:
+            successful_rows = list(
+                (
+                    await session.execute(
+                        select(CrmSyncLog.case_id, CrmSyncLog.event_type, CrmSyncLog.dedupe_key).where(
+                            CrmSyncLog.case_id.in_(case_ids),
+                            CrmSyncLog.success.is_(True),
+                            CrmSyncLog.amo_entity_id == int(target_lead_id),
+                        )
+                    )
+                ).all()
+            )
+        successful_events_by_case: dict[int, set[str]] = {}
+        successful_dedupe_keys: set[str] = set()
+        for logged_case_id, event_type, dedupe_key in successful_rows:
+            if logged_case_id is not None:
+                successful_events_by_case.setdefault(int(logged_case_id), set()).add(event_type)
+            if dedupe_key:
+                successful_dedupe_keys.add(dedupe_key)
+
         for case in cases:
+            successful_event_types = successful_events_by_case.get(case.id, set())
+
             def add_case_event(suffix: str, note: str, files: list[dict[str, str]] | None = None) -> None:
+                if _history_source_already_synced(suffix, successful_event_types):
+                    return
                 source_key = f"case:{case.id}:{suffix}"
                 payload: dict = {"source_event_key": source_key, "note": note}
                 if files:
@@ -149,6 +197,10 @@ async def _history_jobs_for_user(user_id: int) -> list[tuple[dict, str]]:
         )
         seen: set[str] = set()
         for log in logs:
+            if log.dedupe_key and log.dedupe_key in successful_dedupe_keys:
+                continue
+            if log.event_type in successful_events_by_case.get(log.case_id or 0, set()):
+                continue
             raw_key = log.dedupe_key or f"{log.event_type}:{log.case_id}:{log.request_payload}"
             source_key = "crm_log:" + hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
             if source_key in seen:
@@ -249,7 +301,7 @@ async def reconcile_missing_crm_data(settings: Settings) -> dict[str, int]:
     # Files and timeline notes are slower than stage changes. Process them only
     # after every user has a deal and the correct visible pipeline stage.
     for user_id, case_id in reconciliation_targets:
-        history_jobs = await _history_jobs_for_user(user_id)
+        history_jobs = await _history_jobs_for_user(user_id, case_id)
         for payload, _ in history_jobs:
             replayed = await run_crm_sync_job(
                 settings,
