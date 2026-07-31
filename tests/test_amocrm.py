@@ -242,6 +242,26 @@ def test_crm_event_dedupe_key_uses_stable_payload_fields():
 
 
 @pytest.mark.asyncio
+async def test_sync_case_event_exposes_amocrm_note_http_error():
+    service = AmoCrmService(_settings(amocrm_enabled=True))
+    case = Case(id=63, user_id=1, amocrm_lead_id=32404037)
+    user = User(id=1, platform="telegram", platform_user_id="1", amocrm_current_case_id=63)
+
+    async def fake_request(method, path, **kwargs):
+        assert method == "POST"
+        assert path == "/leads/32404037/notes"
+        return None, 'HTTP 400: {"title":"Bad Request","detail":"invalid note"}'
+
+    service.request = fake_request
+
+    with pytest.raises(
+        RuntimeError,
+        match=r'amoCRM did not add note to lead 32404037: HTTP 400: \{"title":"Bad Request"',
+    ):
+        await service.sync_case_event(None, case, user, "chat_message", {"text": "Сообщение клиента"})
+
+
+@pytest.mark.asyncio
 async def test_duplicate_crm_event_skips_note_and_network_calls():
     service = AmoCrmService(_settings(amocrm_enabled=True))
     case = Case(id=63, user_id=1, amocrm_lead_id=123, amocrm_status_name="\u041e\u0442\u043f\u0440\u0430\u0432\u0438\u043b \u043f\u0440\u0438\u043a\u0430\u0437")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 import json
 import logging
 import mimetypes
@@ -19,6 +20,7 @@ from app.services.legal_data import normalize_order_data
 from app.utils import safe_json_loads
 
 logger = logging.getLogger(__name__)
+_LAST_NOTE_ERROR: ContextVar[str | None] = ContextVar("amocrm_last_note_error", default=None)
 
 PIPELINE_STATUSES = [
     "Подписался на бота",
@@ -506,13 +508,18 @@ class AmoCrmService:
 
     async def add_lead_note(self, case: Case, text: str) -> bool:
         lead_id = case.amocrm_lead_id or case.amo_lead_id
+        _LAST_NOTE_ERROR.set(None)
         if not lead_id:
+            _LAST_NOTE_ERROR.set("lead id is missing")
             return False
         _, error = await self.request(
             "POST",
             f"/leads/{int(lead_id)}/notes",
             json_body=[{"entity_id": int(lead_id), "note_type": "common", "params": {"text": text[:65000]}}],
         )
+        if error:
+            _LAST_NOTE_ERROR.set(error)
+            logger.error("amoCRM note creation failed lead_id=%s error=%s", lead_id, error)
         return error is None
 
     async def _request_raw_url(
@@ -881,9 +888,13 @@ class AmoCrmService:
             if attached_files:
                 response_payload["attached_files"] = attached_files
 
+            _LAST_NOTE_ERROR.set(None)
             note_added = await self.add_lead_note(case, "\n".join(note_parts))
             if not note_added:
-                raise RuntimeError(f"amoCRM did not add note to lead {case.amocrm_lead_id or case.amo_lead_id}")
+                lead_id = case.amocrm_lead_id or case.amo_lead_id
+                note_error = _LAST_NOTE_ERROR.get()
+                detail = f": {note_error}" if note_error else ""
+                raise RuntimeError(f"amoCRM did not add note to lead {lead_id}{detail}")
 
             if session:
                 await self._log_sync(

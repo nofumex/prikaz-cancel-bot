@@ -183,9 +183,13 @@ async def reconcile_missing_crm_data(settings: Settings) -> dict[str, int]:
     result = {
         "users_checked": 0,
         "deals_repaired": 0,
+        "deals_failed": 0,
         "history_events_replayed": 0,
+        "history_events_failed": 0,
         "stages_reconciled": 0,
+        "stages_failed": 0,
         "messages_retried": 0,
+        "messages_failed": 0,
     }
     if not settings.amocrm_enabled:
         return result
@@ -214,15 +218,18 @@ async def reconcile_missing_crm_data(settings: Settings) -> dict[str, int]:
             case_id = case.id
             missing_lead = not (case.amocrm_lead_id or case.amo_lead_id)
         if missing_lead:
-            await run_crm_sync_job(
+            repaired = await run_crm_sync_job(
                 settings,
                 case_id,
                 user_id,
                 "crm_reconciliation",
                 {"note": "Автовосстановление отсутствующей сделки CRM"},
             )
-            result["deals_repaired"] += 1
-        await run_crm_sync_job(
+            if repaired:
+                result["deals_repaired"] += 1
+            else:
+                result["deals_failed"] += 1
+        stage_reconciled = await run_crm_sync_job(
             settings,
             case_id,
             user_id,
@@ -233,7 +240,10 @@ async def reconcile_missing_crm_data(settings: Settings) -> dict[str, int]:
                 "note": f"Этап восстановлен по фактическому статусу заявки #{case.id}: {case.status}",
             },
         )
-        result["stages_reconciled"] += 1
+        if stage_reconciled:
+            result["stages_reconciled"] += 1
+        else:
+            result["stages_failed"] += 1
         reconciliation_targets.append((user_id, case_id))
 
     # Files and timeline notes are slower than stage changes. Process them only
@@ -241,14 +251,17 @@ async def reconcile_missing_crm_data(settings: Settings) -> dict[str, int]:
     for user_id, case_id in reconciliation_targets:
         history_jobs = await _history_jobs_for_user(user_id)
         for payload, _ in history_jobs:
-            await run_crm_sync_job(
+            replayed = await run_crm_sync_job(
                 settings,
                 case_id,
                 user_id,
                 "history_replay",
                 payload,
             )
-            result["history_events_replayed"] += 1
+            if replayed:
+                result["history_events_replayed"] += 1
+            else:
+                result["history_events_failed"] += 1
 
     pending_messages: list[tuple[int, int, dict, str]] = []
     async with SessionLocal() as session:
@@ -297,14 +310,17 @@ async def reconcile_missing_crm_data(settings: Settings) -> dict[str, int]:
     for case_id, user_id, payload, key in pending_messages:
         if key in successful_keys:
             continue
-        await run_crm_sync_job(
+        retried = await run_crm_sync_job(
             settings,
             case_id,
             user_id,
             CHAT_MESSAGE_CRM_EVENT,
             payload,
         )
-        result["messages_retried"] += 1
+        if retried:
+            result["messages_retried"] += 1
+        else:
+            result["messages_failed"] += 1
     return result
 
 

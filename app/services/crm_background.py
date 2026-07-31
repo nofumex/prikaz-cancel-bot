@@ -69,7 +69,7 @@ async def run_crm_sync_job(
     user_id: int | None,
     event_type: str,
     payload: dict | None = None,
-) -> None:
+) -> bool:
     start = time.monotonic()
     logger.info("CRM sync start event=%s case_id=%s", event_type, case_id)
     attempts = max(1, settings.crm_sync_max_attempts)
@@ -85,7 +85,7 @@ async def run_crm_sync_job(
                 )
                 duration_ms = int((time.monotonic() - start) * 1000)
                 logger.info("CRM sync done event=%s case_id=%s duration_ms=%s", event_type, case_id, duration_ms)
-                return
+                return True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -121,6 +121,7 @@ async def run_crm_sync_job(
                 case.amocrm_sync_error = last_error
                 case.amocrm_synced = False
         await session.commit()
+    return False
 
 
 async def _run_once(settings: Settings, case_id: int | None, user_id: int | None, event_type: str, payload: dict[str, Any]) -> None:
