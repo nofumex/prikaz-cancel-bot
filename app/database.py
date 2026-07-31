@@ -41,6 +41,7 @@ async def _upgrade_sqlite_schema(conn) -> None:
         [
             ("platform_chat_id", "platform_chat_id TEXT"),
             ("platform_user_id", "platform_user_id TEXT"),
+            ("order_photo_uploaded_at", "order_photo_uploaded_at DATETIME"),
             ("full_pdf_path", "full_pdf_path TEXT"),
             ("preview_pdf_path", "preview_pdf_path TEXT"),
             ("amocrm_contact_id", "amocrm_contact_id INTEGER"),
@@ -124,6 +125,11 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("inactivity_notification_refs", "inactivity_notification_refs TEXT"),
         ],
     )
+    if "order_photo_uploaded_at" in added_case_columns:
+        await conn.exec_driver_sql(
+            "UPDATE cases SET order_photo_uploaded_at = created_at "
+            "WHERE order_photo_path IS NOT NULL AND order_photo_path != ''"
+        )
     await _sqlite_add_columns(
         conn,
         "chat_messages",

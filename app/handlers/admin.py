@@ -19,7 +19,7 @@ from app.config import Settings
 from app.enums import CaseStatus
 from app.keyboards.common import admin_case_actions, admin_cases_page, admin_panel, broadcast_confirm, broadcast_menu, broadcast_settings_menu, btn, manager_panel
 from app.models import Case, CrmSyncLog, OpenAIUsage, User
-from app.services.admin_reporting import PROBLEM_CATEGORIES, client_path_text, order_photo_paths, problem_case_error_text, problem_cases_by_category, problem_category_counts, problem_cases_page
+from app.services.admin_reporting import PROBLEM_CATEGORIES, client_path_text, order_photo_paths, problem_case_error_text, problem_cases_by_category, problem_category_counts, problem_cases_page, submitted_cases_count, submitted_cases_page
 from app.services.amocrm import get_amocrm_service
 from app.services.app_settings import payments_enabled, toggle_payments
 from app.services.app_settings import reminder_settings, update_reminder_setting
@@ -268,11 +268,10 @@ async def cb_cases(callback: CallbackQuery, session: AsyncSession, current_user:
         await callback.answer("Недостаточно прав", show_alert=True)
         return
     page = int(callback.data.split(":")[-1]) if callback.data.startswith("admin:cases:") else 0
-    total = int(await session.scalar(select(func.count(Case.id))) or 0)
+    total = await submitted_cases_count(session)
     total_pages = max(1, math.ceil(total / PAGE_SIZE))
     page = max(0, min(page, total_pages - 1))
-    result = await session.execute(select(Case).order_by(Case.created_at.desc()).offset(page * PAGE_SIZE).limit(PAGE_SIZE))
-    cases = list(result.scalars().all())
+    cases = await submitted_cases_page(session, page, PAGE_SIZE)
     if not cases:
         await callback.message.answer("Заявок пока нет.", reply_markup=admin_panel(payments_enabled()) if current_user.is_admin else manager_panel())
         await callback.answer()
@@ -281,7 +280,8 @@ async def cb_cases(callback: CallbackQuery, session: AsyncSession, current_user:
     for case in cases:
         await session.refresh(case, ["user"])
         name = full_name(case.user).replace("<", "").replace(">", "")
-        date = case.created_at.strftime("%d.%m") if case.created_at else ""
+        application_created_at = case.order_photo_uploaded_at or case.created_at
+        date = application_created_at.strftime("%d.%m") if application_created_at else ""
         items.append((case.id, f"#{case.id} • {date} • {name}"))
     await _edit_or_answer(
         callback,
@@ -484,7 +484,7 @@ async def cb_stats(callback: CallbackQuery, session: AsyncSession, current_user:
     if not await _ensure_admin_callback(callback, current_user):
         return
     users_total = int(await session.scalar(select(func.count(User.id))) or 0)
-    cases_total = int(await session.scalar(select(func.count(Case.id))) or 0)
+    cases_total = await submitted_cases_count(session)
     pending = int(await session.scalar(select(func.count(Case.id)).where(Case.status == CaseStatus.PAYMENT_PENDING.value)) or 0)
     paid = int(await session.scalar(select(func.count(Case.id)).where(Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]))) or 0)
     regenerations = int(await session.scalar(

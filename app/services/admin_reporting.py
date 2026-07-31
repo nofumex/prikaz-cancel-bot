@@ -32,6 +32,30 @@ PROBLEM_CATEGORIES = {
 CLIENT_PATH_TIMEZONE = ZoneInfo('Asia/Krasnoyarsk')
 
 
+def submitted_cases_condition():
+    return (Case.order_photo_path.is_not(None), Case.order_photo_path != "")
+
+
+async def submitted_cases_count(session) -> int:
+    return int(
+        await session.scalar(
+            select(func.count(Case.id)).where(*submitted_cases_condition())
+        )
+        or 0
+    )
+
+
+async def submitted_cases_page(session, page: int, page_size: int) -> list[Case]:
+    rows = await session.execute(
+        select(Case)
+        .where(*submitted_cases_condition())
+        .order_by(Case.order_photo_uploaded_at.desc(), Case.id.desc())
+        .offset(page * page_size)
+        .limit(page_size)
+    )
+    return list(rows.scalars())
+
+
 def _event_time_text(value) -> str:
     if value is None:
         return 'время не записано'

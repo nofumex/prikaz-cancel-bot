@@ -130,6 +130,8 @@ async def list_cases(session: AsyncSession, limit: int = 10, status: str | None 
 async def save_photo_path(session: AsyncSession, case: Case, kind: str, path: Path) -> None:
     if kind == "order":
         case.order_photo_path = str(path)
+        if case.order_photo_uploaded_at is None:
+            case.order_photo_uploaded_at = datetime.utcnow()
         # A replacement image must never reuse facts from the previous OCR run
         # while the new background extraction is still running.
         case.extracted_json = None

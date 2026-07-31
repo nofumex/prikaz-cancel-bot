@@ -18,7 +18,7 @@ from app.services.amocrm import get_amocrm_service
 from app.services.app_settings import payments_enabled, toggle_payments
 from app.services.app_settings import reminder_settings, update_reminder_setting
 from app.services.reminder_center import reminder_counts, reminder_dashboard_text, send_manual_reminders
-from app.services.admin_reporting import PROBLEM_CATEGORIES, client_path_text, order_photo_paths, problem_case_error_text, problem_cases_by_category, problem_category_counts, problem_cases_page
+from app.services.admin_reporting import PROBLEM_CATEGORIES, client_path_text, order_photo_paths, problem_case_error_text, problem_cases_by_category, problem_category_counts, problem_cases_page, submitted_cases_count, submitted_cases_page
 from app.services.amount_recovery import format_amount_mismatch_admin_report
 from app.services.document_delivery import schedule_document_delivery
 from app.services.legal_data import FIELD_LABELS, normalize_order_data
@@ -73,17 +73,23 @@ async def _deny(client: MaxBotClient, event: IncomingEvent, user: User, manager:
 
 async def _show_cases(client, event, session, user: User, payments_only: bool, page: int) -> None:
     condition = Case.status == CaseStatus.PAYMENT_PENDING.value if payments_only else None
-    count = select(func.count(Case.id))
-    if condition is not None:
-        count = count.where(condition)
-    total = int(await session.scalar(count) or 0)
+    if payments_only:
+        total = int(await session.scalar(select(func.count(Case.id)).where(condition)) or 0)
+    else:
+        total = await submitted_cases_count(session)
     pages = max(1, math.ceil(total / PAGE_SIZE))
     page = max(0, min(page, pages - 1))
-    query = select(Case)
-    if condition is not None:
-        query = query.where(condition)
-    query = query.order_by(Case.created_at.desc()).offset(page * PAGE_SIZE).limit(PAGE_SIZE)
-    cases = list((await session.execute(query)).scalars())
+    if payments_only:
+        query = (
+            select(Case)
+            .where(condition)
+            .order_by(Case.created_at.desc())
+            .offset(page * PAGE_SIZE)
+            .limit(PAGE_SIZE)
+        )
+        cases = list((await session.execute(query)).scalars())
+    else:
+        cases = await submitted_cases_page(session, page, PAGE_SIZE)
     if not cases:
         text = 'Неоплаченных предпросмотров пока нет.' if payments_only else 'Заявок пока нет.'
         keyboard = keyboards.admin_panel(payments_enabled()) if user.is_admin else keyboards.manager_panel()
@@ -92,7 +98,8 @@ async def _show_cases(client, event, session, user: User, payments_only: bool, p
     items = []
     for case in cases:
         await session.refresh(case, ['user'])
-        date = case.created_at.strftime('%d.%m') if case.created_at else ''
+        application_created_at = case.order_photo_uploaded_at or case.created_at
+        date = application_created_at.strftime('%d.%m') if application_created_at else ''
         items.append((case.id, f'#{case.id} • {date} • {full_name(case.user)}'))
     prefix = 'admin:payments' if payments_only else 'admin:cases'
     if payments_only:
@@ -169,7 +176,7 @@ async def _show_case(client, event, session, data: str) -> None:
 
 async def _show_stats(client, event, session) -> None:
     users = int(await session.scalar(select(func.count(User.id))) or 0)
-    cases = int(await session.scalar(select(func.count(Case.id))) or 0)
+    cases = await submitted_cases_count(session)
     pending = int(await session.scalar(select(func.count(Case.id)).where(Case.status == CaseStatus.PAYMENT_PENDING.value)) or 0)
     paid_statuses = [CaseStatus.PAID.value, CaseStatus.DELIVERED.value]
     paid = int(await session.scalar(select(func.count(Case.id)).where(Case.status.in_(paid_statuses))) or 0)

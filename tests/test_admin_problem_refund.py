@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.models import Base, Case, CrmSyncLog, Payment, User
-from app.services.admin_reporting import client_path_text, problem_case_error_text, problem_cases_page
+from app.services.admin_reporting import client_path_text, problem_case_error_text, problem_cases_page, submitted_cases_count, submitted_cases_page
 from app.services.payments import net_payment_totals, record_manual_refund
 from app.services.received_date import received_date_prompt_text
 from app.keyboards.common import admin_panel
@@ -95,6 +95,39 @@ async def test_problem_cases_page_returns_problem_cases_and_errors(session_facto
         assert [case.id for case in cases] == [bad_case.id]
         assert errors[bad_case.id] == "OCR не смог прочитать дату"
         assert await problem_case_error_text(session, bad_case.id) == "OCR не смог прочитать дату"
+
+
+@pytest.mark.asyncio
+async def test_submitted_cases_exclude_empty_rows_and_show_newest_application_first(session_factory):
+    async with session_factory() as session:
+        user = User(platform="telegram", platform_user_id="submitted-list")
+        session.add(user)
+        await session.flush()
+        empty = Case(
+            user_id=user.id,
+            created_at=datetime(2026, 7, 31, 15, 2),
+            order_photo_path=None,
+        )
+        older_application = Case(
+            user_id=user.id,
+            created_at=datetime(2026, 7, 31, 15, 3),
+            order_photo_path="storage/old.jpg",
+            order_photo_uploaded_at=datetime(2026, 7, 31, 15, 4),
+        )
+        newest_application = Case(
+            user_id=user.id,
+            created_at=datetime(2026, 7, 1, 10, 0),
+            order_photo_path="storage/new.jpg",
+            order_photo_uploaded_at=datetime(2026, 7, 31, 15, 5),
+        )
+        session.add_all([empty, older_application, newest_application])
+        await session.commit()
+
+        cases = await submitted_cases_page(session, 0, 5)
+
+        assert await submitted_cases_count(session) == 2
+        assert [case.id for case in cases] == [newest_application.id, older_application.id]
+        assert empty.id not in {case.id for case in cases}
 
 
 @pytest.mark.asyncio

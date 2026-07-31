@@ -49,6 +49,7 @@ class Case(Base):
     platform_user_id: Mapped[str | None] = mapped_column(String(255), index=True)
     status: Mapped[str] = mapped_column(String(32), default="draft", index=True, nullable=False)
     order_photo_path: Mapped[str | None] = mapped_column(Text)
+    order_photo_uploaded_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
     envelope_photo_path: Mapped[str | None] = mapped_column(Text)
     received_date: Mapped[date | None] = mapped_column(Date)
     deadline_date: Mapped[date | None] = mapped_column(Date)
