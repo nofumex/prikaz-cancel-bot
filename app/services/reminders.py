@@ -28,10 +28,15 @@ from app.services.app_settings import reminder_settings
 from app.texts import no_order_deadline_reminder_text, post_payment_court_followup_text, unpaid_document_reminder_text
 from app.services.chat import add_inactivity_notification_ref, open_session
 from app.services.users import get_staff
+from app.utils import full_name
 
 INACTIVITY_TEXT = "Видим, что у вас возникли сложности с использованием сервиса. В ближайшее время с вами свяжется наша служба поддержки и поможет разобраться."
 
 logger = logging.getLogger(__name__)
+
+
+def _inactivity_manager_notice(user: User) -> str:
+    return f"Пользователь {full_name(user)} бездействует 10 минут. Можно подключиться к чату."
 
 
 async def run_payment_reminders(bot: Bot | None = None) -> None:
@@ -52,7 +57,7 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
                     if not sent:
                         continue
                     user.inactivity_offer_sent_at = now
-                    notice = f"Пользователь #{user.id} бездействует 10 минут. Можно подключиться к чату."
+                    notice = _inactivity_manager_notice(user)
                     if user.platform == "telegram" and bot is not None:
                         for staff in await get_staff(session, "telegram"):
                             if staff.telegram_id and staff.admin_notifications_enabled:

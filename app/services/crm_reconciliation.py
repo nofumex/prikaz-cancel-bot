@@ -17,6 +17,8 @@ from app.services.chat_crm_sync import CHAT_MESSAGE_CRM_EVENT, build_chat_messag
 from app.services.crm_background import run_crm_sync_job
 
 logger = logging.getLogger(__name__)
+CRM_RECONCILIATION_INTERVAL_SECONDS = 15 * 60
+CRM_STAGE_RECONCILIATION_VERSION = 2
 
 _HISTORY_SOURCE_EVENTS: dict[str, frozenset[str]] = {
     "started": frozenset({"user_started_bot"}),
@@ -113,6 +115,9 @@ async def _history_jobs_for_user(user_id: int, target_case_id: int) -> list[tupl
                 payload: dict = {"source_event_key": source_key, "note": note}
                 if files:
                     payload["files"] = files
+                history_dedupe_key = crm_event_dedupe_key(target_case_id, "history_replay", payload)
+                if history_dedupe_key in successful_dedupe_keys:
+                    return
                 jobs.append((payload, source_key))
 
             add_case_event(
@@ -226,6 +231,9 @@ async def _history_jobs_for_user(user_id: int, target_case_id: int) -> list[tupl
             ]
             if files:
                 payload["files"] = files
+            history_dedupe_key = crm_event_dedupe_key(target_case_id, "history_replay", payload)
+            if history_dedupe_key in successful_dedupe_keys:
+                continue
             jobs.append((payload, source_key))
     return jobs
 
@@ -289,6 +297,7 @@ async def reconcile_missing_crm_data(settings: Settings) -> dict[str, int]:
             {
                 "status_name_override": _status_for_case(case),
                 "force_status": True,
+                "reconciliation_version": CRM_STAGE_RECONCILIATION_VERSION,
                 "note": f"Этап восстановлен по фактическому статусу заявки #{case.id}: {case.status}",
             },
         )
@@ -315,7 +324,7 @@ async def reconcile_missing_crm_data(settings: Settings) -> dict[str, int]:
             else:
                 result["history_events_failed"] += 1
 
-    pending_messages: list[tuple[int, int, dict, str]] = []
+    pending_messages: list[tuple[int, int, dict, str, int | None]] = []
     async with SessionLocal() as session:
         rows = (
             await session.execute(
@@ -345,22 +354,29 @@ async def reconcile_missing_crm_data(settings: Settings) -> dict[str, int]:
             if payload is None:
                 continue
             key = crm_event_dedupe_key(case.id, CHAT_MESSAGE_CRM_EVENT, payload)
-            pending_messages.append((case.id, customer.id, payload, key))
+            lead_id = case.amocrm_lead_id or case.amo_lead_id
+            pending_messages.append((case.id, customer.id, payload, key, int(lead_id) if lead_id else None))
         await session.commit()
         message_keys = [item[3] for item in pending_messages]
-        successful_keys = set(
+        successful_rows = (
             (
                 await session.execute(
-                    select(CrmSyncLog.dedupe_key).where(
+                    select(CrmSyncLog.dedupe_key, CrmSyncLog.amo_entity_id).where(
                         CrmSyncLog.success.is_(True),
                         CrmSyncLog.dedupe_key.in_(message_keys),
                     )
                 )
-            ).scalars()
-        ) if message_keys else set()
+            ).all()
+            if message_keys
+            else []
+        )
+        successful_message_targets = {
+            (dedupe_key, int(entity_id) if entity_id else None)
+            for dedupe_key, entity_id in successful_rows
+        }
 
-    for case_id, user_id, payload, key in pending_messages:
-        if key in successful_keys:
+    for case_id, user_id, payload, key, lead_id in pending_messages:
+        if (key, lead_id) in successful_message_targets:
             continue
         retried = await run_crm_sync_job(
             settings,
@@ -387,4 +403,4 @@ async def run_crm_reconciliation(settings: Settings) -> None:
             raise
         except Exception:
             logger.exception("CRM reconciliation cycle failed")
-        await asyncio.sleep(60)
+        await asyncio.sleep(CRM_RECONCILIATION_INTERVAL_SECONDS)

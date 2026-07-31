@@ -241,6 +241,101 @@ def test_crm_event_dedupe_key_uses_stable_payload_fields():
     assert first != different
 
 
+def test_stage_reconciliation_version_forces_one_new_repair_attempt():
+    old = crm_event_dedupe_key(
+        63,
+        "crm_stage_reconciliation",
+        {"status_name_override": "Отправил приказ", "reconciliation_version": 1},
+    )
+    current = crm_event_dedupe_key(
+        63,
+        "crm_stage_reconciliation",
+        {"status_name_override": "Отправил приказ", "reconciliation_version": 2},
+    )
+
+    assert old != current
+
+
+@pytest.mark.asyncio
+async def test_sync_case_event_fails_when_stage_was_not_updated():
+    service = AmoCrmService(_settings(amocrm_enabled=True))
+    case = Case(id=63, user_id=1, amocrm_lead_id=123)
+    user = User(id=1, platform="telegram", platform_user_id="1", amocrm_current_case_id=63)
+
+    async def fake_update(*args, **kwargs):
+        return False
+
+    async def fake_lead_exists(*args, **kwargs):
+        return True, None
+
+    service.update_lead_status = fake_update
+    service.lead_exists = fake_lead_exists
+
+    with pytest.raises(RuntimeError, match="did not move lead 123"):
+        await service.sync_case_event(
+            None,
+            case,
+            user,
+            "crm_stage_reconciliation",
+            {"status_name_override": "Отправил приказ", "force_status": True},
+        )
+
+
+@pytest.mark.asyncio
+async def test_deleted_lead_is_recreated_during_stage_reconciliation():
+    service = AmoCrmService(_settings(amocrm_enabled=True))
+    case = Case(id=109, user_id=1, amocrm_lead_id=32404037)
+    user = User(id=1, platform="telegram", platform_user_id="7727079839", amocrm_current_case_id=109)
+    created_statuses = []
+
+    async def fake_lead_exists(lead_id):
+        assert lead_id == 32404037
+        return False, None
+
+    async def fake_contact(user):
+        return None
+
+    async def fake_create(case, user, status_name, **kwargs):
+        created_statuses.append(status_name)
+        return 555
+
+    async def fake_note(case, text):
+        return True
+
+    service.lead_exists = fake_lead_exists
+    service.create_or_update_contact = fake_contact
+    service.create_lead = fake_create
+    service.add_lead_note = fake_note
+
+    await service.sync_case_event(
+        None,
+        case,
+        user,
+        "crm_stage_reconciliation",
+        {
+            "status_name_override": "Указал дату",
+            "force_status": True,
+            "reconciliation_version": 2,
+        },
+    )
+
+    assert case.amocrm_lead_id == 555
+    assert case.amo_lead_id == 555
+    assert created_statuses == ["Указал дату"]
+
+
+@pytest.mark.asyncio
+async def test_empty_get_lead_response_means_lead_was_deleted():
+    service = AmoCrmService(_settings(amocrm_enabled=True))
+
+    async def fake_request(*args, **kwargs):
+        return {}, None
+
+    service.request = fake_request
+
+    assert await service.lead_exists(32404037) == (False, None)
+
+
 @pytest.mark.asyncio
 async def test_sync_case_event_exposes_amocrm_note_http_error():
     service = AmoCrmService(_settings(amocrm_enabled=True))

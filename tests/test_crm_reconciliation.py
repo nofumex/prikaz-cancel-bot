@@ -5,6 +5,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.models import Base, Case, CrmSyncLog, User
 from app.services import crm_reconciliation
+from app.services.amocrm import crm_event_dedupe_key
+
+
+def test_reconciliation_interval_is_fifteen_minutes():
+    assert crm_reconciliation.CRM_RECONCILIATION_INTERVAL_SECONDS == 900
 
 
 @pytest.mark.asyncio
@@ -128,5 +133,52 @@ async def test_history_replay_does_not_trust_success_from_another_lead(monkeypat
         jobs = await crm_reconciliation._history_jobs_for_user(user_id, case_id)
 
         assert "case:%s:order_uploaded" % case_id in {source_key for _, source_key in jobs}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_completed_history_replay_is_not_scheduled_again(monkeypatch, tmp_path):
+    order = tmp_path / "order.jpg"
+    order.write_bytes(b"file")
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    try:
+        async with session_factory() as session:
+            user = User(platform="telegram", platform_user_id="102")
+            session.add(user)
+            await session.flush()
+            case = Case(
+                user_id=user.id,
+                status="waiting_envelope",
+                amocrm_lead_id=333,
+                order_photo_path=str(order),
+            )
+            session.add(case)
+            await session.flush()
+            source_key = f"case:{case.id}:order_uploaded"
+            payload = {"source_event_key": source_key, "note": "restored order"}
+            session.add(
+                CrmSyncLog(
+                    case_id=case.id,
+                    user_id=user.id,
+                    event_type="history_replay",
+                    dedupe_key=crm_event_dedupe_key(case.id, "history_replay", payload),
+                    amo_entity_type="lead",
+                    amo_entity_id=333,
+                    success=True,
+                )
+            )
+            await session.commit()
+            user_id = user.id
+            case_id = case.id
+
+        monkeypatch.setattr(crm_reconciliation, "SessionLocal", session_factory)
+        jobs = await crm_reconciliation._history_jobs_for_user(user_id, case_id)
+
+        assert source_key not in {job_source_key for _, job_source_key in jobs}
     finally:
         await engine.dispose()
