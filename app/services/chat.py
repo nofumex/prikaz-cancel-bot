@@ -115,8 +115,26 @@ async def close_session(session: AsyncSession, chat: ChatSession) -> None:
     await session.commit()
 
 
-async def save_message(session: AsyncSession, chat: ChatSession, sender: User, text: str, role: str) -> ChatMessage:
-    message = ChatMessage(session_id=chat.id, sender_id=sender.id, text=text, sender_role=role)
+async def save_message(
+    session: AsyncSession,
+    chat: ChatSession,
+    sender: User,
+    text: str,
+    role: str,
+    *,
+    attachment_path: str | None = None,
+    attachment_name: str | None = None,
+    attachment_type: str | None = None,
+) -> ChatMessage:
+    message = ChatMessage(
+        session_id=chat.id,
+        sender_id=sender.id,
+        text=text,
+        sender_role=role,
+        attachment_path=attachment_path,
+        attachment_name=attachment_name,
+        attachment_type=attachment_type,
+    )
     session.add(message)
     await session.commit()
     await session.refresh(message)

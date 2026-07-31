@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from pathlib import Path
 
 import pytest
 
@@ -128,6 +129,62 @@ def test_user_message_received_dedupe_key_is_stable():
 
     assert first == same
     assert first != different
+
+
+def test_chat_message_payload_contains_real_attachment(tmp_path):
+    from app.services.chat_crm_sync import build_chat_message_payload
+
+    attachment = tmp_path / "order.jpg"
+    attachment.write_bytes(b"real image bytes")
+    user = SimpleNamespace(
+        id=11,
+        first_name="Иван",
+        last_name=None,
+        username=None,
+        platform="telegram",
+        telegram_id=101,
+        platform_user_id="101",
+    )
+
+    payload = build_chat_message_payload(
+        platform="telegram",
+        customer=user,
+        text="[вложение: фото]",
+        sender_role="user",
+        chat_session_id=7,
+        external_message_id="chat:15",
+        attachment_path=str(attachment),
+        attachment_name="приказ.jpg",
+    )
+
+    assert payload["files"] == [{"path": str(attachment), "caption": "приказ.jpg"}]
+
+
+@pytest.mark.asyncio
+async def test_telegram_chat_attachment_is_downloaded(monkeypatch, tmp_path):
+    from app.handlers import chat as module
+
+    async def download(_file_id, *, destination):
+        destination.write_bytes(b"telegram photo")
+
+    monkeypatch.chdir(tmp_path)
+    bot = SimpleNamespace(download=download)
+    message = SimpleNamespace(
+        photo=[SimpleNamespace(file_id="photo-file-id")],
+        document=None,
+        video=None,
+        voice=None,
+        audio=None,
+        sticker=None,
+        chat=SimpleNamespace(id=101),
+        message_id=55,
+    )
+
+    path, name, attachment_type = await module._store_telegram_attachment(bot, message)
+
+    assert Path(path).read_bytes() == b"telegram photo"
+    assert name == "photo.jpg"
+    assert attachment_type == "photo"
 
 
 @pytest.mark.asyncio

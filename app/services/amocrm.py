@@ -42,6 +42,8 @@ DEDUPED_EVENTS = {
     "documents_delivered",
     "user_message_received",
     "chat_message",
+    "history_replay",
+    "crm_stage_reconciliation",
 }
 
 
@@ -62,6 +64,10 @@ def crm_event_dedupe_key(case_id: int | None, event_type: str, payload: dict | N
         stable["platform"] = payload.get("platform")
         stable["external_message_id"] = payload.get("external_message_id")
         stable["sender_role"] = payload.get("sender_role")
+    elif event_type == "history_replay":
+        stable["source_event_key"] = payload.get("source_event_key")
+    elif event_type == "crm_stage_reconciliation":
+        stable["target_status"] = payload.get("status_name_override")
     else:
         stable["payload"] = payload
     return json.dumps(stable, ensure_ascii=False, sort_keys=True, default=str)
@@ -805,7 +811,7 @@ class AmoCrmService:
                 )
             return
 
-        status_name = EVENT_STATUS_MAP.get(event_type)
+        status_name = str(payload.get("status_name_override") or "").strip() or EVENT_STATUS_MAP.get(event_type)
         response_payload: dict[str, Any] = {}
         current_case_id = user.amocrm_current_case_id
         new_cycle = current_case_id != case.id
@@ -828,7 +834,12 @@ class AmoCrmService:
                 else:
                     raise RuntimeError(f"amoCRM did not create or find a lead for user_id={user.id}")
             elif status_name:
-                await self.update_lead_status(case, status_name, current_case_id=current_case_id, event_case_id=case.id)
+                await self.update_lead_status(
+                    case,
+                    status_name,
+                    current_case_id=None if payload.get("force_status") else current_case_id,
+                    event_case_id=case.id,
+                )
 
             if new_cycle:
                 user.amocrm_current_case_id = case.id

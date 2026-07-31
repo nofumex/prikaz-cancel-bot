@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 
 from app.config import Settings
 from app.models import User
@@ -144,6 +145,8 @@ def schedule_chat_message_crm_sync(
     chat_session_id: int,
     external_message_id: str | None,
     message_datetime: datetime | None = None,
+    attachment_path: str | None = None,
+    attachment_name: str | None = None,
 ) -> None:
     """Synchronize every message persisted in a manager chat."""
     payload = build_chat_message_payload(
@@ -154,6 +157,8 @@ def schedule_chat_message_crm_sync(
         chat_session_id=chat_session_id,
         external_message_id=external_message_id,
         message_datetime=message_datetime,
+        attachment_path=attachment_path,
+        attachment_name=attachment_name,
     )
     if payload is None:
         return
@@ -169,6 +174,8 @@ def build_chat_message_payload(
     chat_session_id: int,
     external_message_id: str | None,
     message_datetime: datetime | None = None,
+    attachment_path: str | None = None,
+    attachment_name: str | None = None,
 ) -> dict | None:
     normalized_text = (text or "").strip()
     if not normalized_text:
@@ -176,7 +183,7 @@ def build_chat_message_payload(
     direction = "outgoing" if sender_role == "manager" else "incoming"
     sender_label = "Менеджер" if sender_role == "manager" else "Пользователь"
     timestamp = message_datetime or datetime.now(tz=UTC)
-    return {
+    payload = {
         "platform": platform,
         "direction": direction,
         "sender_role": sender_role,
@@ -194,3 +201,12 @@ def build_chat_message_payload(
             f"Сессия чата: {chat_session_id}"
         ),
     }
+    path = Path(attachment_path) if attachment_path else None
+    if path and path.is_file():
+        payload["files"] = [
+            {
+                "path": str(path),
+                "caption": attachment_name or path.name or "Вложение из чата",
+            }
+        ]
+    return payload

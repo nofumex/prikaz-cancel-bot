@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import logging
+import re
 
 from app.adapters.max import keyboards
 from app.adapters.max.client import MaxBotClient
@@ -31,11 +32,13 @@ async def _send(client, *, user_id=None, chat_id=None, text='', keyboard=None):
     await client.send_message(user_id=user_id, chat_id=chat_id, text=text, keyboard=keyboard)
 
 
-async def _forward_attachment(client: MaxBotClient, event: IncomingEvent, target_user_id: str, settings) -> bool:
+async def _download_attachment(client: MaxBotClient, event: IncomingEvent, settings) -> Path | None:
     if not (event.photo_url or event.document_url or event.photo_token or event.document_token or event.attachment_id):
-        return False
+        return None
     suffix = Path(event.document_name or 'attachment.jpg').suffix or '.jpg'
-    path = Path(settings.max_download_dir) / 'chat' / f'{event.message_id or event.platform_user_id}{suffix}'
+    source_id = event.message_id or event.attachment_id or event.photo_token or event.document_token or event.platform_user_id
+    safe_id = re.sub(r"[^0-9A-Za-z_-]+", "_", str(source_id)).strip("_")[-80:] or "attachment"
+    path = Path(settings.max_download_dir) / 'chat' / f'{safe_id}{suffix}'
     path.parent.mkdir(parents=True, exist_ok=True)
     url = event.photo_url or event.document_url
     data = None
@@ -48,8 +51,22 @@ async def _forward_attachment(client: MaxBotClient, event: IncomingEvent, target
         if data is None and event.attachment_id:
             data = await client.download_by_id(event.attachment_id)
         if data is None:
-            return False
+            return None
         path.write_bytes(data)
+    return path
+
+
+async def _forward_attachment(
+    client: MaxBotClient,
+    event: IncomingEvent,
+    target_user_id: str,
+    settings,
+    *,
+    attachment_path: Path | None = None,
+) -> bool:
+    path = attachment_path or await _download_attachment(client, event, settings)
+    if path is None:
+        return False
     await client.send_document_to_user(target_user_id, str(path), caption=event.text or None)
     return True
 
@@ -190,12 +207,29 @@ async def _relay_message(client, event, settings, session, user: User) -> bool:
         if chat:
             await session.refresh(chat, ['user'])
             saved = event.text or f'[вложение: {event.document_name or event.attachment_type or file_label}]'
-            stored_message = await save_message(session, chat, user, saved, 'manager')
+            attachment_path = await _download_attachment(client, event, settings) if event.has_raw_attachment else None
+            attachment_name = event.document_name or (attachment_path.name if attachment_path else None)
+            stored_message = await save_message(
+                session,
+                chat,
+                user,
+                saved,
+                'manager',
+                attachment_path=str(attachment_path) if attachment_path else None,
+                attachment_name=attachment_name,
+                attachment_type=event.attachment_type,
+            )
             prefix = '<b>Менеджер:</b>\n'
             if event.text:
                 await _send(client, user_id=chat.user.platform_user_id, text=prefix + h(event.text), keyboard=keyboards.chat_end_menu())
             if event.has_raw_attachment:
-                forwarded = await _forward_attachment(client, event, chat.user.platform_user_id, settings)
+                forwarded = await _forward_attachment(
+                    client,
+                    event,
+                    chat.user.platform_user_id,
+                    settings,
+                    attachment_path=attachment_path,
+                )
                 if not forwarded:
                     await _send(client, chat_id=event.chat_id, text='Не удалось переслать вложение. Отправьте его еще раз.')
             case = await _chat_case(session, chat, chat.user)
@@ -208,6 +242,8 @@ async def _relay_message(client, event, settings, session, user: User) -> bool:
                 sender_role="manager",
                 chat_session_id=chat.id,
                 external_message_id=f"chat:{stored_message.id}" if isinstance(getattr(stored_message, "id", None), int) else event.message_id or None,
+                attachment_path=str(attachment_path) if attachment_path else None,
+                attachment_name=attachment_name,
             )
             return True
     chat = await get_user_active_session(session, user.id)
@@ -215,13 +251,30 @@ async def _relay_message(client, event, settings, session, user: User) -> bool:
         return False
     await session.refresh(chat, ['manager'])
     saved = event.text or f'[вложение: {event.document_name or event.attachment_type or file_label}]'
-    stored_message = await save_message(session, chat, user, saved, 'user')
+    attachment_path = await _download_attachment(client, event, settings) if event.has_raw_attachment else None
+    attachment_name = event.document_name or (attachment_path.name if attachment_path else None)
+    stored_message = await save_message(
+        session,
+        chat,
+        user,
+        saved,
+        'user',
+        attachment_path=str(attachment_path) if attachment_path else None,
+        attachment_name=attachment_name,
+        attachment_type=event.attachment_type,
+    )
     if chat.manager:
         header = f'{full_name(user)} ({username_text(user)}):\n'
         if event.text:
             await _send(client, user_id=chat.manager.platform_user_id, text=header + h(event.text), keyboard=keyboards.manager_panel())
         if event.has_raw_attachment:
-            forwarded = await _forward_attachment(client, event, chat.manager.platform_user_id, settings)
+            forwarded = await _forward_attachment(
+                client,
+                event,
+                chat.manager.platform_user_id,
+                settings,
+                attachment_path=attachment_path,
+            )
             if not forwarded:
                 await _send(client, chat_id=event.chat_id, text='Не удалось переслать вложение. Отправьте его еще раз.')
     else:
@@ -230,7 +283,7 @@ async def _relay_message(client, event, settings, session, user: User) -> bool:
             targets.update(str(item.platform_user_id) for item in await get_staff(session, 'max'))
             for target in targets:
                 try:
-                    await _forward_attachment(client, event, target, settings)
+                    await _forward_attachment(client, event, target, settings, attachment_path=attachment_path)
                 except Exception:
                     logger.exception('Failed to forward pending MAX chat attachment to user_id=%s', target)
         await _send(client, chat_id=event.chat_id, text='Сообщение сохранено. Менеджер подключится, как только освободится.', keyboard=keyboards.chat_end_menu())
@@ -244,5 +297,7 @@ async def _relay_message(client, event, settings, session, user: User) -> bool:
         sender_role="user",
         chat_session_id=chat.id,
         external_message_id=f"chat:{stored_message.id}" if isinstance(getattr(stored_message, "id", None), int) else event.message_id or None,
+        attachment_path=str(attachment_path) if attachment_path else None,
+        attachment_name=attachment_name,
     )
     return True

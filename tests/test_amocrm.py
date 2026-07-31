@@ -223,6 +223,15 @@ def test_crm_stage_moves_forward_only_inside_same_case():
     assert _stage_can_move(63, 64, "\u041e\u043f\u043b\u0430\u0442\u0438\u043b", "\u041f\u043e\u0434\u043f\u0438\u0441\u0430\u043b\u0441\u044f \u043d\u0430 \u0431\u043e\u0442\u0430") is True
 
 
+def test_reconciliation_stage_uses_actual_case_status():
+    from app.services.crm_reconciliation import _status_for_case
+
+    assert _status_for_case(Case(status="waiting_order_photo")) == "Подписался на бота"
+    assert _status_for_case(Case(status="waiting_envelope")) == "Отправил приказ"
+    assert _status_for_case(Case(status="payment_pending")) == "Указал дату"
+    assert _status_for_case(Case(status="delivered")) == "Оплатил"
+
+
 def test_crm_event_dedupe_key_uses_stable_payload_fields():
     first = crm_event_dedupe_key(63, "order_photo_uploaded", {"files": [{"path": "b.jpg"}, {"path": "a.jpg"}]})
     same = crm_event_dedupe_key(63, "order_photo_uploaded", {"files": [{"path": "a.jpg"}, {"path": "b.jpg"}]})

@@ -124,6 +124,15 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("inactivity_notification_refs", "inactivity_notification_refs TEXT"),
         ],
     )
+    await _sqlite_add_columns(
+        conn,
+        "chat_messages",
+        [
+            ("attachment_path", "attachment_path TEXT"),
+            ("attachment_name", "attachment_name VARCHAR(512)"),
+            ("attachment_type", "attachment_type VARCHAR(64)"),
+        ],
+    )
 
     await conn.exec_driver_sql(
         """

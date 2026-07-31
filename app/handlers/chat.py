@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
@@ -163,6 +166,36 @@ def _telegram_message_text(message: Message) -> str:
     return f"[вложение: {label}]" + (f" {text}" if text else "")
 
 
+def _telegram_attachment_info(message: Message) -> tuple[str, str, str] | None:
+    if getattr(message, "photo", None):
+        return message.photo[-1].file_id, "photo.jpg", "photo"
+    if getattr(message, "document", None):
+        return message.document.file_id, message.document.file_name or "document", "document"
+    if getattr(message, "video", None):
+        return message.video.file_id, message.video.file_name or "video.mp4", "video"
+    if getattr(message, "voice", None):
+        return message.voice.file_id, "voice.ogg", "voice"
+    if getattr(message, "audio", None):
+        return message.audio.file_id, message.audio.file_name or "audio.mp3", "audio"
+    if getattr(message, "sticker", None):
+        return message.sticker.file_id, "sticker.webp", "sticker"
+    return None
+
+
+async def _store_telegram_attachment(bot: Bot, message: Message) -> tuple[str | None, str | None, str | None]:
+    info = _telegram_attachment_info(message)
+    if info is None:
+        return None, None, None
+    file_id, original_name, attachment_type = info
+    safe_name = re.sub(r"[^0-9A-Za-zА-Яа-яЁё._-]+", "_", Path(original_name).name).strip("._") or "attachment"
+    chat_id = getattr(getattr(message, "chat", None), "id", "unknown")
+    message_id = getattr(message, "message_id", "unknown")
+    path = Path("storage/chat/telegram") / f"{chat_id}_{message_id}_{safe_name}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    await bot.download(file_id, destination=path)
+    return str(path), original_name, attachment_type
+
+
 async def _chat_case(session: AsyncSession, chat, customer: User, *, chat_id: str | None = None) -> Case:
     case_id = getattr(chat, "case_id", None)
     case = await session.get(Case, case_id) if case_id else await latest_open_case(session, customer.id)
@@ -187,7 +220,17 @@ async def relay_chat_message(message: Message, bot: Bot, session: AsyncSession, 
         chat = await get_manager_active_session(session, current_user.id)
         if chat:
             await session.refresh(chat, ["user"])
-            stored_message = await save_message(session, chat, current_user, saved, "manager")
+            attachment_path, attachment_name, attachment_type = await _store_telegram_attachment(bot, message)
+            stored_message = await save_message(
+                session,
+                chat,
+                current_user,
+                saved,
+                "manager",
+                attachment_path=attachment_path,
+                attachment_name=attachment_name,
+                attachment_type=attachment_type,
+            )
             if chat.user.telegram_id:
                 if message.text:
                     await bot.send_message(chat.user.telegram_id, f"<b>Менеджер:</b>\n{h(message.text)}", reply_markup=chat_end_menu())
@@ -204,13 +247,25 @@ async def relay_chat_message(message: Message, bot: Bot, session: AsyncSession, 
                 chat_session_id=chat.id,
                 external_message_id=f"chat:{stored_message.id}" if isinstance(getattr(stored_message, "id", None), int) else external_message_id,
                 message_datetime=getattr(message, "date", None),
+                attachment_path=attachment_path,
+                attachment_name=attachment_name,
             )
             return
     chat = await get_user_active_session(session, current_user.id)
     if not chat:
         return
     await session.refresh(chat, ["manager"])
-    stored_message = await save_message(session, chat, current_user, saved, "user")
+    attachment_path, attachment_name, attachment_type = await _store_telegram_attachment(bot, message)
+    stored_message = await save_message(
+        session,
+        chat,
+        current_user,
+        saved,
+        "user",
+        attachment_path=attachment_path,
+        attachment_name=attachment_name,
+        attachment_type=attachment_type,
+    )
     if chat.manager and chat.manager.telegram_id:
         if message.text:
             await bot.send_message(chat.manager.telegram_id, f"{full_name(current_user)} ({username_text(current_user)}):\n{h(message.text)}", reply_markup=manager_panel())
@@ -229,4 +284,6 @@ async def relay_chat_message(message: Message, bot: Bot, session: AsyncSession, 
         chat_session_id=chat.id,
         external_message_id=f"chat:{stored_message.id}" if isinstance(getattr(stored_message, "id", None), int) else external_message_id,
         message_datetime=getattr(message, "date", None),
+        attachment_path=attachment_path,
+        attachment_name=attachment_name,
     )

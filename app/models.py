@@ -181,6 +181,9 @@ class ChatMessage(Base):
     sender_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
     sender_role: Mapped[str] = mapped_column(String(32), nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
+    attachment_path: Mapped[str | None] = mapped_column(Text)
+    attachment_name: Mapped[str | None] = mapped_column(String(512))
+    attachment_type: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 
