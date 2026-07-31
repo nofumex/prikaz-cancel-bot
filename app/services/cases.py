@@ -65,6 +65,22 @@ async def latest_case(session: AsyncSession, user_id: int) -> Case | None:
     return result.scalar_one_or_none()
 
 
+async def ensure_user_has_case(
+    session: AsyncSession,
+    user: User,
+    *,
+    chat_id: str | None = None,
+) -> tuple[Case, bool]:
+    """Return a stable CRM target, creating the user's first case if needed."""
+    case = await latest_case(session, user.id)
+    if case is not None:
+        if chat_id and not case.platform_chat_id:
+            case.platform_chat_id = chat_id
+            await session.commit()
+        return case, False
+    return await create_case(session, user, chat_id=chat_id), True
+
+
 async def generated_cases(session: AsyncSession, user_id: int) -> list[Case]:
     result = await session.execute(
         select(Case)

@@ -21,6 +21,7 @@ from app.services.document_templates.statement_templates import (
     build_statement_paragraphs,
     date_long_text,
     debtor_short_name,
+    has_render_payload,
     missing_render_fields,
     signature_date_text,
 )
@@ -289,7 +290,7 @@ def create_case_documents(
     ensure_dir(DOCUMENT_DIR)
     case_dir = ensure_dir(DOCUMENT_DIR / f"case_{case.id}")
     data = normalize_order_data(safe_json_loads(case.extracted_json, {}))
-    missing_render = missing_render_fields(data)
+    missing_render = missing_render_fields(data) if has_render_payload(data) else []
     if missing_render:
         labels = {
             "court_addressee": "адресат суда", "court_address": "адрес суда",

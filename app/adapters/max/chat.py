@@ -7,7 +7,7 @@ from app.adapters.max import keyboards
 from app.adapters.max.client import MaxBotClient
 from app.adapters.max.mapper import IncomingEvent
 from app.models import Case, User
-from app.services.cases import latest_open_case
+from app.services.cases import ensure_user_has_case, latest_case
 from app.services.chat import (
     close_session,
     connect_manager,
@@ -18,12 +18,13 @@ from app.services.chat import (
     save_message,
     delete_inactivity_notifications,
 )
-from app.services.chat_crm_sync import schedule_incoming_user_message_crm_sync
+from app.services.chat_crm_sync import schedule_chat_message_crm_sync
 from app.services.crm_background import schedule_crm_sync
 from app.services.users import get_staff
 from app.utils import full_name, h, username_text
 
 logger = logging.getLogger(__name__)
+latest_open_case = latest_case  # Compatibility name; includes completed cases.
 
 
 async def _send(client, *, user_id=None, chat_id=None, text='', keyboard=None):
@@ -72,7 +73,10 @@ async def _notify_staff(client, session, settings, text, keyboard=None):
 
 
 async def _start_chat(client, event, session, settings, user):
-    chat = await open_session(session, user)
+    case = await latest_open_case(session, user.id)
+    if case is None and getattr(settings, "amocrm_enabled", False):
+        case, _ = await ensure_user_has_case(session, user, chat_id=event.chat_id)
+    chat = await open_session(session, user, case_id=case.id if case else None)
     await _send(
         client,
         chat_id=event.chat_id,
@@ -81,7 +85,6 @@ async def _start_chat(client, event, session, settings, user):
     )
     text = f'Новый чат MAX: {full_name(user)} ({username_text(user)})'
     await _notify_staff(client, session, settings, text, keyboards.connect_chat_keyboard(chat.id))
-    case = await latest_open_case(session, user.id)
     if case:
         schedule_crm_sync(settings, case.id, user.id, 'manager_requested', {'note': 'MAX: пользователь открыл live chat'})
 
@@ -148,7 +151,7 @@ async def handle_chat_update(client, event, settings, session, user: User) -> bo
             await _send(client, chat_id=event.chat_id, text='Заявка не найдена.')
             return True
         await session.refresh(case, ['user'])
-        chat = await open_session(session, case.user)
+        chat = await open_session(session, case.user, case_id=case.id)
         chat, connected, busy = await connect_manager(session, chat, user)
         if busy or not connected:
             await _send(client, chat_id=event.chat_id, text='Чат уже занят или у вас есть активный чат.')
@@ -168,6 +171,18 @@ async def handle_chat_update(client, event, settings, session, user: User) -> bo
     return await _relay_message(client, event, settings, session, user)
 
 
+async def _chat_case(session, chat, customer: User, *, chat_id: str | None = None) -> Case:
+    case_id = getattr(chat, "case_id", None)
+    case = await session.get(Case, case_id) if case_id else await latest_open_case(session, customer.id)
+    if case is None:
+        case, _ = await ensure_user_has_case(session, customer, chat_id=chat_id)
+    if getattr(chat, "case_id", None) is None:
+        chat.case_id = case.id
+        if hasattr(session, "commit"):
+            await session.commit()
+    return case
+
+
 async def _relay_message(client, event, settings, session, user: User) -> bool:
     file_label = 'файл'
     if user.is_manager:
@@ -175,7 +190,7 @@ async def _relay_message(client, event, settings, session, user: User) -> bool:
         if chat:
             await session.refresh(chat, ['user'])
             saved = event.text or f'[вложение: {event.document_name or event.attachment_type or file_label}]'
-            await save_message(session, chat, user, saved, 'manager')
+            stored_message = await save_message(session, chat, user, saved, 'manager')
             prefix = '<b>Менеджер:</b>\n'
             if event.text:
                 await _send(client, user_id=chat.user.platform_user_id, text=prefix + h(event.text), keyboard=keyboards.chat_end_menu())
@@ -183,22 +198,24 @@ async def _relay_message(client, event, settings, session, user: User) -> bool:
                 forwarded = await _forward_attachment(client, event, chat.user.platform_user_id, settings)
                 if not forwarded:
                     await _send(client, chat_id=event.chat_id, text='Не удалось переслать вложение. Отправьте его еще раз.')
-            case = await latest_open_case(session, chat.user.id)
-            if case:
-                schedule_crm_sync(
-                    settings,
-                    case.id,
-                    chat.user.id,
-                    'manager_reply_sent',
-                    {'note': f'\u0421\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435 \u043c\u0435\u043d\u0435\u0434\u0436\u0435\u0440\u0430: {saved[:500]}'},
-                )
+            case = await _chat_case(session, chat, chat.user)
+            schedule_chat_message_crm_sync(
+                settings,
+                platform="max",
+                customer=chat.user,
+                case_id=case.id,
+                text=saved,
+                sender_role="manager",
+                chat_session_id=chat.id,
+                external_message_id=f"chat:{stored_message.id}" if isinstance(getattr(stored_message, "id", None), int) else event.message_id or None,
+            )
             return True
     chat = await get_user_active_session(session, user.id)
     if not chat:
         return False
     await session.refresh(chat, ['manager'])
     saved = event.text or f'[вложение: {event.document_name or event.attachment_type or file_label}]'
-    await save_message(session, chat, user, saved, 'user')
+    stored_message = await save_message(session, chat, user, saved, 'user')
     if chat.manager:
         header = f'{full_name(user)} ({username_text(user)}):\n'
         if event.text:
@@ -217,16 +234,15 @@ async def _relay_message(client, event, settings, session, user: User) -> bool:
                 except Exception:
                     logger.exception('Failed to forward pending MAX chat attachment to user_id=%s', target)
         await _send(client, chat_id=event.chat_id, text='Сообщение сохранено. Менеджер подключится, как только освободится.', keyboard=keyboards.chat_end_menu())
-    if event.text and event.text.strip():
-        case = await latest_open_case(session, user.id)
-        schedule_incoming_user_message_crm_sync(
-            settings,
-            platform="max",
-            user=user,
-            case_id=case.id if case else None,
-            text=event.text,
-            chat_session_id=chat.id,
-            external_message_id=event.message_id or None,
-            message_datetime=None,
-        )
+    case = await _chat_case(session, chat, user, chat_id=event.chat_id)
+    schedule_chat_message_crm_sync(
+        settings,
+        platform="max",
+        customer=user,
+        case_id=case.id,
+        text=saved,
+        sender_role="user",
+        chat_session_id=chat.id,
+        external_message_id=f"chat:{stored_message.id}" if isinstance(getattr(stored_message, "id", None), int) else event.message_id or None,
+    )
     return True

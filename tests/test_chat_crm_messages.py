@@ -29,7 +29,7 @@ async def test_telegram_user_message_is_added_to_crm(monkeypatch):
     monkeypatch.setattr(module, "get_user_active_session", AsyncMock(return_value=active_chat))
     monkeypatch.setattr(module, "save_message", AsyncMock())
     monkeypatch.setattr(module, "latest_open_case", AsyncMock(return_value=case))
-    monkeypatch.setattr(module, "schedule_incoming_user_message_crm_sync", lambda *args, **kwargs: scheduled.append((args, kwargs)))
+    monkeypatch.setattr(module, "schedule_chat_message_crm_sync", lambda *args, **kwargs: scheduled.append((args, kwargs)))
 
     await module.relay_chat_message(message, bot, session, customer, settings)
 
@@ -38,6 +38,7 @@ async def test_telegram_user_message_is_added_to_crm(monkeypatch):
     assert kwargs["platform"] == "telegram"
     assert kwargs["case_id"] == 33
     assert kwargs["text"] == "тест"
+    assert kwargs["sender_role"] == "user"
     assert kwargs["chat_session_id"] == 7
     assert kwargs["external_message_id"] == "555:42"
 
@@ -59,7 +60,7 @@ async def test_max_user_message_is_added_to_crm(monkeypatch):
     monkeypatch.setattr(module, "save_message", AsyncMock())
     monkeypatch.setattr(module, "latest_open_case", AsyncMock(return_value=case))
     monkeypatch.setattr(module, "get_staff", AsyncMock(return_value=[]))
-    monkeypatch.setattr(module, "schedule_incoming_user_message_crm_sync", lambda *args, **kwargs: scheduled.append((args, kwargs)))
+    monkeypatch.setattr(module, "schedule_chat_message_crm_sync", lambda *args, **kwargs: scheduled.append((args, kwargs)))
 
     handled = await module._relay_message(client, event, settings, session, customer)
 
@@ -69,6 +70,7 @@ async def test_max_user_message_is_added_to_crm(monkeypatch):
     assert kwargs["platform"] == "max"
     assert kwargs["case_id"] == 33
     assert kwargs["text"] == "тест"
+    assert kwargs["sender_role"] == "user"
     assert kwargs["external_message_id"] == "mid-1"
 
 
@@ -134,7 +136,7 @@ async def test_telegram_manager_reply_is_added_to_crm(monkeypatch):
 
     customer = SimpleNamespace(id=11, telegram_id=101)
     manager = SimpleNamespace(id=22, is_manager=True)
-    active_chat = SimpleNamespace(user=customer)
+    active_chat = SimpleNamespace(id=7, user=customer)
     case = SimpleNamespace(id=33)
     session = SimpleNamespace(refresh=AsyncMock())
     bot = SimpleNamespace(send_message=AsyncMock())
@@ -145,14 +147,15 @@ async def test_telegram_manager_reply_is_added_to_crm(monkeypatch):
     monkeypatch.setattr(module, "get_manager_active_session", AsyncMock(return_value=active_chat))
     monkeypatch.setattr(module, "save_message", AsyncMock())
     monkeypatch.setattr(module, "latest_open_case", AsyncMock(return_value=case))
-    monkeypatch.setattr(module, "schedule_crm_sync", lambda *args: scheduled.append(args))
+    monkeypatch.setattr(module, "schedule_chat_message_crm_sync", lambda *args, **kwargs: scheduled.append((args, kwargs)))
 
     await module.relay_chat_message(message, bot, session, manager, settings)
 
     assert len(scheduled) == 1
-    assert scheduled[0][0] is settings
-    assert scheduled[0][1:4] == (33, 11, "manager_reply_sent")
-    assert message.text in scheduled[0][4]["note"]
+    assert scheduled[0][0][0] is settings
+    assert scheduled[0][1]["case_id"] == 33
+    assert scheduled[0][1]["sender_role"] == "manager"
+    assert scheduled[0][1]["text"] == message.text
 
 
 @pytest.mark.asyncio
@@ -161,7 +164,7 @@ async def test_max_manager_reply_is_added_to_crm(monkeypatch):
 
     customer = SimpleNamespace(id=11, platform_user_id="101")
     manager = SimpleNamespace(id=22, is_manager=True)
-    active_chat = SimpleNamespace(user=customer)
+    active_chat = SimpleNamespace(id=7, user=customer)
     case = SimpleNamespace(id=33)
     session = SimpleNamespace(refresh=AsyncMock())
     client = SimpleNamespace(send_message=AsyncMock())
@@ -172,11 +175,12 @@ async def test_max_manager_reply_is_added_to_crm(monkeypatch):
     monkeypatch.setattr(module, "get_manager_active_session", AsyncMock(return_value=active_chat))
     monkeypatch.setattr(module, "save_message", AsyncMock())
     monkeypatch.setattr(module, "latest_open_case", AsyncMock(return_value=case))
-    monkeypatch.setattr(module, "schedule_crm_sync", lambda *args: scheduled.append(args))
+    monkeypatch.setattr(module, "schedule_chat_message_crm_sync", lambda *args, **kwargs: scheduled.append((args, kwargs)))
 
     handled = await module._relay_message(client, event, settings, session, manager)
 
     assert handled is True
-    assert scheduled == [
-        (settings, 33, 11, "manager_reply_sent", {"note": "Сообщение менеджера: Добрый день"})
-    ]
+    assert scheduled[0][0][0] is settings
+    assert scheduled[0][1]["case_id"] == 33
+    assert scheduled[0][1]["sender_role"] == "manager"
+    assert scheduled[0][1]["text"] == "Добрый день"

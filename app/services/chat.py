@@ -56,11 +56,14 @@ async def close_inactivity_sessions(session: AsyncSession, user_id: int, setting
             chat.closed_at = datetime.utcnow()
 
 
-async def open_session(session: AsyncSession, user: User) -> ChatSession:
+async def open_session(session: AsyncSession, user: User, *, case_id: int | None = None) -> ChatSession:
     existing = await get_user_active_session(session, user.id)
     if existing:
+        if case_id is not None and existing.case_id is None:
+            existing.case_id = case_id
+            await session.commit()
         return existing
-    chat = ChatSession(user_id=user.id, status=ChatStatus.OPEN.value)
+    chat = ChatSession(user_id=user.id, case_id=case_id, status=ChatStatus.OPEN.value)
     session.add(chat)
     await session.commit()
     await session.refresh(chat)
@@ -112,6 +115,9 @@ async def close_session(session: AsyncSession, chat: ChatSession) -> None:
     await session.commit()
 
 
-async def save_message(session: AsyncSession, chat: ChatSession, sender: User, text: str, role: str) -> None:
-    session.add(ChatMessage(session_id=chat.id, sender_id=sender.id, text=text, sender_role=role))
+async def save_message(session: AsyncSession, chat: ChatSession, sender: User, text: str, role: str) -> ChatMessage:
+    message = ChatMessage(session_id=chat.id, sender_id=sender.id, text=text, sender_role=role)
+    session.add(message)
     await session.commit()
+    await session.refresh(message)
+    return message

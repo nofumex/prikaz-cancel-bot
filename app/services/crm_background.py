@@ -90,7 +90,7 @@ async def run_crm_sync_job(
                 raise
             except Exception as exc:
                 last_error = _safe_error(exc)
-                if event_type == "user_message_received":
+                if event_type in {"user_message_received", "chat_message"}:
                     logger.exception(
                         "CRM sync failed event=%s case_id=%s platform=%s external_message_id=%s",
                         event_type,

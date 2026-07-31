@@ -6,9 +6,9 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.keyboards.common import chat_end_menu, connect_chat_keyboard, main_menu, manager_panel
-from app.models import User
-from app.services.cases import latest_open_case
-from app.services.chat_crm_sync import schedule_incoming_user_message_crm_sync
+from app.models import Case, User
+from app.services.cases import ensure_user_has_case, latest_case
+from app.services.chat_crm_sync import schedule_chat_message_crm_sync
 from app.services.crm_background import schedule_crm_sync
 from app.services.chat import (
     close_session,
@@ -25,6 +25,7 @@ from app.texts import manager_request_text
 from app.utils import full_name, h, username_text
 
 router = Router(name="chat")
+latest_open_case = latest_case  # Compatibility name; unlike the old query it also returns completed cases.
 
 
 async def _notify_staff(bot: Bot, session: AsyncSession, text: str, reply_markup=None) -> None:
@@ -34,15 +35,14 @@ async def _notify_staff(bot: Bot, session: AsyncSession, text: str, reply_markup
 
 
 async def _start_chat(message: Message, bot: Bot, session: AsyncSession, current_user: User, settings) -> None:
-    chat = await open_session(session, current_user)
+    case, _ = await ensure_user_has_case(session, current_user, chat_id=str(message.chat.id))
+    chat = await open_session(session, current_user, case_id=case.id)
     await message.answer(
         "Чат с менеджером открыт. Напишите вопрос следующим сообщением, менеджер увидит его здесь.",
         reply_markup=chat_end_menu(),
     )
     await _notify_staff(bot, session, manager_request_text(current_user), reply_markup=connect_chat_keyboard(chat.id))
-    case = await latest_open_case(session, current_user.id)
-    if case:
-        schedule_crm_sync(settings, case.id, current_user.id, "manager_requested", {"note": "Пользователь запросил менеджера"})
+    schedule_crm_sync(settings, case.id, current_user.id, "manager_requested", {"note": "Пользователь запросил менеджера"})
 
 
 @router.message(Command("tutor"))
@@ -110,7 +110,7 @@ async def cb_case_chat(callback: CallbackQuery, bot: Bot, session: AsyncSession,
         await callback.answer("Заявка не найдена", show_alert=True)
         return
     await session.refresh(case, ["user"])
-    chat = await open_session(session, case.user)
+    chat = await open_session(session, case.user, case_id=case.id)
     chat, connected, busy = await connect_manager(session, chat, current_user)
     if busy or not connected:
         await callback.answer("Чат уже занят или у вас есть активный чат", show_alert=True)
@@ -142,45 +142,91 @@ async def end_chat(event: Message | CallbackQuery, bot: Bot, session: AsyncSessi
         await event.answer()
 
 
-@router.message(F.text)
+def _telegram_message_text(message: Message) -> str:
+    text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+    if getattr(message, "text", None):
+        return text
+    if getattr(message, "photo", None):
+        label = "фото"
+    elif getattr(message, "document", None):
+        label = message.document.file_name or "документ"
+    elif getattr(message, "video", None):
+        label = "видео"
+    elif getattr(message, "voice", None):
+        label = "голосовое сообщение"
+    elif getattr(message, "audio", None):
+        label = "аудио"
+    elif getattr(message, "sticker", None):
+        label = "стикер"
+    else:
+        label = "вложение/сообщение"
+    return f"[вложение: {label}]" + (f" {text}" if text else "")
+
+
+async def _chat_case(session: AsyncSession, chat, customer: User, *, chat_id: str | None = None) -> Case:
+    case_id = getattr(chat, "case_id", None)
+    case = await session.get(Case, case_id) if case_id else await latest_open_case(session, customer.id)
+    if case is None:
+        case, _ = await ensure_user_has_case(session, customer, chat_id=chat_id)
+    if getattr(chat, "case_id", None) is None:
+        chat.case_id = case.id
+        if hasattr(session, "commit"):
+            await session.commit()
+    return case
+
+
+@router.message()
 async def relay_chat_message(message: Message, bot: Bot, session: AsyncSession, current_user: User, settings) -> None:
-    if message.text.startswith("/"):
+    if message.text and message.text.startswith("/"):
         return
+    saved = _telegram_message_text(message)
+    message_chat_id = getattr(getattr(message, "chat", None), "id", None)
+    message_id = getattr(message, "message_id", None)
+    external_message_id = f"{message_chat_id}:{message_id}" if message_chat_id is not None and message_id is not None else None
     if current_user.is_manager:
         chat = await get_manager_active_session(session, current_user.id)
         if chat:
             await session.refresh(chat, ["user"])
-            await save_message(session, chat, current_user, message.text, "manager")
+            stored_message = await save_message(session, chat, current_user, saved, "manager")
             if chat.user.telegram_id:
-                await bot.send_message(chat.user.telegram_id, f"<b>Менеджер:</b>\n{h(message.text)}", reply_markup=chat_end_menu())
-            case = await latest_open_case(session, chat.user.id)
-            if case:
-                schedule_crm_sync(
-                    settings,
-                    case.id,
-                    chat.user.id,
-                    "manager_reply_sent",
-                    {"note": f"\u0421\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435 \u043c\u0435\u043d\u0435\u0434\u0436\u0435\u0440\u0430: {message.text[:500]}"},
-                )
+                if message.text:
+                    await bot.send_message(chat.user.telegram_id, f"<b>Менеджер:</b>\n{h(message.text)}", reply_markup=chat_end_menu())
+                else:
+                    await bot.copy_message(chat.user.telegram_id, message.chat.id, message.message_id, reply_markup=chat_end_menu())
+            case = await _chat_case(session, chat, chat.user)
+            schedule_chat_message_crm_sync(
+                settings,
+                platform="telegram",
+                customer=chat.user,
+                case_id=case.id,
+                text=saved,
+                sender_role="manager",
+                chat_session_id=chat.id,
+                external_message_id=f"chat:{stored_message.id}" if isinstance(getattr(stored_message, "id", None), int) else external_message_id,
+                message_datetime=getattr(message, "date", None),
+            )
             return
     chat = await get_user_active_session(session, current_user.id)
     if not chat:
         return
     await session.refresh(chat, ["manager"])
-    await save_message(session, chat, current_user, message.text, "user")
+    stored_message = await save_message(session, chat, current_user, saved, "user")
     if chat.manager and chat.manager.telegram_id:
-        await bot.send_message(chat.manager.telegram_id, f"{full_name(current_user)} ({username_text(current_user)}):\n{h(message.text)}", reply_markup=manager_panel())
+        if message.text:
+            await bot.send_message(chat.manager.telegram_id, f"{full_name(current_user)} ({username_text(current_user)}):\n{h(message.text)}", reply_markup=manager_panel())
+        else:
+            await bot.copy_message(chat.manager.telegram_id, message.chat.id, message.message_id, reply_markup=manager_panel())
     else:
         await message.answer("Сообщение сохранено. Менеджер подключится, как только освободится.", reply_markup=chat_end_menu())
-    case = await latest_open_case(session, current_user.id)
-    schedule_incoming_user_message_crm_sync(
+    case = await _chat_case(session, chat, current_user, chat_id=str(message_chat_id) if message_chat_id is not None else None)
+    schedule_chat_message_crm_sync(
         settings,
         platform="telegram",
-        user=current_user,
-        case_id=case.id if case else None,
-        text=message.text,
+        customer=current_user,
+        case_id=case.id,
+        text=saved,
+        sender_role="user",
         chat_session_id=chat.id,
-        external_message_id=f"{message.chat.id}:{message.message_id}",
-        message_datetime=message.date,
-        is_bot=bool(message.from_user and message.from_user.is_bot),
+        external_message_id=f"chat:{stored_message.id}" if isinstance(getattr(stored_message, "id", None), int) else external_message_id,
+        message_datetime=getattr(message, "date", None),
     )

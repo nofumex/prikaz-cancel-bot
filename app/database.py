@@ -119,7 +119,10 @@ async def _upgrade_sqlite_schema(conn) -> None:
     await _sqlite_add_columns(
         conn,
         "chat_sessions",
-        [("inactivity_notification_refs", "inactivity_notification_refs TEXT")],
+        [
+            ("case_id", "case_id INTEGER"),
+            ("inactivity_notification_refs", "inactivity_notification_refs TEXT"),
+        ],
     )
 
     await conn.exec_driver_sql(

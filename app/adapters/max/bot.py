@@ -19,10 +19,10 @@ from app.database import SessionLocal
 from app.enums import CaseStatus
 from app.models import Case, User
 from app.services.app_settings import payments_enabled
-from app.services.cases import generated_case_for_user, generated_cases, get_or_create_active_case, latest_case, latest_open_case, save_photo_path, set_received_date
+from app.services.cases import ensure_user_has_case, generated_case_for_user, generated_cases, get_or_create_active_case, latest_case, latest_open_case, save_photo_path, set_received_date
 from app.services.crm_background import schedule_crm_sync
 from app.services.document_delivery import deliver_documents_to_case_platform
-from app.services.documents import MANUAL_REVIEW_USER_TEXT, create_case_documents_reviewed, extraction_preview
+from app.services.documents import create_case_documents_reviewed, extraction_preview
 from app.services.document_background import start_document_preparation, wait_started_document_preparation
 from app.services.legal_data import FIELD_LABELS, is_deadline_missed, missing_order_fields, normalize_debtor_name_fields, normalize_order_data, suggest_nominative_full_name
 from app.services.llm import extract_envelope_date, extract_order_data
@@ -53,6 +53,10 @@ STATE_PAYMENT_CONTACT = 'max_waiting_payment_contact'
 STATE_RESTORE_REASON = 'max_waiting_restore_reason'
 STATE_PAID_FIELD = 'max_waiting_paid_field'
 STATE_PAID_DATE = 'max_waiting_paid_date'
+DOCUMENT_GENERATION_FAILURE_TEXT = (
+    "Причина пропуска срока сохранена, но документ не удалось сформировать из-за технической ошибки. "
+    "Повторно фотографировать приказ не нужно — менеджер уже получил информацию и поможет завершить заявление."
+)
 
 
 async def _send(client: MaxBotClient, event: IncomingEvent, text: str, keyboard=None) -> None:
@@ -346,6 +350,16 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             first_name=event.first_name,
             last_name=event.last_name,
         )
+        if settings.amocrm_enabled and not user.is_admin and not user.is_manager:
+            crm_case, created = await ensure_user_has_case(session, user, chat_id=event.chat_id)
+            if created or not (crm_case.amocrm_lead_id or crm_case.amo_lead_id):
+                schedule_crm_sync(
+                    settings,
+                    crm_case.id,
+                    user.id,
+                    "user_started_bot" if created else "crm_reconciliation",
+                    {"note": "MAX: пользователь зарегистрирован в боте"},
+                )
         if event.callback_id:
             await client.answer_callback(event.callback_id)
         data = event.callback_data
@@ -1108,9 +1122,8 @@ async def _generate_documents(client: MaxBotClient, event: IncomingEvent, sessio
         case.status = CaseStatus.NEEDS_REVIEW.value
         await session.commit()
         schedule_crm_sync(settings, case.id, user.id, "document_qa_failed", {"note": str(exc)})
-        await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})
         await _notify_admin_document_review_failure(client, settings, f"⚠️ QA не пройден по заявке #{case.id}: {exc}")
-        await _send(client, event, MANUAL_REVIEW_USER_TEXT)
+        await _send(client, event, DOCUMENT_GENERATION_FAILURE_TEXT, keyboards.main_menu())
         return
     if not review_outcome.ok or review_outcome.artifacts is None:
         case.status = CaseStatus.NEEDS_REVIEW.value
@@ -1118,7 +1131,7 @@ async def _generate_documents(client: MaxBotClient, event: IncomingEvent, sessio
         report = review_outcome.admin_report or "AI document review failed"
         schedule_crm_sync(settings, case.id, user.id, "document_qa_failed", {"note": report[:65000]})
         await _notify_admin_document_review_failure(client, settings, report)
-        await _send(client, event, MANUAL_REVIEW_USER_TEXT)
+        await _send(client, event, DOCUMENT_GENERATION_FAILURE_TEXT, keyboards.main_menu())
         return
     full_docx = review_outcome.artifacts.full_docx_path
     full_pdf = review_outcome.artifacts.full_pdf_path

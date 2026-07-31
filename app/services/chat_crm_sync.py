@@ -11,6 +11,7 @@ from app.utils import full_name, platform_id_text
 logger = logging.getLogger(__name__)
 
 USER_MESSAGE_CRM_EVENT = "user_message_received"
+CHAT_MESSAGE_CRM_EVENT = "chat_message"
 
 _SERVICE_COMMANDS = {
     "/start",
@@ -130,3 +131,66 @@ def schedule_incoming_user_message_crm_sync(
         ),
     }
     schedule_crm_sync(settings, case_id, user.id, event, payload)
+
+
+def schedule_chat_message_crm_sync(
+    settings: Settings,
+    *,
+    platform: str,
+    customer: User,
+    case_id: int,
+    text: str,
+    sender_role: str,
+    chat_session_id: int,
+    external_message_id: str | None,
+    message_datetime: datetime | None = None,
+) -> None:
+    """Synchronize every message persisted in a manager chat."""
+    payload = build_chat_message_payload(
+        platform=platform,
+        customer=customer,
+        text=text,
+        sender_role=sender_role,
+        chat_session_id=chat_session_id,
+        external_message_id=external_message_id,
+        message_datetime=message_datetime,
+    )
+    if payload is None:
+        return
+    schedule_crm_sync(settings, case_id, customer.id, CHAT_MESSAGE_CRM_EVENT, payload)
+
+
+def build_chat_message_payload(
+    *,
+    platform: str,
+    customer: User,
+    text: str,
+    sender_role: str,
+    chat_session_id: int,
+    external_message_id: str | None,
+    message_datetime: datetime | None = None,
+) -> dict | None:
+    normalized_text = (text or "").strip()
+    if not normalized_text:
+        return None
+    direction = "outgoing" if sender_role == "manager" else "incoming"
+    sender_label = "Менеджер" if sender_role == "manager" else "Пользователь"
+    timestamp = message_datetime or datetime.now(tz=UTC)
+    return {
+        "platform": platform,
+        "direction": direction,
+        "sender_role": sender_role,
+        "user_name": full_name(customer),
+        "user_id": platform_id_text(customer),
+        "text": normalized_text[:2000],
+        "datetime": timestamp.isoformat(),
+        "chat_session_id": chat_session_id,
+        "external_message_id": external_message_id,
+        "note": (
+            f"Переписка с менеджером ({platform})\n"
+            f"Отправитель: {sender_label}\n"
+            f"Клиент: {full_name(customer)} (id: {platform_id_text(customer)})\n"
+            f"Сообщение: {normalized_text[:2000]}\n"
+            f"Сессия чата: {chat_session_id}"
+        ),
+    }

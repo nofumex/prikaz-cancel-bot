@@ -41,6 +41,7 @@ DEDUPED_EVENTS = {
     "payment_paid",
     "documents_delivered",
     "user_message_received",
+    "chat_message",
 }
 
 
@@ -57,9 +58,10 @@ def crm_event_dedupe_key(case_id: int | None, event_type: str, payload: dict | N
         stable["payment"] = payload.get("payment") or payload.get("label") or payload.get("note")
     elif event_type in {"preview_generated", "documents_delivered", "user_started_bot"}:
         stable["case"] = case_id
-    elif event_type == "user_message_received":
+    elif event_type in {"user_message_received", "chat_message"}:
         stable["platform"] = payload.get("platform")
         stable["external_message_id"] = payload.get("external_message_id")
+        stable["sender_role"] = payload.get("sender_role")
     else:
         stable["payload"] = payload
     return json.dumps(stable, ensure_ascii=False, sort_keys=True, default=str)
@@ -823,6 +825,8 @@ class AmoCrmService:
                 if lead_id:
                     case.amocrm_lead_id = lead_id
                     case.amo_lead_id = lead_id
+                else:
+                    raise RuntimeError(f"amoCRM did not create or find a lead for user_id={user.id}")
             elif status_name:
                 await self.update_lead_status(case, status_name, current_case_id=current_case_id, event_case_id=case.id)
 
@@ -866,7 +870,9 @@ class AmoCrmService:
             if attached_files:
                 response_payload["attached_files"] = attached_files
 
-            await self.add_lead_note(case, "\n".join(note_parts))
+            note_added = await self.add_lead_note(case, "\n".join(note_parts))
+            if not note_added:
+                raise RuntimeError(f"amoCRM did not add note to lead {case.amocrm_lead_id or case.amo_lead_id}")
 
             if session:
                 await self._log_sync(

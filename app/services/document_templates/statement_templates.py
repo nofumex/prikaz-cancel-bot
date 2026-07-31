@@ -70,6 +70,13 @@ def render_value(data: dict, name: str) -> str:
     return str(data.get(f"render_{name}") or "").strip()
 
 
+def has_render_payload(data: dict) -> bool:
+    render = data.get("render")
+    return isinstance(render, dict) or any(
+        str(key).startswith("render_") for key in data
+    )
+
+
 def missing_render_fields(data: dict) -> list[str]:
     return [
         name
