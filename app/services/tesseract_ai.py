@@ -1459,7 +1459,9 @@ def _apply_post_validation(
     records: dict[str, dict[str, Any]], issues: list[str],
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     total_for_completion = records.get("total_amount")
-    amount_names = [name for name in ("debt_amount", "interest", "penalty", "state_duty") if name in records]
+    # debt_amount is the complete debt; interest and penalty only explain its
+    # composition and are not independent addends to total_amount.
+    amount_names = [name for name in ("debt_amount", "state_duty") if name in records]
     arithmetic_completion_reasons = {"money_unit_incomplete", "ocr_single_run", "ocr_disagreement"}
     incomplete_names = [
         name for name in amount_names
@@ -1491,7 +1493,7 @@ def _apply_post_validation(
                     value_provenance={
                         "kind": "calculated_unit_completion",
                         "printed_value": record.get("raw_ocr_value", ""),
-                        "formula": "debt_amount + interest + penalty + state_duty = total_amount",
+                        "formula": "debt_amount + state_duty = total_amount",
                     },
                 )
                 issues = [
@@ -1508,7 +1510,7 @@ def _apply_post_validation(
             record.update(status="disputed", document_value="", verification_reason="case_uid_conflict")
         issues.extend(("case_number:case_uid_conflict", "uid:case_uid_conflict"))
     # Printed total must reconcile; failure disputes the involved critical amounts.
-    amount_names = [name for name in ("debt_amount", "interest", "penalty", "state_duty") if name in records]
+    amount_names = [name for name in ("debt_amount", "state_duty") if name in records]
     total_record = records.get("total_amount")
     if total_record and total_record["status"] == "confirmed" and amount_names:
         parts = [money_to_decimal(records[name].get("document_value")) for name in amount_names]

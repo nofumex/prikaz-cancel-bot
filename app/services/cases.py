@@ -4,7 +4,7 @@ import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import CaseStatus, PaymentStatus
@@ -86,7 +86,10 @@ async def generated_cases(session: AsyncSession, user_id: int) -> list[Case]:
         select(Case)
         .where(
             Case.user_id == user_id,
-            Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]),
+            or_(
+                Case.full_doc_path.is_not(None),
+                Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]),
+            ),
         )
         .order_by(Case.created_at.desc(), Case.id.desc())
     )
@@ -98,7 +101,10 @@ async def generated_case_for_user(session: AsyncSession, user_id: int, case_id: 
         select(Case).where(
             Case.id == case_id,
             Case.user_id == user_id,
-            Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]),
+            or_(
+                Case.full_doc_path.is_not(None),
+                Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]),
+            ),
         )
     )
     return result.scalar_one_or_none()

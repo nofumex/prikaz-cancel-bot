@@ -10,6 +10,7 @@ from app.services.document_templates.statement_templates import (
     normalize_court_instrumental,
 )
 from app.services.legal_data import (
+    clean_money_text,
     clean_text,
     is_deadline_missed,
     normalize_order_data,
@@ -34,6 +35,8 @@ DERIVED_FIELDS = {
     "creditor_name_genitive", "court_type", "court_unit_number", "court_territory",
     "court_region", "debt_basis_type", "debt_basis_number", "debt_basis_date",
 }
+
+_MONEY_IN_FACTS = r"\d[\d \u00a0]*(?:[.,]\d{1,2})?\s*(?:руб(?:\.|лей|ля)?\s*\d{0,2}\s*коп\.?)"
 
 
 def _json_object(raw: object) -> dict:
@@ -123,6 +126,41 @@ def _promote_legacy_render_sources(data: dict) -> dict:
             case_match = re.search(r"№\s*([^,;]+)", identifier)
             if case_match:
                 promoted["case_number"] = case_match.group(1).strip()
+
+    facts = rendered("order_facts_sentence")
+    if facts:
+        amount_patterns = {
+            "interest": rf"процент\w*\s+в размере\s+({_MONEY_IN_FACTS})",
+            "penalty": rf"(?:пен\w*|неустойк\w*)\s+в размере\s+({_MONEY_IN_FACTS})",
+            "state_duty": rf"(?:госпошлин\w*|государственн\w+\s+пошлин\w*)\s+в размере\s+({_MONEY_IN_FACTS})",
+            "total_amount": rf"(?:общая сумма взыскания составляет|итого[^\d]*)\s*({_MONEY_IN_FACTS})",
+        }
+        debt_match = re.search(
+            rf"задолженност\w*.*?\s+в размере\s+({_MONEY_IN_FACTS})",
+            facts,
+            re.IGNORECASE,
+        )
+        if debt_match and not clean_text(promoted.get("debt_amount")):
+            promoted["debt_amount"] = clean_money_text(debt_match.group(1))
+        for field, pattern in amount_patterns.items():
+            if clean_text(promoted.get(field)):
+                continue
+            match = re.search(pattern, facts, re.IGNORECASE)
+            if match:
+                promoted[field] = clean_money_text(match.group(1))
+
+        period_match = re.search(
+            r"за период\s+(.+?)(?=\s+в размере)", facts, re.IGNORECASE
+        )
+        if period_match and not clean_text(promoted.get("debt_period")):
+            promoted["debt_period"] = period_match.group(1).strip(" ,.;")
+        contract_match = re.search(
+            r"задолженност\w*\s+по\s+(.+?)(?=\s+за период|\s+в размере)",
+            facts,
+            re.IGNORECASE,
+        )
+        if contract_match and not clean_text(promoted.get("debt_contract")):
+            promoted["debt_contract"] = contract_match.group(1).strip(" ,.;")
     return promoted
 
 
@@ -156,6 +194,8 @@ def prepare_paid_case_data(case) -> dict:
     normalized = normalize_order_data(merged)
     # Explicit input has higher priority than formatting, inference and OCR.
     normalized.update({key: value for key, value in overrides.items() if key != "received_date"})
+    if "total_amount" in overrides:
+        normalized["amount_render_mode"] = "explicit_total"
     rebuilt = _rebuild_derived(normalized)
     provenance = rebuilt.get("_field_provenance")
     provenance = dict(provenance) if isinstance(provenance, dict) else {}
@@ -183,6 +223,10 @@ def apply_paid_correction(case, field: str, value: str) -> dict:
         raise ValueError("Поле нельзя редактировать напрямую.")
     overrides = manual_corrections(case)
     overrides[field] = clean_text(value)
+    if field == "creditor_address":
+        # The generic legacy address is the address the user expects to see in
+        # the statement. Keep the higher-priority legal source in sync.
+        overrides["creditor_legal_address"] = clean_text(value)
     case.paid_corrections_json = json.dumps(overrides, ensure_ascii=False, sort_keys=True)
     record_corrected_field(case, field)
     data = prepare_paid_case_data(case)
@@ -210,7 +254,7 @@ async def regenerate_paid_case(session, settings, case, user):
     if not amount_check.ok:
         if "amount_mismatch" in amount_check.errors:
             raise ValueError(
-                "Суммы не совпадают: долг + проценты + пени + госпошлина должны "
+                "Суммы не совпадают: долг (включая проценты и пени) + госпошлина должны "
                 "равняться итоговой сумме. Исправьте суммы; введённые значения сохранены."
             )
         raise ValueError("Проверьте формат сумм: " + "; ".join(amount_check.errors))

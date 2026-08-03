@@ -757,8 +757,6 @@ class AmountValidationResult:
 def validate_amounts(data: dict) -> AmountValidationResult:
     normalized = normalize_order_data(data)
     debt = money_to_decimal(normalized.get("debt_amount"))
-    interest = money_to_decimal(normalized.get("interest"))
-    penalty = money_to_decimal(normalized.get("penalty"))
     state_duty = money_to_decimal(normalized.get("state_duty"))
     total = money_to_decimal(normalized.get("total_amount"))
     errors: list[str] = []
@@ -770,9 +768,9 @@ def validate_amounts(data: dict) -> AmountValidationResult:
         errors.append("total_amount: не удалось распознать итоговую сумму")
     computed_total = None
     if debt is not None and state_duty is not None:
-        computed_total = (
-            debt + (interest or Decimal("0")) + (penalty or Decimal("0")) + state_duty
-        ).quantize(Decimal("0.01"))
+        # debt_amount already includes interest and penalties; those fields are
+        # only its optional breakdown and must not be counted twice.
+        computed_total = (debt + state_duty).quantize(Decimal("0.01"))
         if total is not None and abs(total - computed_total) > Decimal("0.01"):
             errors.append("amount_mismatch")
     return AmountValidationResult(

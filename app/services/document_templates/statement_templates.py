@@ -278,10 +278,13 @@ def _money_body_phrase(data: dict) -> str:
         base = f"{base} {' '.join(fragments)}"
     base = f"{base} в размере {debt}"
     base = re.sub(r"по договор №", "по договору №", base)
+    breakdown = []
     if interest:
-        base = f"{base}, процентов в размере {interest}"
+        breakdown.append(f"проценты в размере {interest}")
     if penalty:
-        base = f"{base}, неустойки в размере {penalty}"
+        breakdown.append(f"пени в размере {penalty}")
+    if breakdown:
+        base = f"{base} (в том числе {', '.join(breakdown)})"
     if state_duty:
         base = f"{base}, а также расходов по оплате государственной пошлины в размере {state_duty}"
     if total and _optional(data, "amount_render_mode") == "explicit_total":
