@@ -19,7 +19,11 @@ from app.config import Settings
 from app.models import OpenAIUsage
 from app.services.amount_recovery import recover_amounts_from_mismatch
 from app.services.classic_ocr import classic_amount_facts, classic_court_name, extract_classic_ocr_text
-from app.services.image_preprocessing import build_amount_ocr_variants, build_order_ocr_variants
+from app.services.image_preprocessing import (
+    build_amount_ocr_variants,
+    build_order_ocr_variants,
+    prepare_order_preflight_image,
+)
 from app.services.legal_data import clean_money_text, format_money_rub_kop, missing_order_fields, money_from_source_fragment, normalize_debtor_name_fields, normalize_order_data, validate_amounts
 from app.services.order_integrity import (
     CRITICAL_ORDER_FIELDS,
@@ -115,6 +119,18 @@ ORDER_JSON_SCHEMA = {
     "additionalProperties": False,
     "properties": ORDER_JSON_SCHEMA_PROPERTIES,
     "required": list(ORDER_JSON_SCHEMA_PROPERTIES.keys()),
+}
+
+ORDER_TYPE_PRECHECK_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "classification": {
+            "type": "string",
+            "enum": ["court_order", "other", "unclear"],
+        }
+    },
+    "required": ["classification"],
 }
 
 
@@ -377,6 +393,7 @@ async def _responses_json(
     schema: dict[str, Any],
     model: str | None = None,
     max_output_tokens: int = 1800,
+    image_detail: str = "high",
 ) -> LLMResult:
     if not settings.openai_api_key:
         raise RuntimeError("OPENAI_API_KEY is not configured")
@@ -388,7 +405,7 @@ async def _responses_json(
 
     content: list[dict[str, Any]] = [{"type": "input_text", "text": text}]
     for path in paths:
-        content.append({"type": "input_image", "image_url": _image_data_url(path), "detail": "high"})
+        content.append({"type": "input_image", "image_url": _image_data_url(path), "detail": image_detail})
 
     start = time.perf_counter()
     body = {
@@ -431,6 +448,71 @@ async def _responses_json(
             if attempt == 0:
                 await asyncio.sleep(0.15)
     raise RuntimeError(f"OpenAI structured request failed after retry: {last_error}")
+
+
+async def classify_order_image_preflight(
+    settings: Settings,
+    session: AsyncSession | None,
+    *,
+    case_id: int | None,
+    user_id: int | None,
+    order_photo_path: str,
+) -> str:
+    """Cheap visual gate which deliberately runs before OCR and extraction."""
+    model = getattr(settings, "order_type_precheck_model", "") or settings.vision_model
+    result: LLMResult | None = None
+    try:
+        preview_path = prepare_order_preflight_image(order_photo_path, case_id=case_id)
+        result = await _responses_json(
+            settings,
+            instructions=(
+                "Classify the image only. court_order means a Russian judicial order issued by a court "
+                "or magistrate. other means any different document or screen, including FSSP, Gosuslugi, "
+                "bank or enforcement-debt screens. unclear means the image is unreadable or ambiguous."
+            ),
+            text="Classify this image.",
+            image_path=preview_path,
+            schema_name="order_type_precheck",
+            schema=ORDER_TYPE_PRECHECK_SCHEMA,
+            model=model,
+            max_output_tokens=32,
+            image_detail="low",
+        )
+        classification = str(result.data.get("classification") or "unclear").strip().lower()
+        if classification not in {"court_order", "other", "unclear"}:
+            classification = "unclear"
+    except Exception as exc:
+        await record_openai_usage(
+            settings,
+            session,
+            case_id=case_id,
+            user_id=user_id,
+            operation="order_type_precheck",
+            model=model,
+            success=False,
+            error_message=str(exc),
+        )
+        logger.warning("Order type precheck failed case_id=%s: %s", case_id, exc)
+        return "unclear"
+
+    await record_openai_usage(
+        settings,
+        session,
+        case_id=case_id,
+        user_id=user_id,
+        operation="order_type_precheck",
+        model=result.model,
+        result=result,
+        success=True,
+    )
+    _save_debug_attempt(
+        case_id,
+        "order_type_precheck",
+        {"classification": classification},
+        request_id=result.request_id,
+        model=result.model,
+    )
+    return classification
 
 
 async def _extract_order_data_primary(
@@ -668,6 +750,18 @@ async def extract_order_data(
     user_id: int | None,
     order_photo_path: str,
 ) -> dict[str, Any]:
+    classification = await classify_order_image_preflight(
+        settings,
+        session,
+        case_id=case_id,
+        user_id=user_id,
+        order_photo_path=order_photo_path,
+    )
+    if classification != "court_order":
+        return {
+            "_document_kind": classification,
+            "_preflight_blocked": "1",
+        }
     data = await _extract_order_data_uncached(
         settings, session, case_id=case_id, user_id=user_id, order_photo_path=order_photo_path
     )

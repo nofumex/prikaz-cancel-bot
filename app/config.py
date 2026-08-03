@@ -136,6 +136,7 @@ class Settings:
     tesseract_ai_model: str = ""
     order_recognition_mode: str = "tesseract_text"
     order_crop_vision_enabled: bool = False
+    order_type_precheck_model: str = ""
 
     @property
     def staff_ids(self) -> set[int]:
@@ -240,4 +241,5 @@ def get_settings() -> Settings:
         tesseract_ai_model=(getenv("TESSERACT_AI_MODEL") or "gpt-4.1-mini").strip(),
         order_recognition_mode=(getenv("ORDER_RECOGNITION_MODE") or "tesseract_text").strip().lower(),
         order_crop_vision_enabled=_parse_bool(getenv("ORDER_CROP_VISION_ENABLED"), False),
+        order_type_precheck_model=(getenv("ORDER_TYPE_PRECHECK_MODEL") or "gpt-4.1-mini").strip(),
     )

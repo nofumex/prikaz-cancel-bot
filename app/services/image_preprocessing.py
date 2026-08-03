@@ -8,6 +8,7 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from app.utils import ensure_dir
 
 PREPROCESSING_VERSION = "order-gray-v1"
+PREFLIGHT_VERSION = "order-type-precheck-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +56,20 @@ def prepare_order_ocr_image(order_photo_path: str | Path, *, case_id: int | None
         image = ImageEnhance.Contrast(image).enhance(1.15)
         image = ImageEnhance.Sharpness(image).enhance(1.15)
         image.save(target, optimize=True)
+    return target
+
+
+def prepare_order_preflight_image(order_photo_path: str | Path, *, case_id: int | None = None) -> Path:
+    """Create a small RGB image for the cheap order/not-order classifier."""
+    source = Path(order_photo_path)
+    if not source.exists():
+        return source
+    debug_dir = ensure_dir(Path("storage/debug") / f"case_{case_id or 'unknown'}")
+    target = debug_dir / f"{PREFLIGHT_VERSION}_{source.stem}.jpg"
+    with Image.open(source) as opened:
+        image = ImageOps.exif_transpose(opened).convert("RGB")
+        image.thumbnail((768, 768), Image.Resampling.LANCZOS)
+        image.save(target, format="JPEG", quality=72, optimize=True)
     return target
 
 

@@ -41,6 +41,21 @@ async def _extract_and_store(settings: Settings, case_id: int, user_id: int) -> 
         except Exception:
             logger.exception("Background order extraction failed case_id=%s", case_id)
             extracted = {}
+        if extracted.get("_preflight_blocked"):
+            missing = ["not_court_order"]
+            case.extracted_json = json.dumps(extracted, ensure_ascii=False)
+            case.missing_fields = json.dumps(missing, ensure_ascii=False)
+            case.order_rephoto_attempts = (case.order_rephoto_attempts or 0) + 1
+            case.status = CaseStatus.WAITING_ORDER_REPHOTO.value
+            await session.commit()
+            schedule_crm_sync(
+                settings,
+                case.id,
+                user.id,
+                "wrong_document_type",
+                {"note": "Загруженное изображение не распознано как судебный приказ"},
+            )
+            return OrderExtractionResult(case.id, missing, False)
         extracted = normalize_order_data(extracted)
         wrong_document_type = extracted.get("_document_kind") == "other"
         extracted, name_result = normalize_debtor_name_fields(extracted)

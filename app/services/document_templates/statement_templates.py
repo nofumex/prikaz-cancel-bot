@@ -10,7 +10,7 @@ from app.services.document_render_contract import (
     dates_long_in_text,
     select_creditor_address_for_render,
 )
-from app.services.legal_data import clean_case_number, clean_uid, is_deadline_missed, keep_house_number_together, normalize_address_text
+from app.services.legal_data import clean_case_number, clean_uid, format_money_rub_kop, is_deadline_missed, keep_house_number_together, normalize_address_text, normalize_court_forms
 from app.services.name_normalizer import make_short_name
 
 LLM_STATEMENT_TEMPLATE = """{{render_court_addressee}}
@@ -120,37 +120,11 @@ def normalize_court_address_line(text: str) -> str:
 
 
 def normalize_court_addressee(court: str) -> str:
-    court = court.strip().rstrip(".")
-    court = re.sub(r"№(\d+)", r"№ \1", court)
-    court = re.sub(r"\bгород\s+", "г. ", court, flags=re.IGNORECASE)
-    lower = court.lower()
-    if lower.startswith("мировому судье"):
-        return court
-    if lower.startswith("мировой судья"):
-        return "Мировому судье " + court[len("мировой судья") :].strip()
-    if lower.startswith("судебный участок") or lower.startswith("судебного участка"):
-        normalized = re.sub(r"^судебный участок", "судебного участка", court, flags=re.IGNORECASE)
-        normalized = re.sub(r"№\s*(\d+)", r"№ \1", normalized)
-        return "Мировому судье " + normalized
-    return court
+    return normalize_court_forms(court)["court_addressee"]
 
 
 def normalize_court_instrumental(court: str) -> str:
-    court = court.strip().rstrip(".")
-    court = re.sub(r"№(\d+)", r"№ \1", court)
-    court = re.sub(r"\bгород\s+", "г. ", court, flags=re.IGNORECASE)
-    lower = court.lower()
-    if lower.startswith("мировому судье"):
-        rest = court[len("мировому судье") :].strip()
-        return f"мировым судьей {rest}" if rest else "мировым судьей"
-    if lower.startswith("мировой судья"):
-        rest = court[len("мировой судья") :].strip()
-        return f"мировым судьей {rest}" if rest else "мировым судьей"
-    if lower.startswith("судебный участок") or lower.startswith("судебного участка"):
-        normalized = re.sub(r"^судебный участок", "судебного участка", court, flags=re.IGNORECASE)
-        normalized = re.sub(r"№\s*(\d+)", r"№ \1", normalized)
-        return f"мировым судьей {normalized}"
-    return court
+    return normalize_court_forms(court)["court_instrumental"]
 
 
 def normalize_creditor_address(address: str) -> str:
@@ -260,12 +234,11 @@ def _period_inline(value: str) -> str:
 
 
 def _money_body_phrase(data: dict) -> str:
-    state_duty_raw = _optional(data, "state_duty")
-    state_duty = state_duty_raw if state_duty_raw else ""
-    interest = _optional(data, "interest")
-    penalty = _optional(data, "penalty")
-    debt = _required(data, "debt_amount").rstrip(".") + ("." if state_duty else "")
-    total = _optional(data, "total_amount").rstrip(".")
+    state_duty = format_money_rub_kop(_optional(data, "state_duty"))
+    interest = format_money_rub_kop(_optional(data, "interest"))
+    penalty = format_money_rub_kop(_optional(data, "penalty"))
+    debt = format_money_rub_kop(_required(data, "debt_amount"))
+    total = format_money_rub_kop(_optional(data, "total_amount"))
     contract = _structured_debt_basis_inline(data)
     period = _optional(data, "debt_period")
     fragments = []
@@ -288,8 +261,10 @@ def _money_body_phrase(data: dict) -> str:
     if state_duty:
         base = f"{base}, а также расходов по оплате государственной пошлины в размере {state_duty}"
     if total and _optional(data, "amount_render_mode") == "explicit_total":
-        base = f"{base}. Общая сумма взыскания составляет {total}"
-    return base
+        base = f"{base.rstrip('.')}. Общая сумма взыскания составляет {total}"
+    # The enclosing sentence owns its final full stop. Money formatter values
+    # already end in one, so do not let the last amount create ``коп..``.
+    return base.rstrip(".")
 
 
 def statement_in_time(ctx: StatementContext) -> list[str]:

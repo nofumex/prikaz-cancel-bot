@@ -18,6 +18,57 @@ from app.services.legal_data import legal_deadline_from_received, normalize_orde
 from app.services.pdf_tools import pdf_page_count, pdf_text
 from docx import Document
 
+
+@pytest.mark.parametrize("number", [1, 2, 3, 21])
+def test_ordinal_court_name_is_declined_in_header_body_and_request(number):
+    data = normalize_order_data(
+        {
+            **BELSKY_DATA,
+            "court_name": f"{number}-й судебный участок судебного района Центрального района г. Красноярска",
+        }
+    )
+    ctx = StatementContext(
+        data=data,
+        received_date=date(2026, 7, 11),
+        deadline_date=date(2099, 7, 21),
+        document_date=date(2026, 7, 12),
+    )
+
+    header = "\n".join(build_header_lines(ctx))
+    paragraphs = build_statement_paragraphs(ctx)
+    body = paragraphs[0]
+    request = next(item for item in paragraphs if item.startswith("1. Отменить"))
+
+    assert f"Мировому судье {number}-го судебного участка" in header
+    assert f"мировым судьёй {number}-го судебного участка" in body
+    assert f"мировым судьёй {number}-го судебного участка" in request
+
+
+def test_statement_formats_all_money_and_has_no_double_money_periods():
+    data = normalize_order_data(
+        {
+            **BELSKY_DATA,
+            "debt_amount": "32200 руб. 00 коп..",
+            "state_duty": "2000 руб. 00 коп..",
+            "total_amount": "34200 руб. 00 коп..",
+            "amount_render_mode": "explicit_total",
+        }
+    )
+    ctx = StatementContext(
+        data=data,
+        received_date=date(2026, 7, 11),
+        deadline_date=date(2099, 7, 21),
+        document_date=date(2026, 7, 12),
+    )
+
+    text = "\n".join(build_statement_paragraphs(ctx))
+
+    assert "32 200 руб. 00 коп." in text
+    assert "2 000 руб. 00 коп." in text
+    assert "34 200 руб. 00 коп." in text
+    assert "2000 руб." not in text
+    assert "коп.." not in text
+
 LONG_POST_BANK_ADDRESS = "107061, г. Москва, Преображенская пл., д. 8; 101000, г. Москва, по улице Мясницкая, д. 35; для корреспонденции: 443001, г. Самара ул. Галактионовская д. 157"
 
 

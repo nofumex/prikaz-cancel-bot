@@ -1005,6 +1005,23 @@ async def _extract_and_process_order(client: MaxBotClient, event: IncomingEvent,
     except Exception:
         logger.exception("MAX order extraction failed")
         extracted = {}
+    if extracted.get("_preflight_blocked"):
+        missing = ["not_court_order"]
+        case.extracted_json = json.dumps(extracted, ensure_ascii=False)
+        case.missing_fields = json.dumps(missing, ensure_ascii=False)
+        case.order_rephoto_attempts = (case.order_rephoto_attempts or 0) + 1
+        case.status = CaseStatus.WAITING_ORDER_REPHOTO.value
+        await session.commit()
+        await _set_state(session, event, STATE_ORDER_REPHOTO, {"case_id": case.id})
+        await _send_order_rephoto_prompt(client, event, missing, attempts=case.order_rephoto_attempts)
+        schedule_crm_sync(
+            settings,
+            case.id,
+            user.id,
+            "wrong_document_type",
+            {"note": "MAX: изображение не распознано как судебный приказ"},
+        )
+        return
     extracted = normalize_order_data(extracted)
     extracted, _ = normalize_debtor_name_fields(extracted)
     pending_confirmation = next_confirmation(extracted)

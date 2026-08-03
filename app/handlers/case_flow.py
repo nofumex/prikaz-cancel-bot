@@ -687,6 +687,24 @@ async def _extract_and_process_order(
     except Exception:
         logger.exception("Order extraction failed")
         extracted = {}
+    if extracted.get("_preflight_blocked"):
+        missing = ["not_court_order"]
+        case.extracted_json = json.dumps(extracted, ensure_ascii=False)
+        case.missing_fields = json.dumps(missing, ensure_ascii=False)
+        case.order_rephoto_attempts = (case.order_rephoto_attempts or 0) + 1
+        case.status = CaseStatus.WAITING_ORDER_REPHOTO.value
+        await session.commit()
+        await state.update_data(case_id=case.id)
+        await state.set_state(CaseStates.waiting_order_rephoto)
+        await _send_order_rephoto_prompt(message, missing, attempts=case.order_rephoto_attempts)
+        schedule_crm_sync(
+            settings,
+            case.id,
+            current_user.id,
+            "wrong_document_type",
+            {"note": "Загруженное изображение не распознано как судебный приказ"},
+        )
+        return
     extracted = normalize_order_data(extracted)
     extracted, name_result = normalize_debtor_name_fields(extracted)
     if name_result and name_result.confidence >= 0.85 and name_result.normalized:

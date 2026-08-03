@@ -114,6 +114,35 @@ async def test_max_order_without_received_date_prompts_for_date(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_max_precheck_failure_immediately_requests_order_rephoto(monkeypatch):
+    from app.adapters.max import bot as max_bot
+
+    settings = _make_settings(amocrm_enabled=False)
+    case = _case()
+    user = User(id=1, platform="max", platform_user_id="42")
+    event = IncomingEvent(platform_user_id="42", chat_id="chat-1")
+    client = SimpleNamespace(send_message=AsyncMock())
+    session = SimpleNamespace(commit=AsyncMock())
+    monkeypatch.setattr(max_bot, "_clear_state", AsyncMock())
+    monkeypatch.setattr(max_bot, "_set_state", AsyncMock())
+    monkeypatch.setattr(
+        max_bot,
+        "extract_order_data",
+        AsyncMock(return_value={"_document_kind": "other", "_preflight_blocked": "1"}),
+    )
+    monkeypatch.setattr(max_bot, "schedule_crm_sync", lambda *args, **kwargs: None)
+
+    await max_bot._extract_and_process_order(client, event, session, settings, user, case)
+
+    assert case.status == CaseStatus.WAITING_ORDER_REPHOTO.value
+    assert json.loads(case.missing_fields) == ["not_court_order"]
+    max_bot._set_state.assert_awaited_once_with(
+        session, event, max_bot.STATE_ORDER_REPHOTO, {"case_id": case.id}
+    )
+    assert "судебный приказ" in client.send_message.await_args.kwargs["text"].lower()
+
+
+@pytest.mark.asyncio
 async def test_max_generation_passes_custom_restore_reason(monkeypatch):
     from app.adapters.max import bot as max_bot
 

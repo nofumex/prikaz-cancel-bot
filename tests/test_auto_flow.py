@@ -53,6 +53,36 @@ def _case(**kwargs) -> Case:
     return Case(**base)
 
 
+@pytest.mark.parametrize("classification", ["other", "unclear"])
+@pytest.mark.asyncio
+async def test_telegram_precheck_failure_immediately_requests_order_rephoto(
+    monkeypatch, classification
+):
+    from app.handlers.case_flow import CaseStates
+
+    settings = _make_settings(amocrm_enabled=False)
+    case = _case()
+    user = User(id=1, platform="telegram", platform_user_id="1")
+    message = SimpleNamespace(
+        answer=AsyncMock(),
+        bot=SimpleNamespace(send_message=AsyncMock()),
+    )
+    state = SimpleNamespace(clear=AsyncMock(), update_data=AsyncMock(), set_state=AsyncMock())
+    session = SimpleNamespace(commit=AsyncMock())
+    monkeypatch.setattr(
+        "app.handlers.case_flow.extract_order_data",
+        AsyncMock(return_value={"_document_kind": classification, "_preflight_blocked": "1"}),
+    )
+    monkeypatch.setattr("app.handlers.case_flow.schedule_crm_sync", lambda *args, **kwargs: None)
+
+    await _extract_and_process_order(message, state, session, settings, case, user)
+
+    assert case.status == CaseStatus.WAITING_ORDER_REPHOTO.value
+    assert json.loads(case.missing_fields) == ["not_court_order"]
+    assert state.set_state.await_args.args[0].state == CaseStates.waiting_order_rephoto.state
+    assert "судебный приказ" in message.answer.await_args.args[0].lower()
+
+
 def test_max_callback_inline_keyboard_is_not_attachment():
     event = parse_update({
         'update_type': 'message_callback',

@@ -361,7 +361,8 @@ def format_money_rub_kop(value: Decimal | int | float | str | None) -> str:
         return ""
     decimal_value = value if isinstance(value, Decimal) else money_to_decimal(value)
     if decimal_value is None:
-        return clean_text(value)
+        raw = clean_text(value).rstrip(".")
+        return f"{raw}." if raw else ""
     decimal_value = decimal_value.quantize(Decimal("0.01"))
     rubles = int(decimal_value)
     kopeks = int((decimal_value - Decimal(rubles)) * 100)
@@ -452,12 +453,18 @@ def normalize_court_forms(court_name: str) -> dict[str, str]:
         base = court[len("мировой суд ") :].strip()
     elif lower.startswith("судебный участок"):
         base = re.sub(r"^судебный участок", "судебного участка", court, flags=re.IGNORECASE)
+    base = re.sub(
+        r"^(\d+)\s*[-‐‑‒–—]?\s*(?:й|ый|ой)\s+судебн(?:ый|ого)\s+участ(?:ок|ка)\b",
+        lambda match: f"{match.group(1)}-го судебного участка",
+        base,
+        flags=re.IGNORECASE,
+    )
     if base.lower().startswith("судебный участок"):
         base = re.sub(r"^судебный участок", "судебного участка", base, flags=re.IGNORECASE)
     return {
         "court_name": base,
         "court_addressee": f"Мировому судье {base}" if not base.lower().startswith("мировому") else court,
-        "court_instrumental": f"мировым судьей {base}",
+        "court_instrumental": f"мировым судьёй {base}",
     }
 
 
