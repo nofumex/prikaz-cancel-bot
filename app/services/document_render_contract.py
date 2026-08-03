@@ -93,6 +93,9 @@ INTENTIONALLY_NOT_RENDERED_FIELDS: dict[str, str] = {
 
 def select_creditor_address_for_render(data: dict) -> tuple[str, str]:
     """The header uses the legal address; correspondence and legacy are fallbacks."""
+    manual_override = clean_text(data.get("_creditor_render_address_override"))
+    if manual_override:
+        return "_creditor_render_address_override", manual_override
     for field in ("creditor_legal_address", "creditor_correspondence_address", "creditor_address"):
         value = clean_text(data.get(field))
         if value:

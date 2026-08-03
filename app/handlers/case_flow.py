@@ -49,6 +49,7 @@ from app.services.paid_correction import (
     apply_paid_correction,
     correction_allowed,
     paid_regeneration_requires_new_date,
+    paid_case_correction_available,
     prepare_paid_case_data,
     record_paid_received_date,
     regenerate_paid_case,
@@ -1156,8 +1157,8 @@ async def receive_restore_reason_custom(message: Message, state: FSMContext, ses
 async def paid_correction_start(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User) -> None:
     parts = callback.data.split(':')
     case = await generated_case_for_user(session, current_user.id, int(parts[3])) if len(parts) > 3 else await latest_case(session, current_user.id)
-    if not case or case.status not in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}:
-        await callback.answer('Оплаченное заявление не найдено.', show_alert=True)
+    if not paid_case_correction_available(case):
+        await callback.answer('Архивное заявление не найдено или ещё не было создано.', show_alert=True)
         return
     schedule_crm_sync(settings, case.id, current_user.id, 'paid_document_correction_started', {'note': 'Пользователь сообщил: данные в заявлении неверные'})
     await _edit_or_answer(callback, '<b>✏️ Что нужно исправить?</b>\n\nВыберите поле и отправьте новое значение.', paid_edit_fields_menu(case.id))
@@ -1168,8 +1169,8 @@ async def paid_correction_start(callback: CallbackQuery, session: AsyncSession, 
 async def paid_field_selected(callback: CallbackQuery, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
     parts = callback.data.split(':')
     case = await generated_case_for_user(session, current_user.id, int(parts[2])) if len(parts) > 3 else await latest_case(session, current_user.id)
-    if not case or case.status not in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}:
-        await callback.answer('Оплаченное заявление не найдено.', show_alert=True)
+    if not paid_case_correction_available(case):
+        await callback.answer('Архивное заявление не найдено или ещё не было создано.', show_alert=True)
         return
     field = callback.data.split(':')[-1]
     if not correction_allowed(case, field):
@@ -1217,8 +1218,8 @@ async def paid_review(callback: CallbackQuery, session: AsyncSession, current_us
 async def paid_regenerate(callback: CallbackQuery, session: AsyncSession, settings: Settings, current_user: User) -> None:
     parts = callback.data.split(':')
     case = await generated_case_for_user(session, current_user.id, int(parts[2])) if len(parts) > 2 else await latest_case(session, current_user.id)
-    if not case or case.status not in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}:
-        await callback.answer('Оплаченное заявление не найдено.', show_alert=True)
+    if not paid_case_correction_available(case):
+        await callback.answer('Архивное заявление не найдено или ещё не было создано.', show_alert=True)
         return
     if paid_regeneration_requires_new_date(case):
         await _edit_or_answer(

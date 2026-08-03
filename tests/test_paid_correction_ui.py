@@ -12,7 +12,7 @@ from app.services.document_templates.renderer import _render_statement_docx
 from app.services.document_templates.statement_templates import StatementContext, build_statement_paragraphs
 from app.services.document_templates.styles import StyleProfile
 from app.services.legal_data import docx_text, normalize_order_data, validate_amounts
-from app.services.paid_correction import PAID_EDITABLE_FIELDS, apply_paid_correction, correction_allowed, paid_regeneration_requires_new_date, prepare_paid_case_data, record_corrected_field, regenerate_paid_case
+from app.services.paid_correction import PAID_EDITABLE_FIELDS, apply_paid_correction, correction_allowed, paid_case_correction_available, paid_regeneration_requires_new_date, prepare_paid_case_data, record_corrected_field, regenerate_paid_case
 
 
 def test_paid_correction_keyboards_have_only_safe_post_payment_actions():
@@ -75,6 +75,12 @@ def test_paid_correction_allows_every_editable_source_field():
     assert set(json.loads(case.paid_corrected_fields_json)) == set(fields[:-1])
     assert correction_allowed(case, fields[-1])
     assert correction_allowed(case, fields[0])
+
+
+def test_generated_archived_file_is_correctable_regardless_of_status():
+    assert paid_case_correction_available(SimpleNamespace(status='processing', full_doc_path='old.docx'))
+    assert paid_case_correction_available(SimpleNamespace(status='paid', full_doc_path=None))
+    assert not paid_case_correction_available(SimpleNamespace(status='processing', full_doc_path=None))
 
 
 def test_paid_regeneration_requires_current_deadline_or_restore_reason():
@@ -186,8 +192,24 @@ def test_generic_creditor_address_and_manual_total_change_rendered_sources():
     )
     apply_paid_correction(case, 'creditor_address', 'Новый адрес взыскателя')
     result = apply_paid_correction(case, 'total_amount', '120 руб. 00 коп.')
-    assert select_creditor_address_for_render(result) == ('creditor_legal_address', 'Новый адрес взыскателя')
+    assert select_creditor_address_for_render(result) == ('_creditor_render_address_override', 'Новый адрес взыскателя')
+    assert result['creditor_legal_address'] == 'Старый юридический адрес'
     assert result['amount_render_mode'] == 'explicit_total'
+
+
+def test_independent_creditor_address_corrections_are_preserved_and_last_one_is_rendered():
+    case = SimpleNamespace(
+        extracted_json='{}', paid_corrected_fields_json=None, paid_corrections_json=None,
+    )
+    apply_paid_correction(case, 'creditor_legal_address', 'Новый юридический адрес')
+    result = apply_paid_correction(case, 'creditor_address', 'Новый обычный адрес')
+    assert result['creditor_legal_address'] == 'Новый юридический адрес'
+    assert result['creditor_address'] == 'Новый обычный адрес'
+    assert select_creditor_address_for_render(result)[1] == 'Новый обычный адрес'
+    result = apply_paid_correction(case, 'creditor_correspondence_address', 'Новый почтовый адрес')
+    assert result['creditor_legal_address'] == 'Новый юридический адрес'
+    assert result['creditor_address'] == 'Новый обычный адрес'
+    assert select_creditor_address_for_render(result)[1] == 'Новый почтовый адрес'
 
 
 def test_render_only_legacy_payload_recovers_debt_facts_before_cleanup():
@@ -220,6 +242,34 @@ def test_render_only_legacy_payload_recovers_debt_facts_before_cleanup():
     assert result['debt_contract'] == 'договору № 55'
     assert result['debt_period'] == 'с 01.01.2026 по 30.06.2026'
     assert 'render' not in result
+
+
+def test_render_only_legacy_payload_accepts_decimal_comma_and_labels_after_amount():
+    case = SimpleNamespace(
+        extracted_json=json.dumps({'render_order_facts_sentence': (
+            'Взыскана задолженность в размере 32 200,00 руб., в том числе '
+            '17 241,25 руб. процентов и 958,75 руб. пени, а также '
+            '2 000,00 руб. государственной пошлины. Итого 34 200,00 руб.'
+        )}),
+        paid_corrected_fields_json=None, paid_corrections_json=None,
+    )
+    result = prepare_paid_case_data(case)
+    assert result['debt_amount'] == '32 200 руб. 00 коп.'
+    assert result['interest'] == '17 241 руб. 25 коп.'
+    assert result['penalty'] == '958 руб. 75 коп.'
+    assert result['state_duty'] == '2 000 руб. 00 коп.'
+    assert result['total_amount'] == '34 200 руб. 00 коп.'
+
+
+def test_interest_and_penalty_must_be_money_values():
+    base = {
+        'debt_amount': '100 руб. 00 коп.', 'state_duty': '20 руб. 00 коп.',
+        'total_amount': '120 руб. 00 коп.',
+    }
+    interest = validate_amounts({**base, 'interest': 'примерно много'})
+    penalty = validate_amounts({**base, 'penalty': 'неизвестно'})
+    assert any(error.startswith('interest:') for error in interest.errors)
+    assert any(error.startswith('penalty:') for error in penalty.errors)
 
 
 def test_real_docx_contains_all_corrected_values(tmp_path):

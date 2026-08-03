@@ -4,6 +4,7 @@ import json
 import re
 
 from app.services.crm_background import schedule_crm_sync
+from app.enums import CaseStatus
 from app.services.documents import create_case_documents_reviewed
 from app.services.document_templates.statement_templates import (
     normalize_court_addressee,
@@ -34,9 +35,15 @@ DERIVED_FIELDS = {
     "render", "court_addressee", "court_instrumental", "debtor_short_name",
     "creditor_name_genitive", "court_type", "court_unit_number", "court_territory",
     "court_region", "debt_basis_type", "debt_basis_number", "debt_basis_date",
+    "_creditor_render_address_override",
 }
 
-_MONEY_IN_FACTS = r"\d[\d \u00a0]*(?:[.,]\d{1,2})?\s*(?:руб(?:\.|лей|ля)?\s*\d{0,2}\s*коп\.?)"
+_CREDITOR_RENDER_FIELD_KEY = "_creditor_render_address_field"
+
+_MONEY_IN_FACTS = (
+    r"\d[\d \u00a0]*(?:[.,]\d{1,2})?\s*руб(?:\.|лей|ля)?"
+    r"(?:\s*\d{1,2}\s*коп\.?)?"
+)
 
 
 def _json_object(raw: object) -> dict:
@@ -74,6 +81,14 @@ def manual_corrections(case) -> dict[str, str]:
 def correction_allowed(case, field: str) -> bool:
     del case
     return field in PAID_EDITABLE_FIELDS
+
+
+def paid_case_correction_available(case) -> bool:
+    """Paid records and any record with a previously generated file are editable."""
+    return bool(case) and (
+        getattr(case, "status", None) in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}
+        or bool(getattr(case, "full_doc_path", None))
+    )
 
 
 def record_corrected_field(case, field: str) -> None:
@@ -130,24 +145,39 @@ def _promote_legacy_render_sources(data: dict) -> dict:
     facts = rendered("order_facts_sentence")
     if facts:
         amount_patterns = {
-            "interest": rf"процент\w*\s+в размере\s+({_MONEY_IN_FACTS})",
-            "penalty": rf"(?:пен\w*|неустойк\w*)\s+в размере\s+({_MONEY_IN_FACTS})",
-            "state_duty": rf"(?:госпошлин\w*|государственн\w+\s+пошлин\w*)\s+в размере\s+({_MONEY_IN_FACTS})",
-            "total_amount": rf"(?:общая сумма взыскания составляет|итого[^\d]*)\s*({_MONEY_IN_FACTS})",
+            "interest": (
+                rf"процент\w*\s+(?:в размере\s+)?({_MONEY_IN_FACTS})",
+                rf"({_MONEY_IN_FACTS})\s*(?:[-—,:]?\s*)процент\w*",
+            ),
+            "penalty": (
+                rf"(?:пен\w*|неустойк\w*)\s+(?:в размере\s+)?({_MONEY_IN_FACTS})",
+                rf"({_MONEY_IN_FACTS})\s*(?:[-—,:]?\s*)(?:пен\w*|неустойк\w*)",
+            ),
+            "state_duty": (
+                rf"(?:госпошлин\w*|государственн\w+\s+пошлин\w*)\s+(?:в размере\s+)?({_MONEY_IN_FACTS})",
+                rf"({_MONEY_IN_FACTS})\s*(?:[-—,:]?\s*)(?:госпошлин\w*|государственн\w+\s+пошлин\w*)",
+            ),
+            "total_amount": (
+                rf"(?:общая сумма взыскания составляет|итого[^\d]*)\s*({_MONEY_IN_FACTS})",
+            ),
         }
         debt_match = re.search(
-            rf"задолженност\w*.*?\s+в размере\s+({_MONEY_IN_FACTS})",
-            facts,
-            re.IGNORECASE,
+            rf"задолженност\w*.*?\s+(?:в размере\s+)?({_MONEY_IN_FACTS})",
+            facts, re.IGNORECASE,
+        ) or re.search(
+            rf"({_MONEY_IN_FACTS})\s*(?:[-—,:]?\s*)задолженност\w*",
+            facts, re.IGNORECASE,
         )
         if debt_match and not clean_text(promoted.get("debt_amount")):
             promoted["debt_amount"] = clean_money_text(debt_match.group(1))
-        for field, pattern in amount_patterns.items():
+        for field, patterns in amount_patterns.items():
             if clean_text(promoted.get(field)):
                 continue
-            match = re.search(pattern, facts, re.IGNORECASE)
-            if match:
-                promoted[field] = clean_money_text(match.group(1))
+            for pattern in patterns:
+                match = re.search(pattern, facts, re.IGNORECASE)
+                if match:
+                    promoted[field] = clean_money_text(match.group(1))
+                    break
 
         period_match = re.search(
             r"за период\s+(.+?)(?=\s+в размере)", facts, re.IGNORECASE
@@ -197,6 +227,14 @@ def prepare_paid_case_data(case) -> dict:
     if "total_amount" in overrides:
         normalized["amount_render_mode"] = "explicit_total"
     rebuilt = _rebuild_derived(normalized)
+    correction_payload = _json_object(getattr(case, "paid_corrections_json", None))
+    render_address_field = correction_payload.get(_CREDITOR_RENDER_FIELD_KEY)
+    if render_address_field in {
+        "creditor_address", "creditor_legal_address", "creditor_correspondence_address"
+    }:
+        rendered_address = clean_text(overrides.get(render_address_field))
+        if rendered_address:
+            rebuilt["_creditor_render_address_override"] = rendered_address
     provenance = rebuilt.get("_field_provenance")
     provenance = dict(provenance) if isinstance(provenance, dict) else {}
     for key, value in overrides.items():
@@ -223,11 +261,16 @@ def apply_paid_correction(case, field: str, value: str) -> dict:
         raise ValueError("Поле нельзя редактировать напрямую.")
     overrides = manual_corrections(case)
     overrides[field] = clean_text(value)
-    if field == "creditor_address":
-        # The generic legacy address is the address the user expects to see in
-        # the statement. Keep the higher-priority legal source in sync.
-        overrides["creditor_legal_address"] = clean_text(value)
-    case.paid_corrections_json = json.dumps(overrides, ensure_ascii=False, sort_keys=True)
+    payload = dict(overrides)
+    if field in {"creditor_address", "creditor_legal_address", "creditor_correspondence_address"}:
+        # Preserve every independently corrected address and remember only
+        # which one the user most recently selected for the statement header.
+        payload[_CREDITOR_RENDER_FIELD_KEY] = field
+    else:
+        old_payload = _json_object(getattr(case, "paid_corrections_json", None))
+        if old_payload.get(_CREDITOR_RENDER_FIELD_KEY):
+            payload[_CREDITOR_RENDER_FIELD_KEY] = old_payload[_CREDITOR_RENDER_FIELD_KEY]
+    case.paid_corrections_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     record_corrected_field(case, field)
     data = prepare_paid_case_data(case)
     case.extracted_json = json.dumps(data, ensure_ascii=False)
@@ -237,6 +280,9 @@ def apply_paid_correction(case, field: str, value: str) -> dict:
 def record_paid_received_date(case) -> None:
     overrides = manual_corrections(case)
     overrides["received_date"] = case.received_date.strftime("%d.%m.%Y")
+    old_payload = _json_object(getattr(case, "paid_corrections_json", None))
+    if old_payload.get(_CREDITOR_RENDER_FIELD_KEY):
+        overrides[_CREDITOR_RENDER_FIELD_KEY] = old_payload[_CREDITOR_RENDER_FIELD_KEY]
     case.paid_corrections_json = json.dumps(overrides, ensure_ascii=False, sort_keys=True)
     record_corrected_field(case, "received_date")
     case.extracted_json = json.dumps(prepare_paid_case_data(case), ensure_ascii=False)

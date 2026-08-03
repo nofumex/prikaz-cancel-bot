@@ -32,7 +32,7 @@ from app.services.order_confirmation import (
 )
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
 from app.services.paid_correction import (
-    apply_paid_correction, correction_allowed, paid_regeneration_requires_new_date,
+    apply_paid_correction, correction_allowed, paid_case_correction_available, paid_regeneration_requires_new_date,
     prepare_paid_case_data, record_paid_received_date, regenerate_paid_case,
 )
 from app.services.received_date import received_date_prompt_text, save_received_date, validate_received_date
@@ -582,8 +582,8 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
         if data and data.startswith('paid:correction:start'):
             parts = data.split(':')
             case = await generated_case_for_user(session, user.id, int(parts[3])) if len(parts) > 3 else await latest_case(session, user.id)
-            if not case or case.status not in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}:
-                await _send(client, event, 'Оплаченное заявление не найдено.')
+            if not paid_case_correction_available(case):
+                await _send(client, event, 'Архивное заявление не найдено или ещё не было создано.')
                 return
             schedule_crm_sync(settings, case.id, user.id, 'paid_document_correction_started', {'note': 'Пользователь сообщил: данные в заявлении неверные'})
             await _edit_or_send(client, event, '<b>✏️ Что нужно исправить?</b>\n\nВыберите поле и отправьте новое значение.', keyboards.paid_edit_fields_menu(case.id))
@@ -591,8 +591,8 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
         if data and data.startswith('paid:field:'):
             parts = data.split(':')
             case = await generated_case_for_user(session, user.id, int(parts[2])) if len(parts) > 3 else await latest_case(session, user.id)
-            if not case or case.status not in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}:
-                await _send(client, event, 'Оплаченное заявление не найдено.')
+            if not paid_case_correction_available(case):
+                await _send(client, event, 'Архивное заявление не найдено или ещё не было создано.')
                 return
             field = data.split(':')[-1]
             if not correction_allowed(case, field):
@@ -616,8 +616,8 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
         if data and data.startswith('paid:regenerate'):
             parts = data.split(':')
             case = await generated_case_for_user(session, user.id, int(parts[2])) if len(parts) > 2 else await latest_case(session, user.id)
-            if not case or case.status not in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value}:
-                await _send(client, event, 'Оплаченное заявление не найдено.')
+            if not paid_case_correction_available(case):
+                await _send(client, event, 'Архивное заявление не найдено или ещё не было создано.')
                 return
             if paid_regeneration_requires_new_date(case):
                 await _edit_or_send(client, event, 'Срок подачи по указанной дате уже истёк. Пересоздание невозможно, пока не будет указана актуальная дата получения.', keyboards.paid_date_required_menu(case.id))

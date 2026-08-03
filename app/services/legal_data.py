@@ -560,7 +560,7 @@ def normalize_order_data(data: dict) -> dict:
         for key, value in derived_basis.items():
             if value and not normalized.get(key):
                 normalized[key] = value
-    for key in ("debt_amount", "state_duty", "total_amount"):
+    for key in ("debt_amount", "interest", "penalty", "state_duty", "total_amount"):
         if normalized.get(key):
             normalized[key] = clean_money_text(normalized[key])
     debt = money_to_decimal(normalized.get("debt_amount"))
@@ -757,11 +757,17 @@ class AmountValidationResult:
 def validate_amounts(data: dict) -> AmountValidationResult:
     normalized = normalize_order_data(data)
     debt = money_to_decimal(normalized.get("debt_amount"))
+    interest = money_to_decimal(normalized.get("interest"))
+    penalty = money_to_decimal(normalized.get("penalty"))
     state_duty = money_to_decimal(normalized.get("state_duty"))
     total = money_to_decimal(normalized.get("total_amount"))
     errors: list[str] = []
     if debt is None and normalized.get("debt_amount"):
         errors.append("debt_amount: не удалось распознать сумму долга")
+    if interest is None and normalized.get("interest"):
+        errors.append("interest: не удалось распознать сумму процентов")
+    if penalty is None and normalized.get("penalty"):
+        errors.append("penalty: не удалось распознать сумму пеней")
     if state_duty is None and normalized.get("state_duty"):
         errors.append("state_duty: не удалось распознать госпошлину")
     if total is None and normalized.get("total_amount"):
