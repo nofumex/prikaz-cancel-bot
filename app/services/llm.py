@@ -127,7 +127,7 @@ ORDER_TYPE_PRECHECK_SCHEMA = {
     "properties": {
         "classification": {
             "type": "string",
-            "enum": ["court_order", "other", "unclear"],
+            "enum": ["court_order", "other"],
         }
     },
     "required": ["classification"],
@@ -468,7 +468,8 @@ async def classify_order_image_preflight(
             instructions=(
                 "Classify the image only. court_order means a Russian judicial order issued by a court "
                 "or magistrate. other means any different document or screen, including FSSP, Gosuslugi, "
-                "bank or enforcement-debt screens. unclear means the image is unreadable or ambiguous."
+                "bank or enforcement-debt screens. If the image is unreadable or ambiguous, return court_order "
+                "so the normal OCR pipeline can make the final decision."
             ),
             text="Classify this image.",
             image_path=preview_path,
@@ -478,9 +479,9 @@ async def classify_order_image_preflight(
             max_output_tokens=32,
             image_detail="low",
         )
-        classification = str(result.data.get("classification") or "unclear").strip().lower()
-        if classification not in {"court_order", "other", "unclear"}:
-            classification = "unclear"
+        classification = str(result.data.get("classification") or "court_order").strip().lower()
+        if classification not in {"court_order", "other"}:
+            classification = "court_order"
     except Exception as exc:
         await record_openai_usage(
             settings,
@@ -493,7 +494,9 @@ async def classify_order_image_preflight(
             error_message=str(exc),
         )
         logger.warning("Order type precheck failed case_id=%s: %s", case_id, exc)
-        return "unclear"
+        # Fail open: an unavailable or uncertain cheap classifier must not
+        # prevent Tesseract from recognizing a real court order.
+        return "court_order"
 
     await record_openai_usage(
         settings,
@@ -757,7 +760,7 @@ async def extract_order_data(
         user_id=user_id,
         order_photo_path=order_photo_path,
     )
-    if classification != "court_order":
+    if classification == "other":
         return {
             "_document_kind": classification,
             "_preflight_blocked": "1",

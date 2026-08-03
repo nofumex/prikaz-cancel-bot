@@ -53,11 +53,11 @@ def _case(**kwargs) -> Case:
     return Case(**base)
 
 
-@pytest.mark.parametrize("classification", ["other", "unclear"])
 @pytest.mark.asyncio
 async def test_telegram_precheck_failure_immediately_requests_order_rephoto(
-    monkeypatch, classification
+    monkeypatch
 ):
+    classification = "other"
     from app.handlers.case_flow import CaseStates
 
     settings = _make_settings(amocrm_enabled=False)

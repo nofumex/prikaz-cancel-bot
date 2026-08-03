@@ -45,11 +45,27 @@ async def test_precheck_uses_cheap_request_and_separate_usage_operation(monkeypa
     assert usage.await_args.kwargs["operation"] == "order_type_precheck"
 
 
-@pytest.mark.parametrize("classification", ["other", "unclear"])
+@pytest.mark.asyncio
+async def test_precheck_error_fails_open_as_court_order(monkeypatch):
+    monkeypatch.setattr(llm, "prepare_order_preflight_image", lambda *args, **kwargs: "small.jpg")
+    monkeypatch.setattr(llm, "_responses_json", AsyncMock(side_effect=RuntimeError("temporary")))
+    usage = AsyncMock()
+    monkeypatch.setattr(llm, "record_openai_usage", usage)
+
+    result = await llm.classify_order_image_preflight(
+        _settings(), None, case_id=None, user_id=22, order_photo_path="ambiguous.jpg"
+    )
+
+    assert result == "court_order"
+    assert usage.await_args.kwargs["operation"] == "order_type_precheck"
+    assert usage.await_args.kwargs["success"] is False
+
+
 @pytest.mark.asyncio
 async def test_precheck_rejects_non_order_before_tesseract_and_main_extraction(
-    monkeypatch, classification
+    monkeypatch
 ):
+    classification = "other"
     precheck = AsyncMock(return_value=classification)
     tesseract = AsyncMock()
     extraction = AsyncMock()
@@ -70,6 +86,31 @@ async def test_precheck_rejects_non_order_before_tesseract_and_main_extraction(
     precheck.assert_awaited_once()
     tesseract.assert_not_awaited()
     extraction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_precheck_result_fails_open_to_full_pipeline(monkeypatch):
+    ocr_result = SimpleNamespace(latency_ms=7)
+    extraction_result = SimpleNamespace(
+        data={"court_name": "судебный участок № 1"},
+        safe_to_generate=True,
+        issues=[],
+        debtor_name_occurrences=[],
+        ocr=ocr_result,
+        llm_result=SimpleNamespace(latency_ms=9, request_id="req-2", model="test-model"),
+    )
+    tesseract = AsyncMock(return_value=ocr_result)
+    extraction = AsyncMock(return_value=extraction_result)
+    monkeypatch.setattr(llm, "classify_order_image_preflight", AsyncMock(return_value="unexpected"))
+    monkeypatch.setattr(llm, "extract_fast_tesseract_text", tesseract)
+    monkeypatch.setattr(llm, "extract_order_data_from_tesseract_ai", extraction)
+
+    await llm.extract_order_data(
+        _settings(), None, case_id=None, user_id=22, order_photo_path="ambiguous.jpg"
+    )
+
+    tesseract.assert_awaited_once()
+    extraction.assert_awaited_once()
 
 
 @pytest.mark.asyncio
