@@ -86,7 +86,6 @@ async def generated_cases(session: AsyncSession, user_id: int) -> list[Case]:
         select(Case)
         .where(
             Case.user_id == user_id,
-            Case.full_doc_path.is_not(None),
             Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]),
         )
         .order_by(Case.created_at.desc(), Case.id.desc())
@@ -99,7 +98,6 @@ async def generated_case_for_user(session: AsyncSession, user_id: int, case_id: 
         select(Case).where(
             Case.id == case_id,
             Case.user_id == user_id,
-            Case.full_doc_path.is_not(None),
             Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]),
         )
     )

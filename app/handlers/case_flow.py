@@ -45,7 +45,14 @@ from app.services.order_confirmation import (
     reduce_and_validate,
 )
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
-from app.services.paid_correction import correction_allowed, paid_regeneration_requires_new_date, record_corrected_field, regenerate_paid_case
+from app.services.paid_correction import (
+    apply_paid_correction,
+    correction_allowed,
+    paid_regeneration_requires_new_date,
+    prepare_paid_case_data,
+    record_paid_received_date,
+    regenerate_paid_case,
+)
 from app.services.received_date import received_date_prompt_text, save_received_date, validate_received_date
 from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaError, YooKassaReceiptContactRequired
@@ -230,15 +237,18 @@ async def my_case(callback: CallbackQuery, session: AsyncSession, current_user: 
 async def my_document(callback: CallbackQuery, session: AsyncSession, current_user: User) -> None:
     case_id = int(callback.data.rsplit(':', 1)[-1])
     case = await generated_case_for_user(session, current_user.id, case_id)
-    if not case or not case.full_doc_path or not Path(case.full_doc_path).exists():
-        await callback.answer('Документ не найден.', show_alert=True)
+    if not case:
+        await callback.answer('Заявление не найдено.', show_alert=True)
         return
     try:
         await callback.message.delete()
     except TelegramBadRequest:
         pass
-    await callback.message.answer_document(FSInputFile(case.full_doc_path), caption='📄 Ваше заявление')
-    extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    if case.full_doc_path and Path(case.full_doc_path).exists():
+        await callback.message.answer_document(FSInputFile(case.full_doc_path), caption='📄 Ваше заявление')
+    else:
+        await callback.message.answer('Старый файл документа недоступен. Сохранённые данные можно проверить и исправить ниже.')
+    extracted = prepare_paid_case_data(case)
     await callback.message.answer(
         extraction_preview(extracted, case.received_date, [], case.deadline_date, title='📄 <b>Данные в заявлении:</b>'),
         reply_markup=document_details_menu(case.id),
@@ -1163,9 +1173,9 @@ async def paid_field_selected(callback: CallbackQuery, state: FSMContext, sessio
         return
     field = callback.data.split(':')[-1]
     if not correction_allowed(case, field):
-        await callback.answer('Нельзя изменить абсолютно все поля одного заявления. Оставьте хотя бы одно исходное поле.', show_alert=True)
+        await callback.answer('Это поле не предназначено для ручного редактирования.', show_alert=True)
         return
-    extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    extracted = prepare_paid_case_data(case)
     await state.update_data(case_id=case.id, paid_field=field)
     await state.set_state(CaseStates.waiting_paid_field_value)
     schedule_crm_sync(settings, case.id, current_user.id, 'paid_document_field_selected', {'note': f'Выбрано поле: {FIELD_LABELS.get(field, field)}'})
@@ -1183,11 +1193,7 @@ async def paid_field_value(message: Message, state: FSMContext, session: AsyncSe
     if not value:
         await message.answer('Значение не должно быть пустым.')
         return
-    extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
-    extracted[field] = value
-    extracted = normalize_order_data(extracted)
-    case.extracted_json = json.dumps(extracted, ensure_ascii=False)
-    record_corrected_field(case, field)
+    extracted = apply_paid_correction(case, field, value)
     await session.commit()
     await state.clear()
     schedule_crm_sync(settings, case.id, current_user.id, 'paid_document_field_corrected', {'note': f'Исправил поле: {FIELD_LABELS.get(field, field)}'})
@@ -1201,7 +1207,7 @@ async def paid_review(callback: CallbackQuery, session: AsyncSession, current_us
     if not case:
         await callback.answer('Заявление не найдено.', show_alert=True)
         return
-    extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    extracted = prepare_paid_case_data(case)
     text = extraction_preview(extracted, case.received_date, [], case.deadline_date)
     await _edit_or_answer(callback, text, paid_review_menu(case.id))
     await callback.answer()
@@ -1229,7 +1235,7 @@ async def paid_regenerate(callback: CallbackQuery, session: AsyncSession, settin
         logger.warning('Paid document regeneration rejected case_id=%s: %s', case.id, exc)
         await _edit_or_answer(
             callback,
-            'Не удалось пересоздать заявление: проверьте дату получения и исправленные данные.',
+            f'Не удалось пересоздать заявление: {h(str(exc))}',
             paid_review_menu(case.id),
         )
         await callback.answer()
@@ -1267,9 +1273,10 @@ async def paid_date_value(message: Message, state: FSMContext, session: AsyncSes
         case.status, case.full_doc_path, case.full_pdf_path, case.preview_pdf_path,
         case.preview_doc_path, case.instruction_path,
     ) = document_state
+    record_paid_received_date(case)
     await session.commit()
     await state.clear()
-    extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+    extracted = prepare_paid_case_data(case)
     await message.answer(extraction_preview(extracted, case.received_date, [], case.deadline_date), reply_markup=paid_review_menu(case.id))
 
 

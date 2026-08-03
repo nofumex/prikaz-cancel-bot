@@ -430,21 +430,24 @@ def extraction_preview(
         "",
         f"<b>Суд:</b> {h(data.get('court_name') or 'не заполнено')}",
         f"<b>Адрес суда:</b> {h(data.get('court_address') or 'не заполнено')}",
+        f"<b>Судья:</b> {h(data.get('judge_name') or data.get('judge') or 'не заполнено')}",
         f"<b>Должник:</b> {h(data.get('debtor_full_name') or 'не заполнено')}",
         f"<b>Адрес должника:</b> {h(data.get('debtor_address') or 'не заполнено')}",
         f"<b>Взыскатель:</b> {h(data.get('creditor_name') or 'не заполнено')}",
         f"<b>Адрес взыскателя:</b> {h(data.get('creditor_address') or 'не заполнено')}",
+        f"<b>Юридический адрес взыскателя:</b> {h(data.get('creditor_legal_address') or 'не заполнено')}",
+        f"<b>Почтовый адрес взыскателя:</b> {h(data.get('creditor_correspondence_address') or 'не заполнено')}",
         f"<b>Номер дела:</b> {h(clean_case_number(data.get('case_number') or '') or 'не заполнено')}",
         f"<b>УИД:</b> {h(clean_uid(data.get('uid') or '') or 'не заполнено')}",
         f"<b>Дата приказа:</b> {h(data.get('order_date') or 'не заполнено')}",
         f"<b>Долг:</b> {h(format_money_rub_kop(data.get('debt_amount') or '') or 'не заполнено')}",
+        f"<b>Проценты:</b> {h(format_money_rub_kop(data.get('interest') or '') or 'не заполнено')}",
+        f"<b>Пени:</b> {h(format_money_rub_kop(data.get('penalty') or '') or 'не заполнено')}",
         f"<b>Госпошлина:</b> {h(format_money_rub_kop(data.get('state_duty') or '') or 'не заполнено')}",
         f"<b>Итого:</b> {h(format_money_rub_kop(data.get('total_amount') or '') or 'не заполнено')}",
     ]
-    if data.get("debt_contract"):
-        lines.append(f"<b>Договор:</b> {h(data.get('debt_contract'))}")
-    if data.get("debt_period"):
-        lines.append(f"<b>Период:</b> {h(data.get('debt_period'))}")
+    lines.append(f"<b>Договор:</b> {h(data.get('debt_contract') or 'не заполнено')}")
+    lines.append(f"<b>Период:</b> {h(data.get('debt_period') or 'не заполнено')}")
     if received_date:
         lines.append(f"<b>Дата получения:</b> {received_date.strftime('%d.%m.%Y')}")
     if deadline_date:

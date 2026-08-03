@@ -200,12 +200,16 @@ def paid_edit_fields_menu(case_id: int | None = None) -> MaxKeyboard:
         return f'paid:field:{case_id}:{field}' if case_id is not None else f'paid:field:{field}'
     return [
         [btn('⚖️ Суд', action('court_name')), btn('📍 Адрес суда', action('court_address'))],
+        [btn('👩‍⚖️ Судья', action('judge_name')), btn('📬 Дата получения', f'paid:date:{case_id}' if case_id is not None else 'paid:date')],
         [btn('👤 Должник', action('debtor_full_name')), btn('🏠 Адрес должника', action('debtor_address'))],
         [btn('🏦 Взыскатель', action('creditor_name')), btn('📍 Адрес взыскателя', action('creditor_address'))],
+        [btn('🏢 Юр. адрес взыскателя', action('creditor_legal_address'))],
+        [btn('📮 Почтовый адрес взыскателя', action('creditor_correspondence_address'))],
         [btn('📄 Номер дела', action('case_number')), btn('📅 Дата приказа', action('order_date'))],
         [btn('🔖 УИД', action('uid')), btn('🧾 Договор', action('debt_contract'))],
         [btn('📆 Период', action('debt_period')), btn('💰 Сумма долга', action('debt_amount'))],
-        [btn('⚖️ Госпошлина', action('state_duty'))],
+        [btn('📈 Проценты', action('interest')), btn('⚠️ Пени', action('penalty'))],
+        [btn('⚖️ Госпошлина', action('state_duty')), btn('🧮 Итоговая сумма', action('total_amount'))],
         [btn('↩️ Назад к проверке', f'paid:review:{case_id}' if case_id is not None else 'paid:review')],
     ]
 

@@ -31,7 +31,10 @@ from app.services.order_confirmation import (
     apply_confirmation_answer, confirmation_crop, confirmation_text, next_confirmation, reduce_and_validate,
 )
 from app.services.payments import ensure_payment, refresh_yookassa_payment_for_case
-from app.services.paid_correction import correction_allowed, paid_regeneration_requires_new_date, record_corrected_field, regenerate_paid_case
+from app.services.paid_correction import (
+    apply_paid_correction, correction_allowed, paid_regeneration_requires_new_date,
+    prepare_paid_case_data, record_paid_received_date, regenerate_paid_case,
+)
 from app.services.received_date import received_date_prompt_text, save_received_date, validate_received_date
 from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaReceiptContactRequired
@@ -429,16 +432,19 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             return
         if data and data.startswith('case:document:'):
             case = await generated_case_for_user(session, user.id, int(data.rsplit(':', 1)[-1]))
-            if not case or not case.full_doc_path or not Path(case.full_doc_path).exists():
-                await _send(client, event, 'Документ не найден.')
+            if not case:
+                await _send(client, event, 'Заявление не найдено.')
                 return
             if event.message_id:
                 try:
                     await client.delete_message(event.message_id)
                 except Exception:
                     logger.info('MAX archive list delete unavailable message_id=%s', event.message_id)
-            await client.send_file(event.chat_id, case.full_doc_path, caption='📄 Ваше заявление')
-            extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+            if case.full_doc_path and Path(case.full_doc_path).exists():
+                await client.send_file(event.chat_id, case.full_doc_path, caption='📄 Ваше заявление')
+            else:
+                await _send(client, event, 'Старый файл документа недоступен. Сохранённые данные можно проверить и исправить ниже.')
+            extracted = prepare_paid_case_data(case)
             await _send(client, event, extraction_preview(extracted, case.received_date, [], case.deadline_date, title='📄 <b>Данные в заявлении:</b>'), keyboards.document_details_menu(case.id))
             return
         if data == "case:new":
@@ -590,9 +596,9 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 return
             field = data.split(':')[-1]
             if not correction_allowed(case, field):
-                await _send(client, event, 'Нельзя изменить абсолютно все поля одного заявления. Оставьте хотя бы одно исходное поле.')
+                await _send(client, event, 'Это поле не предназначено для ручного редактирования.')
                 return
-            extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+            extracted = prepare_paid_case_data(case)
             await _set_state(session, event, STATE_PAID_FIELD, {'case_id': case.id, 'field': field})
             schedule_crm_sync(settings, case.id, user.id, 'paid_document_field_selected', {'note': f'Выбрано поле: {FIELD_LABELS.get(field, field)}'})
             current = extracted.get(field) or 'не указано'
@@ -604,7 +610,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             if not case:
                 await _send(client, event, 'Заявление не найдено.')
                 return
-            extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+            extracted = prepare_paid_case_data(case)
             await _edit_or_send(client, event, extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.paid_review_menu(case.id))
             return
         if data and data.startswith('paid:regenerate'):
@@ -621,7 +627,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 artifacts = await regenerate_paid_case(session, settings, case, user)
             except ValueError as exc:
                 logger.warning('Paid document regeneration rejected case_id=%s: %s', case.id, exc)
-                await _edit_or_send(client, event, 'Не удалось пересоздать заявление: проверьте дату получения и исправленные данные.', keyboards.paid_review_menu(case.id))
+                await _edit_or_send(client, event, f'Не удалось пересоздать заявление: {h(str(exc))}', keyboards.paid_review_menu(case.id))
                 return
             await client.send_file(event.chat_id, artifacts.full_docx_path, caption='✅ Исправленное заявление готово.')
             await _send(client, event, 'Проверьте исправленное заявление.', keyboards.paid_document_actions(case.id))
@@ -735,11 +741,7 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             if not value:
                 await _send(client, event, 'Значение не должно быть пустым.')
                 return
-            extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
-            extracted[field] = value
-            extracted = normalize_order_data(extracted)
-            case.extracted_json = json.dumps(extracted, ensure_ascii=False)
-            record_corrected_field(case, field)
+            extracted = apply_paid_correction(case, field, value)
             await session.commit()
             await _clear_state(session, event)
             schedule_crm_sync(settings, case.id, user.id, 'paid_document_field_corrected', {'note': f'Исправил поле: {FIELD_LABELS.get(field, field)}'})
@@ -761,9 +763,10 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 case.status, case.full_doc_path, case.full_pdf_path, case.preview_pdf_path,
                 case.preview_doc_path, case.instruction_path,
             ) = document_state
+            record_paid_received_date(case)
             await session.commit()
             await _clear_state(session, event)
-            extracted = normalize_order_data(json.loads(case.extracted_json or '{}'))
+            extracted = prepare_paid_case_data(case)
             await _send(client, event, extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.paid_review_menu(case.id))
             return
         if current_state == STATE_RESTORE_REASON and event.text:

@@ -60,6 +60,7 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("reminder_delivery_error", "reminder_delivery_error TEXT"),
             ("paid_regeneration_count", "paid_regeneration_count INTEGER NOT NULL DEFAULT 0"),
             ("paid_corrected_fields_json", "paid_corrected_fields_json TEXT"),
+            ("paid_corrections_json", "paid_corrections_json TEXT"),
         ],
     )
     await _sqlite_add_columns(

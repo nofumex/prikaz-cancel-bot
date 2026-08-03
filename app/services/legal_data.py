@@ -45,6 +45,7 @@ PREVIEW_IGNORED_TOKENS = {"▒"}
 FIELD_LABELS = {
     "court_name": "Суд",
     "court_address": "Адрес суда",
+    "judge_name": "Судья",
     "debtor_full_name": "ФИО должника",
     "debtor_address": "Адрес должника",
     "creditor_name": "Взыскатель",
@@ -57,6 +58,8 @@ FIELD_LABELS = {
     "debt_contract": "Договор/основание долга",
     "debt_period": "Период задолженности",
     "debt_amount": "Сумма задолженности",
+    "interest": "Проценты",
+    "penalty": "Пени",
     "state_duty": "Госпошлина",
     "total_amount": "Итого ко взысканию",
     "received_date": "Дата получения",

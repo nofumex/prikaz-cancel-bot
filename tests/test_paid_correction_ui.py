@@ -7,7 +7,8 @@ import pytest
 from app.adapters.max import keyboards as max_keyboards
 from app.keyboards.common import document_details_menu, documents_menu, paid_document_actions, paid_edit_fields_menu, paid_review_menu
 from app.services.documents import extraction_preview
-from app.services.paid_correction import PAID_EDITABLE_FIELDS, correction_allowed, paid_regeneration_requires_new_date, record_corrected_field, regenerate_paid_case
+from app.services.legal_data import normalize_order_data
+from app.services.paid_correction import PAID_EDITABLE_FIELDS, apply_paid_correction, correction_allowed, paid_regeneration_requires_new_date, prepare_paid_case_data, record_corrected_field, regenerate_paid_case
 
 
 def test_paid_correction_keyboards_have_only_safe_post_payment_actions():
@@ -58,14 +59,14 @@ def test_archive_data_title_does_not_repeat_review_heading():
     assert 'Проверьте данные' not in text
 
 
-def test_paid_correction_keeps_at_least_one_original_field():
+def test_paid_correction_allows_every_editable_source_field():
     case = SimpleNamespace(paid_corrected_fields_json=None)
     fields = sorted(PAID_EDITABLE_FIELDS)
     for field in fields[:-1]:
         assert correction_allowed(case, field)
         record_corrected_field(case, field)
     assert set(json.loads(case.paid_corrected_fields_json)) == set(fields[:-1])
-    assert not correction_allowed(case, fields[-1])
+    assert correction_allowed(case, fields[-1])
     assert correction_allowed(case, fields[0])
 
 
@@ -79,7 +80,7 @@ def test_paid_regeneration_requires_current_deadline_or_restore_reason():
 
 
 @pytest.mark.asyncio
-async def test_paid_regeneration_repairs_legacy_amount_mismatch(monkeypatch):
+async def test_paid_regeneration_blocks_legacy_amount_mismatch_without_rewriting(monkeypatch):
     case = SimpleNamespace(
         id=23,
         extracted_json=json.dumps({
@@ -103,8 +104,39 @@ async def test_paid_regeneration_repairs_legacy_amount_mismatch(monkeypatch):
     session = SimpleNamespace(commit=AsyncMock())
     user = SimpleNamespace(id=1)
 
-    await regenerate_paid_case(session, SimpleNamespace(), case, user)
+    with pytest.raises(ValueError, match='Суммы не совпадают'):
+        await regenerate_paid_case(session, SimpleNamespace(), case, user)
 
     saved = json.loads(case.extracted_json)
-    assert saved['debt_amount'] == '78 472 руб. 87 коп.'
-    assert case.paid_regeneration_count == 1
+    assert saved['debt_amount'] == '78 742 руб. 00 коп.'
+    assert case.paid_regeneration_count == 0
+    review.assert_not_awaited()
+
+
+def test_multiple_manual_corrections_accumulate_and_clear_stale_render_fields():
+    case = SimpleNamespace(
+        extracted_json=json.dumps({
+            'court_name': 'Старый суд',
+            'debtor_full_name': 'Старое Имя',
+            'debt_amount': '100 руб. 00 коп.',
+            'render': {'debtor_full_name': 'Старое Имя'},
+            'render_debtor_short_name': 'С. И.',
+        }),
+        paid_corrected_fields_json=None,
+        paid_corrections_json=None,
+    )
+
+    apply_paid_correction(case, 'court_name', 'Новый судебный участок № 7')
+    apply_paid_correction(case, 'debtor_full_name', 'Иванов Иван Иванович')
+    result = apply_paid_correction(case, 'debt_amount', '777 руб. 77 коп.')
+
+    assert result['court_name'] == 'Новый судебный участок № 7'
+    assert result['debtor_full_name'] == 'Иванов Иван Иванович'
+    assert result['debt_amount'] == '777 руб. 77 коп.'
+    assert result['debtor_short_name'] == 'Иванов И.И.'
+    assert 'render' not in result
+    assert not any(key.startswith('render_') for key in result)
+    assert prepare_paid_case_data(case) == result
+    renormalized = normalize_order_data(result)
+    assert renormalized['debtor_full_name'] == 'Иванов Иван Иванович'
+    assert renormalized['debt_amount'] == '777 руб. 77 коп.'
