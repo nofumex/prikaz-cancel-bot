@@ -23,7 +23,7 @@ from app.services.amount_recovery import format_amount_mismatch_admin_report
 from app.services.document_delivery import schedule_document_delivery
 from app.services.legal_data import FIELD_LABELS, normalize_order_data
 from app.services.payments import mark_paid_by_label, net_payment_totals, record_manual_refund
-from app.services.consultations import CONSULTATION_OFFER_TEXT, consultation_recipients
+from app.services.consultations import CONSULTATION_OFFER_TEXT, TEST_BROADCAST_USER_IDS, consultation_recipients
 from app.texts import case_summary
 from app.utils import full_name, h, username_text
 
@@ -45,12 +45,12 @@ async def _send_consultation_broadcast(client: MaxBotClient, session, settings: 
         for recipient in users:
             try:
                 if recipient.platform == 'max':
-                    await client.send_message(user_id=recipient.platform_user_id, text=CONSULTATION_OFFER_TEXT, keyboard=keyboards.consultation_request_menu())
+                    await client.send_message(user_id=recipient.platform_user_id, text=CONSULTATION_OFFER_TEXT, keyboard=keyboards.consultation_request_menu(test_mode=test_ids is not None))
                 elif recipient.platform == 'telegram' and telegram_bot:
                     from app.keyboards.common import consultation_request_menu
                     await telegram_bot.send_message(
                         int(recipient.platform_user_id), CONSULTATION_OFFER_TEXT,
-                        reply_markup=consultation_request_menu(), parse_mode='HTML',
+                        reply_markup=consultation_request_menu(test_mode=test_ids is not None), parse_mode='HTML',
                     )
                 else:
                     continue
@@ -287,7 +287,7 @@ async def handle_admin_update(
     if command in {'/consult_message', '/test_consult_message'}:
         if await _deny(client, event, user):
             return True
-        test_ids = {str(user.platform_user_id), '7727079839', '185607445'} if command == '/test_consult_message' else None
+        test_ids = TEST_BROADCAST_USER_IDS if command == '/test_consult_message' else None
         sent, failed = await _send_consultation_broadcast(client, session, settings, test_ids=test_ids)
         await _send(client, event, f"Рассылка консультации завершена. Отправлено: {sent}. Ошибок: {failed}.")
         return True

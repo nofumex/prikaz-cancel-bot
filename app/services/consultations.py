@@ -20,6 +20,14 @@ CONSULTATION_OFFER_TEXT = (
 CONSULTATION_ACCEPTED_TEXT = "✅ Ваша заявка принята. Скоро с вами свяжутся."
 CONSULTATION_PHONE_TEXT = "Пожалуйста, поделитесь номером телефона — так мы сможем связаться с вами для консультации."
 STAFF_TELEGRAM_IDS = {6143011344, 7727079839}
+TEST_BROADCAST_USER_IDS = {"8608404966", "7727079839", "185607445"}
+TEST_NOTIFICATION_TELEGRAM_IDS = {8608404966, 7727079839}
+
+
+def consultation_notification_ids(settings, *, test_mode: bool) -> set[int]:
+    if test_mode:
+        return TEST_NOTIFICATION_TELEGRAM_IDS
+    return set(settings.admin_ids) | STAFF_TELEGRAM_IDS
 
 
 async def consultation_case(session: AsyncSession, user: User, chat_id: str | None = None) -> Case:

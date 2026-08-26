@@ -140,8 +140,9 @@ def consultation_menu() -> MaxKeyboard:
     ]
 
 
-def consultation_request_menu() -> MaxKeyboard:
-    return [[btn("Получить консультацию", "consultation:request")]]
+def consultation_request_menu(*, test_mode: bool = False) -> MaxKeyboard:
+    callback_data = "consultation:request:test" if test_mode else "consultation:request"
+    return [[btn("Получить консультацию", callback_data)]]
 
 
 def chat_end_menu() -> MaxKeyboard:

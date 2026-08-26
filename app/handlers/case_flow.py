@@ -59,7 +59,7 @@ from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaError, YooKassaReceiptContactRequired
 from app.texts import case_summary, manual_received_date_prompt_text, payment_text
 from app.utils import ensure_dir, h, normalize_phone, normalize_receipt_contact, parse_russian_date, parse_structured_date
-from app.services.consultations import CONSULTATION_ACCEPTED_TEXT, CONSULTATION_PHONE_TEXT, STAFF_TELEGRAM_IDS, submit_consultation
+from app.services.consultations import CONSULTATION_ACCEPTED_TEXT, CONSULTATION_PHONE_TEXT, consultation_notification_ids, submit_consultation
 
 router = Router(name="case_flow")
 logger = logging.getLogger(__name__)
@@ -588,21 +588,25 @@ async def receive_payment_contact(message: Message, state: FSMContext, session: 
     )
 
 
-async def _notify_consultation_staff(message: Message, text: str) -> None:
-    for staff_id in STAFF_TELEGRAM_IDS | {message.from_user.id}:
-        await message.bot.send_message(staff_id, text)
+async def _notify_consultation_staff(message: Message, settings: Settings, text: str, *, test_mode: bool) -> None:
+    for staff_id in consultation_notification_ids(settings, test_mode=test_mode):
+        try:
+            await message.bot.send_message(staff_id, text)
+        except Exception:
+            logger.exception("Could not notify consultation staff telegram_id=%s", staff_id)
 
 
-@router.callback_query(F.data == "consultation:request")
+@router.callback_query(F.data.in_({"consultation:request", "consultation:request:test"}))
 async def request_consultation(callback: CallbackQuery, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
-    if current_user.phone:
+    test_mode = callback.data == "consultation:request:test"
+    if current_user.phone and not test_mode:
         await submit_consultation(
             session, settings, current_user, chat_id=str(callback.message.chat.id),
-            notify=lambda text: _notify_consultation_staff(callback.message, text),
+            notify=lambda text: _notify_consultation_staff(callback.message, settings, text, test_mode=False),
         )
         await callback.message.answer(CONSULTATION_ACCEPTED_TEXT)
     else:
-        await state.update_data(consultation_chat_id=str(callback.message.chat.id))
+        await state.update_data(consultation_chat_id=str(callback.message.chat.id), consultation_test_mode=test_mode)
         await state.set_state(CaseStates.waiting_consultation_phone)
         await callback.message.answer(CONSULTATION_PHONE_TEXT, reply_markup=phone_request_keyboard())
     await callback.answer()
@@ -619,9 +623,10 @@ async def receive_consultation_phone(message: Message, state: FSMContext, sessio
     current_user.phone = phone
     await session.commit()
     data = await state.get_data()
+    test_mode = bool(data.get("consultation_test_mode"))
     await submit_consultation(
         session, settings, current_user, chat_id=data.get("consultation_chat_id"),
-        notify=lambda text: _notify_consultation_staff(message, text),
+        notify=lambda text: _notify_consultation_staff(message, settings, text, test_mode=test_mode),
     )
     await state.clear()
     await message.answer(CONSULTATION_ACCEPTED_TEXT, reply_markup=ReplyKeyboardRemove())

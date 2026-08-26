@@ -134,8 +134,9 @@ def consultation_menu() -> InlineKeyboardMarkup:
     )
 
 
-def consultation_request_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[btn("Получить консультацию", "consultation:request")]])
+def consultation_request_menu(*, test_mode: bool = False) -> InlineKeyboardMarkup:
+    callback_data = "consultation:request:test" if test_mode else "consultation:request"
+    return InlineKeyboardMarkup(inline_keyboard=[[btn("Получить консультацию", callback_data)]])
 
 
 def chat_end_menu() -> InlineKeyboardMarkup:

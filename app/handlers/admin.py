@@ -28,7 +28,7 @@ from app.services.document_delivery import schedule_document_delivery
 from app.services.payments import mark_paid_by_label, net_payment_totals, record_manual_refund
 from app.texts import case_summary
 from app.services.legal_data import FIELD_LABELS, normalize_order_data
-from app.services.consultations import CONSULTATION_OFFER_TEXT, consultation_recipients
+from app.services.consultations import CONSULTATION_OFFER_TEXT, TEST_BROADCAST_USER_IDS, consultation_recipients
 from app.keyboards.common import consultation_request_menu
 from app.utils import full_name, h, safe_json_loads, username_text
 
@@ -140,9 +140,9 @@ async def _send_consultation_broadcast(
         for recipient in users:
             try:
                 if recipient.platform == "telegram":
-                    await bot.send_message(int(recipient.platform_user_id), CONSULTATION_OFFER_TEXT, reply_markup=consultation_request_menu())
+                    await bot.send_message(int(recipient.platform_user_id), CONSULTATION_OFFER_TEXT, reply_markup=consultation_request_menu(test_mode=test_ids is not None))
                 elif recipient.platform == "max" and max_client:
-                    await max_client.send_message(user_id=recipient.platform_user_id, text=CONSULTATION_OFFER_TEXT, keyboard=max_consultation_request_menu())
+                    await max_client.send_message(user_id=recipient.platform_user_id, text=CONSULTATION_OFFER_TEXT, keyboard=max_consultation_request_menu(test_mode=test_ids is not None))
                 else:
                     continue
                 sent += 1
@@ -167,7 +167,7 @@ async def cmd_test_consult_message(message: Message, bot: Bot, session: AsyncSes
     if not await _ensure_admin_message(message, current_user):
         return
     sent, failed = await _send_consultation_broadcast(
-        bot, session, settings, test_ids={str(current_user.platform_user_id), "7727079839", "185607445"}
+        bot, session, settings, test_ids=TEST_BROADCAST_USER_IDS
     )
     await message.answer(f"Тестовая рассылка консультации завершена. Отправлено: {sent}. Ошибок: {failed}.")
 
