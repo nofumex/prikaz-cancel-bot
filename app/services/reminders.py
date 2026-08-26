@@ -244,7 +244,10 @@ async def _send_user_message(settings, bot: Bot | None, user: User, text: str, *
 
 def _is_terminal_max_delivery_error(exc: MaxApiError) -> bool:
     text = str(exc).lower()
-    return exc.status == 403 and (exc.code == 'chat.denied' or 'dialog.suspended' in text)
+    return (
+        (exc.status == 403 and (exc.code == 'chat.denied' or 'dialog.suspended' in text))
+        or (exc.status == 404 and exc.code == 'chat.not.found')
+    )
 
 
 async def _send_max_message(settings, text: str, keyboard=None, *, chat_id: str | int | None = None, user_id: str | int | None = None) -> dict:

@@ -301,3 +301,19 @@ async def test_max_suspended_dialog_isolated_and_disabled(monkeypatch) -> None:
     assert sent is False
     assert user.reminder_delivery_blocked_at is not None
     assert 'chat.denied' in user.reminder_delivery_error
+
+
+@pytest.mark.asyncio
+async def test_max_missing_chat_isolated_and_disabled(monkeypatch) -> None:
+    async def missing_chat(*args, **kwargs):
+        raise MaxApiError(404, {'code': 'chat.not.found', 'message': 'Chat not found'})
+
+    monkeypatch.setattr('app.services.reminders._send_max_message', missing_chat)
+    monkeypatch.setattr('app.services.reminders.schedule_crm_sync', lambda *args, **kwargs: None)
+    user = User(id=8, platform='max', platform_user_id='98496220')
+
+    sent = await _send_user_message(SimpleNamespace(), None, user, 'test')
+
+    assert sent is False
+    assert user.reminder_delivery_blocked_at is not None
+    assert 'chat.not.found' in user.reminder_delivery_error
