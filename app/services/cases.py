@@ -158,7 +158,7 @@ def new_payment_label(case_id: int) -> str:
     return f"prikaz-{case_id}-{secrets.token_hex(4)}"
 
 
-async def due_unpaid_cases(session: AsyncSession) -> list[Case]:
+async def due_unpaid_cases(session: AsyncSession, *, not_before: datetime | None = None) -> list[Case]:
     now = datetime.utcnow()
     due_24h = now - timedelta(hours=int(reminder_settings()['reminder_pay_hours']))
     latest_active_unpaid_ids = (
@@ -170,25 +170,28 @@ async def due_unpaid_cases(session: AsyncSession) -> list[Case]:
         )
         .group_by(Case.platform, Case.platform_user_id)
     )
+    conditions = [
+        Case.id.in_(latest_active_unpaid_ids),
+        Case.status == CaseStatus.PAYMENT_PENDING.value,
+        Payment.status == PaymentStatus.PENDING.value,
+        Case.deadline_reminder_sent_at.is_(None),
+        Case.reminder_delivery_blocked_at.is_(None),
+        Case.user.has(User.reminder_delivery_blocked_at.is_(None)),
+        Payment.created_at <= due_24h,
+    ]
+    if not_before is not None:
+        conditions.append(Payment.created_at >= not_before)
     result = await session.execute(
         select(Case)
         .join(Payment, Payment.case_id == Case.id)
-        .where(
-            Case.id.in_(latest_active_unpaid_ids),
-            Case.status == CaseStatus.PAYMENT_PENDING.value,
-            Payment.status == PaymentStatus.PENDING.value,
-            Case.deadline_reminder_sent_at.is_(None),
-            Case.reminder_delivery_blocked_at.is_(None),
-            Case.user.has(User.reminder_delivery_blocked_at.is_(None)),
-            Payment.created_at <= due_24h,
-        )
+        .where(*conditions)
         .order_by(Case.created_at.asc())
         .limit(50)
     )
     return list(result.scalars().unique().all())
 
 
-async def due_no_order_cases(session: AsyncSession) -> list[Case]:
+async def due_no_order_cases(session: AsyncSession, *, not_before: datetime | None = None) -> list[Case]:
     now = datetime.utcnow()
     due_24h = now - timedelta(hours=int(reminder_settings()['reminder_try_hours']))
     waiting_statuses = [CaseStatus.WAITING_ORDER_PHOTO.value, CaseStatus.WAITING_ORDER_REPHOTO.value]
@@ -200,42 +203,48 @@ async def due_no_order_cases(session: AsyncSession) -> list[Case]:
         )
         .group_by(Case.platform, Case.platform_user_id)
     )
+    conditions = [
+        Case.id.in_(latest_waiting_ids),
+        Case.created_at <= due_24h,
+        Case.deadline_reminder_sent_at.is_(None),
+        Case.reminder_delivery_blocked_at.is_(None),
+        Case.user.has(User.reminder_delivery_blocked_at.is_(None)),
+    ]
+    if not_before is not None:
+        conditions.append(Case.created_at >= not_before)
     result = await session.execute(
         select(Case)
-        .where(
-            Case.id.in_(latest_waiting_ids),
-            Case.created_at <= due_24h,
-            Case.deadline_reminder_sent_at.is_(None),
-            Case.reminder_delivery_blocked_at.is_(None),
-            Case.user.has(User.reminder_delivery_blocked_at.is_(None)),
-        )
+        .where(*conditions)
         .order_by(Case.created_at.asc())
         .limit(50)
     )
     return list(result.scalars().unique().all())
 
 
-async def due_started_users_without_cases(session: AsyncSession) -> list[User]:
+async def due_started_users_without_cases(session: AsyncSession, *, not_before: datetime | None = None) -> list[User]:
     now = datetime.utcnow()
     due_24h = now - timedelta(hours=int(reminder_settings()['reminder_try_hours']))
     case_exists = select(Case.id).where(Case.user_id == User.id).exists()
+    conditions = [
+        User.created_at <= due_24h,
+        User.first_deadline_reminder_sent_at.is_(None),
+        User.reminder_delivery_blocked_at.is_(None),
+        User.is_admin.is_(False),
+        User.is_manager.is_(False),
+        ~case_exists,
+    ]
+    if not_before is not None:
+        conditions.append(User.created_at >= not_before)
     result = await session.execute(
         select(User)
-        .where(
-            User.created_at <= due_24h,
-            User.first_deadline_reminder_sent_at.is_(None),
-            User.reminder_delivery_blocked_at.is_(None),
-            User.is_admin.is_(False),
-            User.is_manager.is_(False),
-            ~case_exists,
-        )
+        .where(*conditions)
         .order_by(User.created_at.asc())
         .limit(50)
     )
     return list(result.scalars().unique().all())
 
 
-async def due_inactive_users(session: AsyncSession) -> list[User]:
+async def due_inactive_users(session: AsyncSession, *, not_before: datetime | None = None) -> list[User]:
     """Users with a phone who stopped interacting for ten minutes."""
     due_at = datetime.utcnow() - timedelta(minutes=10)
     open_case_exists = select(Case.id).where(
@@ -246,54 +255,65 @@ async def due_inactive_users(session: AsyncSession) -> list[User]:
         ChatSession.user_id == User.id,
         ChatSession.status.in_(["open", "connected"]),
     ).exists()
+    conditions = [
+        User.phone.is_not(None),
+        User.phone != "",
+        User.is_admin.is_(False),
+        User.is_manager.is_(False),
+        User.updated_at <= due_at,
+        User.inactivity_offer_sent_at.is_(None),
+        User.inactivity_offer_dismissed_at.is_(None),
+        open_case_exists,
+        ~active_chat_exists,
+    ]
+    if not_before is not None:
+        conditions.append(User.updated_at >= not_before)
     result = await session.execute(
         select(User).where(
-            User.phone.is_not(None),
-            User.phone != "",
-            User.is_admin.is_(False),
-            User.is_manager.is_(False),
-            User.updated_at <= due_at,
-            User.inactivity_offer_sent_at.is_(None),
-            User.inactivity_offer_dismissed_at.is_(None),
-            open_case_exists,
-            ~active_chat_exists,
+            *conditions,
         ).order_by(User.updated_at.asc()).limit(50)
     )
     return list(result.scalars().all())
 
 
-async def due_paid_followup_cases(session: AsyncSession) -> list[Case]:
+async def due_paid_followup_cases(session: AsyncSession, *, not_before: datetime | None = None) -> list[Case]:
     now = datetime.utcnow()
     due_48h = now - timedelta(hours=48)
+    conditions = [
+        Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]),
+        Case.paid_at.is_not(None),
+        Case.paid_at <= due_48h,
+        Case.post_payment_followup_sent_at.is_(None),
+        Case.reminder_delivery_blocked_at.is_(None),
+        Case.user.has(User.reminder_delivery_blocked_at.is_(None)),
+    ]
+    if not_before is not None:
+        conditions.append(Case.paid_at >= not_before)
     result = await session.execute(
         select(Case)
-        .where(
-            Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]),
-            Case.paid_at.is_not(None),
-            Case.paid_at <= due_48h,
-            Case.post_payment_followup_sent_at.is_(None),
-            Case.reminder_delivery_blocked_at.is_(None),
-            Case.user.has(User.reminder_delivery_blocked_at.is_(None)),
-        )
+        .where(*conditions)
         .order_by(Case.paid_at.asc(), Case.created_at.asc())
         .limit(50)
     )
     return list(result.scalars().unique().all())
 
 
-async def due_case_consultation_reminders(session: AsyncSession) -> list[Case]:
+async def due_case_consultation_reminders(session: AsyncSession, *, not_before: datetime | None = None) -> list[Case]:
     now = datetime.utcnow()
     due_at = now - timedelta(hours=int(reminder_settings()['reminder_consultation_hours']))
+    conditions = [
+        Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]),
+        Case.consultation_reminder_sent_at.is_(None),
+        Case.reminder_delivery_blocked_at.is_(None),
+        Case.user.has(User.reminder_delivery_blocked_at.is_(None)),
+        Case.post_payment_followup_sent_at.is_not(None),
+        Case.post_payment_followup_sent_at <= due_at,
+    ]
+    if not_before is not None:
+        conditions.append(Case.post_payment_followup_sent_at >= not_before)
     result = await session.execute(
         select(Case)
-        .where(
-            Case.status.in_([CaseStatus.PAID.value, CaseStatus.DELIVERED.value]),
-            Case.consultation_reminder_sent_at.is_(None),
-            Case.reminder_delivery_blocked_at.is_(None),
-            Case.user.has(User.reminder_delivery_blocked_at.is_(None)),
-            Case.post_payment_followup_sent_at.is_not(None),
-            Case.post_payment_followup_sent_at <= due_at,
-        )
+        .where(*conditions)
         .order_by(Case.created_at.asc())
         .limit(50)
     )

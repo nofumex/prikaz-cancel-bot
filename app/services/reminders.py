@@ -41,13 +41,16 @@ def _inactivity_manager_notice(user: User) -> str:
 
 async def run_payment_reminders(bot: Bot | None = None) -> None:
     settings = get_settings()
+    # Do not retrospectively message the entire old database on process start.
+    # Only actions that happen while this bot process is running may schedule a reminder.
+    reminders_started_at = datetime.utcnow()
     while True:
         try:
             async with SessionLocal() as session:
                 now = datetime.utcnow()
                 reminder_config = reminder_settings()
 
-                for user in await due_inactive_users(session):
+                for user in await due_inactive_users(session, not_before=reminders_started_at):
                     chat = await open_session(session, user)
                     sent = await _send_user_message(
                         settings, bot, user, INACTIVITY_TEXT,
@@ -75,7 +78,7 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
                     if case:
                         schedule_crm_sync(settings, case.id, user.id, "manager_requested", {"note": "Бездействие пользователя 10 минут: менеджеру предложено подключиться"})
 
-                for user in await due_started_users_without_cases(session):
+                for user in await due_started_users_without_cases(session, not_before=reminders_started_at):
                     sent = await _send_user_message(
                         settings,
                         bot,
@@ -87,7 +90,7 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
                     if sent:
                         user.first_deadline_reminder_sent_at = now
 
-                for case in await due_no_order_cases(session):
+                for case in await due_no_order_cases(session, not_before=reminders_started_at):
                     await session.refresh(case, ["user"])
                     sent = await _send_case_message(
                         settings,
@@ -109,7 +112,7 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
                             {"note": "\u041d\u0430\u043f\u043e\u043c\u0438\u043d\u0430\u043d\u0438\u0435 \u0447\u0435\u0440\u0435\u0437 \u0441\u0443\u0442\u043a\u0438: \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c \u043d\u0435 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u043b \u0441\u0443\u0434\u0435\u0431\u043d\u044b\u0439 \u043f\u0440\u0438\u043a\u0430\u0437"},
                         )
 
-                for case in await due_unpaid_cases(session):
+                for case in await due_unpaid_cases(session, not_before=reminders_started_at):
                     await session.refresh(case, ["user"])
                     if case.status != CaseStatus.PAYMENT_PENDING.value:
                         continue
@@ -133,7 +136,7 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
                             {"note": "\u041d\u0430\u043f\u043e\u043c\u0438\u043d\u0430\u043d\u0438\u0435 \u0447\u0435\u0440\u0435\u0437 \u0441\u0443\u0442\u043a\u0438: \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c \u043d\u0435 \u043e\u043f\u043b\u0430\u0442\u0438\u043b \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u043b\u0435\u043d\u043d\u044b\u0439 \u0434\u043e\u043a\u0443\u043c\u0435\u043d\u0442"},
                         )
 
-                for case in await due_paid_followup_cases(session):
+                for case in await due_paid_followup_cases(session, not_before=reminders_started_at):
                     await session.refresh(case, ["user"])
                     sent = await _send_case_message(
                         settings,
@@ -151,7 +154,7 @@ async def run_payment_reminders(bot: Bot | None = None) -> None:
                             {"note": "\u0412\u043e\u043f\u0440\u043e\u0441 \u0447\u0435\u0440\u0435\u0437 \u0434\u0432\u043e\u0435 \u0441\u0443\u0442\u043e\u043a \u043f\u043e\u0441\u043b\u0435 \u043e\u043f\u043b\u0430\u0442\u044b: \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043b\u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c \u0437\u0430\u044f\u0432\u043b\u0435\u043d\u0438\u0435 \u0432 \u0441\u0443\u0434"},
                         )
 
-                for case in await due_case_consultation_reminders(session):
+                for case in await due_case_consultation_reminders(session, not_before=reminders_started_at):
                     await session.refresh(case, ["user"])
                     sent = await _send_case_message(
                         settings,
