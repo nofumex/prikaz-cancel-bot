@@ -339,6 +339,24 @@ async def _submit_max_consultation(client: MaxBotClient, event: IncomingEvent, s
     )
 
 
+async def _handle_consultation_phone(
+    client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User,
+) -> None:
+    phone = normalize_phone(event.contact_phone or event.text)
+    if not phone:
+        await _send(client, event, 'Укажите корректный номер телефона.', keyboards.phone_request_keyboard())
+        return
+    user.phone = phone
+    await session.commit()
+    state_data = await _state_data(session, event)
+    await _submit_max_consultation(
+        client, event, session, settings, user,
+        test_mode=bool(state_data.get('consultation_test_mode')),
+    )
+    await _clear_state(session, event)
+    await _send(client, event, CONSULTATION_ACCEPTED_TEXT)
+
+
 async def _recover_state_for_input(
     session,
     event: IncomingEvent,
@@ -430,6 +448,9 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
         if await handle_admin_update(
             client, event, settings, session, user, generate_documents=generate_admin_documents
         ):
+            return
+        if current_state == STATE_CONSULTATION_PHONE and (event.contact_phone or event.text):
+            await _handle_consultation_phone(client, event, session, settings, user)
             return
         if await handle_chat_update(client, event, settings, session, user):
             return
@@ -733,22 +754,6 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 await client.answer_callback(event.callback_id)
                 return
             await _send(client, event, 'Эта кнопка больше неактуальна. Выберите действие в меню.', keyboards.main_menu())
-            return
-
-        if current_state == STATE_CONSULTATION_PHONE and (event.contact_phone or event.text):
-            phone = normalize_phone(event.contact_phone or event.text)
-            if not phone:
-                await _send(client, event, 'Укажите корректный номер телефона.', keyboards.phone_request_keyboard())
-                return
-            user.phone = phone
-            await session.commit()
-            state_data = await _state_data(session, event)
-            await _submit_max_consultation(
-                client, event, session, settings, user,
-                test_mode=bool(state_data.get('consultation_test_mode')),
-            )
-            await _clear_state(session, event)
-            await _send(client, event, CONSULTATION_ACCEPTED_TEXT)
             return
 
         if current_state == STATE_PAYMENT_CONTACT and (event.contact_phone or event.text):
