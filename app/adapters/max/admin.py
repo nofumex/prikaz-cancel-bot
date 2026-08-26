@@ -287,7 +287,7 @@ async def handle_admin_update(
     if command in {'/consult_message', '/test_consult_message'}:
         if await _deny(client, event, user):
             return True
-        test_ids = {str(user.platform_user_id), '7727079839'} if command == '/test_consult_message' else None
+        test_ids = {str(user.platform_user_id), '7727079839', '185607445'} if command == '/test_consult_message' else None
         sent, failed = await _send_consultation_broadcast(client, session, settings, test_ids=test_ids)
         await _send(client, event, f"Рассылка консультации завершена. Отправлено: {sent}. Ошибок: {failed}.")
         return True

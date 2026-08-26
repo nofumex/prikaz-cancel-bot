@@ -373,6 +373,13 @@ async def _recover_state_for_input(
     return None
 
 async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Settings) -> None:
+    # MAX can send an update for messages delivered by the bot itself.  Such an
+    # update is not user input and must never create a user/case/CRM lead.
+    # Do not apply this to callbacks: their source message belongs to the bot,
+    # while the callback user is a real client selected by the mapper.
+    if event.update_type == "message_created" and event.sender_is_bot:
+        logger.info("Ignoring MAX outgoing bot message message_id=%s", event.message_id)
+        return
     async with SessionLocal() as session:
         user = await get_or_create_platform_user(
             session,

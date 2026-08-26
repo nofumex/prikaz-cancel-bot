@@ -167,7 +167,7 @@ async def cmd_test_consult_message(message: Message, bot: Bot, session: AsyncSes
     if not await _ensure_admin_message(message, current_user):
         return
     sent, failed = await _send_consultation_broadcast(
-        bot, session, settings, test_ids={str(current_user.platform_user_id), "7727079839"}
+        bot, session, settings, test_ids={str(current_user.platform_user_id), "7727079839", "185607445"}
     )
     await message.answer(f"Тестовая рассылка консультации завершена. Отправлено: {sent}. Ошибок: {failed}.")
 
