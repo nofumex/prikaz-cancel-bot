@@ -28,6 +28,8 @@ from app.services.document_delivery import schedule_document_delivery
 from app.services.payments import mark_paid_by_label, net_payment_totals, record_manual_refund
 from app.texts import case_summary
 from app.services.legal_data import FIELD_LABELS, normalize_order_data
+from app.services.consultations import CONSULTATION_OFFER_TEXT, consultation_recipients
+from app.keyboards.common import consultation_request_menu
 from app.utils import full_name, h, safe_json_loads, username_text
 
 router = Router(name="admin")
@@ -120,6 +122,54 @@ async def _ensure_admin_callback(callback: CallbackQuery, user: User) -> bool:
         await callback.answer("Недостаточно прав", show_alert=True)
         return False
     return True
+
+
+async def _send_consultation_broadcast(
+    bot: Bot, session: AsyncSession, settings: Settings, *, test_ids: set[str] | None = None,
+) -> tuple[int, int]:
+    """Send to every stored bot user; test mode is explicitly limited to staff IDs."""
+    from app.adapters.max.client import MaxBotClient
+    from app.adapters.max.keyboards import consultation_request_menu as max_consultation_request_menu
+
+    users = await consultation_recipients(session, test_ids=test_ids)
+    sent = failed = 0
+    max_client = MaxBotClient(settings.max_bot_token, settings.max_api_base_url) if settings.max_bot_token else None
+    try:
+        if max_client:
+            await max_client.__aenter__()
+        for recipient in users:
+            try:
+                if recipient.platform == "telegram":
+                    await bot.send_message(int(recipient.platform_user_id), CONSULTATION_OFFER_TEXT, reply_markup=consultation_request_menu())
+                elif recipient.platform == "max" and max_client:
+                    await max_client.send_message(user_id=recipient.platform_user_id, text=CONSULTATION_OFFER_TEXT, keyboard=max_consultation_request_menu())
+                else:
+                    continue
+                sent += 1
+            except Exception:
+                failed += 1
+        return sent, failed
+    finally:
+        if max_client:
+            await max_client.close()
+
+
+@router.message(Command("consult_message"))
+async def cmd_consult_message(message: Message, bot: Bot, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    if not await _ensure_admin_message(message, current_user):
+        return
+    sent, failed = await _send_consultation_broadcast(bot, session, settings)
+    await message.answer(f"Рассылка консультации завершена. Отправлено: {sent}. Ошибок: {failed}.")
+
+
+@router.message(Command("test_consult_message"))
+async def cmd_test_consult_message(message: Message, bot: Bot, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    if not await _ensure_admin_message(message, current_user):
+        return
+    sent, failed = await _send_consultation_broadcast(
+        bot, session, settings, test_ids={str(current_user.platform_user_id), "7727079839"}
+    )
+    await message.answer(f"Тестовая рассылка консультации завершена. Отправлено: {sent}. Ошибок: {failed}.")
 
 
 @router.message(Command("admin"))

@@ -29,6 +29,7 @@ PIPELINE_STATUSES = [
     "Оплатил",
     "Получил напоминание",
     "Получил предложение о консультации",
+    "Консультация",
 ]
 
 
@@ -112,6 +113,7 @@ EVENT_STATUS_MAP = {
     "documents_delivered": "Оплатил",
     "paid_court_followup_sent": "Получил предложение о консультации",
     "consultation_offer_sent": "Получил предложение о консультации",
+    "consultation_requested": "Консультация",
 }
 
 CASE_STATUS_EVENT_MAP = {

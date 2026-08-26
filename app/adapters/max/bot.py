@@ -39,6 +39,7 @@ from app.services.received_date import received_date_prompt_text, save_received_
 from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaReceiptContactRequired
 from app.services.users import get_or_create_platform_user
+from app.services.consultations import CONSULTATION_ACCEPTED_TEXT, CONSULTATION_PHONE_TEXT, STAFF_TELEGRAM_IDS, submit_consultation
 from app.texts import case_summary, help_text, manual_received_date_prompt_text, payment_text, profile_text, welcome_text
 from app.utils import ensure_dir, h, normalize_phone, normalize_receipt_contact, parse_russian_date, parse_structured_date
 
@@ -53,6 +54,7 @@ STATE_MANUAL_DATE = "max_waiting_manual_date"
 STATE_FIELD_VALUE = "max_waiting_field_value"
 STATE_OCR_FIELD_VALUE = "max_waiting_ocr_field_value"
 STATE_PAYMENT_CONTACT = 'max_waiting_payment_contact'
+STATE_CONSULTATION_PHONE = 'max_waiting_consultation_phone'
 STATE_RESTORE_REASON = 'max_waiting_restore_reason'
 STATE_PAID_FIELD = 'max_waiting_paid_field'
 STATE_PAID_DATE = 'max_waiting_paid_date'
@@ -306,6 +308,34 @@ async def _handle_payment_contact(client: MaxBotClient, event: IncomingEvent, se
         await _send(client, event, extraction_preview(extracted, case.received_date, [], case.deadline_date), keyboards.confirm_extraction())
         return
     await _generate_documents(client, event, session, settings, user, case)
+
+
+async def _notify_consultation_staff_max(client: MaxBotClient, event: IncomingEvent, settings: Settings, text: str) -> None:
+    # MAX has no username for incoming users; notify the operating admin and configured staff IDs.
+    for staff_id in STAFF_TELEGRAM_IDS | {int(event.platform_user_id)}:
+        try:
+            await client.send_message(user_id=staff_id, text=text)
+        except Exception:
+            logger.exception('Failed to notify staff about MAX consultation staff_id=%s', staff_id)
+    if settings.telegram_bot_token:
+        from aiogram import Bot
+
+        telegram_bot = Bot(settings.telegram_bot_token)
+        try:
+            for staff_id in STAFF_TELEGRAM_IDS | set(settings.admin_ids):
+                try:
+                    await telegram_bot.send_message(staff_id, text, parse_mode='HTML')
+                except Exception:
+                    logger.exception('Failed to notify Telegram staff about MAX consultation staff_id=%s', staff_id)
+        finally:
+            await telegram_bot.session.close()
+
+
+async def _submit_max_consultation(client: MaxBotClient, event: IncomingEvent, session, settings: Settings, user: User) -> None:
+    await submit_consultation(
+        session, settings, user, chat_id=event.chat_id,
+        notify=lambda text: _notify_consultation_staff_max(client, event, settings, text),
+    )
 
 
 async def _recover_state_for_input(
@@ -684,7 +714,28 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             return
 
         if event.update_type == 'message_callback':
+            if data == 'consultation:request':
+                if user.phone:
+                    await _submit_max_consultation(client, event, session, settings, user)
+                    await _send(client, event, CONSULTATION_ACCEPTED_TEXT)
+                else:
+                    await _set_state(session, event, STATE_CONSULTATION_PHONE, {})
+                    await _send(client, event, CONSULTATION_PHONE_TEXT, keyboards.phone_request_keyboard())
+                await client.answer_callback(event.callback_id)
+                return
             await _send(client, event, 'Эта кнопка больше неактуальна. Выберите действие в меню.', keyboards.main_menu())
+            return
+
+        if current_state == STATE_CONSULTATION_PHONE and (event.contact_phone or event.text):
+            phone = normalize_phone(event.contact_phone or event.text)
+            if not phone:
+                await _send(client, event, 'Укажите корректный номер телефона.', keyboards.phone_request_keyboard())
+                return
+            user.phone = phone
+            await session.commit()
+            await _submit_max_consultation(client, event, session, settings, user)
+            await _clear_state(session, event)
+            await _send(client, event, CONSULTATION_ACCEPTED_TEXT)
             return
 
         if current_state == STATE_PAYMENT_CONTACT and (event.contact_phone or event.text):

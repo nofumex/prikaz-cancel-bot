@@ -140,6 +140,10 @@ def consultation_menu() -> MaxKeyboard:
     ]
 
 
+def consultation_request_menu() -> MaxKeyboard:
+    return [[btn("Получить консультацию", "consultation:request")]]
+
+
 def chat_end_menu() -> MaxKeyboard:
     return [[btn("✅ Завершить чат", "chat:end")]]
 

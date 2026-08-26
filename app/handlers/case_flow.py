@@ -59,6 +59,7 @@ from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaError, YooKassaReceiptContactRequired
 from app.texts import case_summary, manual_received_date_prompt_text, payment_text
 from app.utils import ensure_dir, h, normalize_phone, normalize_receipt_contact, parse_russian_date, parse_structured_date
+from app.services.consultations import CONSULTATION_ACCEPTED_TEXT, CONSULTATION_PHONE_TEXT, STAFF_TELEGRAM_IDS, submit_consultation
 
 router = Router(name="case_flow")
 logger = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ class CaseStates(StatesGroup):
     waiting_field_value = State()
     waiting_ocr_field_value = State()
     waiting_payment_contact = State()
+    waiting_consultation_phone = State()
     waiting_restore_reason = State()
     waiting_restore_reason_custom = State()
     waiting_paid_field_value = State()
@@ -584,6 +586,45 @@ async def receive_payment_contact(message: Message, state: FSMContext, session: 
         bot=message.bot,
         remove_phone_keyboard=True,
     )
+
+
+async def _notify_consultation_staff(message: Message, text: str) -> None:
+    for staff_id in STAFF_TELEGRAM_IDS | {message.from_user.id}:
+        await message.bot.send_message(staff_id, text)
+
+
+@router.callback_query(F.data == "consultation:request")
+async def request_consultation(callback: CallbackQuery, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    if current_user.phone:
+        await submit_consultation(
+            session, settings, current_user, chat_id=str(callback.message.chat.id),
+            notify=lambda text: _notify_consultation_staff(callback.message, text),
+        )
+        await callback.message.answer(CONSULTATION_ACCEPTED_TEXT)
+    else:
+        await state.update_data(consultation_chat_id=str(callback.message.chat.id))
+        await state.set_state(CaseStates.waiting_consultation_phone)
+        await callback.message.answer(CONSULTATION_PHONE_TEXT, reply_markup=phone_request_keyboard())
+    await callback.answer()
+
+
+@router.message(CaseStates.waiting_consultation_phone, F.contact)
+@router.message(CaseStates.waiting_consultation_phone, F.text)
+async def receive_consultation_phone(message: Message, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
+    raw_phone = message.contact.phone_number if message.contact else message.text
+    phone = normalize_phone(raw_phone)
+    if not phone:
+        await message.answer("Укажите корректный номер телефона.", reply_markup=phone_request_keyboard())
+        return
+    current_user.phone = phone
+    await session.commit()
+    data = await state.get_data()
+    await submit_consultation(
+        session, settings, current_user, chat_id=data.get("consultation_chat_id"),
+        notify=lambda text: _notify_consultation_staff(message, text),
+    )
+    await state.clear()
+    await message.answer(CONSULTATION_ACCEPTED_TEXT, reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(CaseStates.waiting_envelope_photo, F.photo)

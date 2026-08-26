@@ -23,6 +23,7 @@ from app.services.amount_recovery import format_amount_mismatch_admin_report
 from app.services.document_delivery import schedule_document_delivery
 from app.services.legal_data import FIELD_LABELS, normalize_order_data
 from app.services.payments import mark_paid_by_label, net_payment_totals, record_manual_refund
+from app.services.consultations import CONSULTATION_OFFER_TEXT, consultation_recipients
 from app.texts import case_summary
 from app.utils import full_name, h, username_text
 
@@ -32,6 +33,34 @@ GenerateDocuments = Callable[[Case], Awaitable[None]]
 
 async def _send(client: MaxBotClient, event: IncomingEvent, text: str, keyboard=None) -> None:
     await client.send_message(chat_id=event.chat_id, text=text, keyboard=keyboard)
+
+
+async def _send_consultation_broadcast(client: MaxBotClient, session, settings: Settings, *, test_ids: set[str] | None = None) -> tuple[int, int]:
+    from aiogram import Bot
+
+    users = await consultation_recipients(session, test_ids=test_ids)
+    sent = failed = 0
+    telegram_bot = Bot(settings.telegram_bot_token) if settings.telegram_bot_token else None
+    try:
+        for recipient in users:
+            try:
+                if recipient.platform == 'max':
+                    await client.send_message(user_id=recipient.platform_user_id, text=CONSULTATION_OFFER_TEXT, keyboard=keyboards.consultation_request_menu())
+                elif recipient.platform == 'telegram' and telegram_bot:
+                    from app.keyboards.common import consultation_request_menu
+                    await telegram_bot.send_message(
+                        int(recipient.platform_user_id), CONSULTATION_OFFER_TEXT,
+                        reply_markup=consultation_request_menu(), parse_mode='HTML',
+                    )
+                else:
+                    continue
+                sent += 1
+            except Exception:
+                failed += 1
+    finally:
+        if telegram_bot:
+            await telegram_bot.session.close()
+    return sent, failed
 
 
 async def _edit_or_send(client: MaxBotClient, event: IncomingEvent, text: str, keyboard=None) -> None:
@@ -255,6 +284,13 @@ async def handle_admin_update(
         return True
     data = event.callback_data
     command = (event.text or '').strip().lower()
+    if command in {'/consult_message', '/test_consult_message'}:
+        if await _deny(client, event, user):
+            return True
+        test_ids = {str(user.platform_user_id), '7727079839'} if command == '/test_consult_message' else None
+        sent, failed = await _send_consultation_broadcast(client, session, settings, test_ids=test_ids)
+        await _send(client, event, f"Рассылка консультации завершена. Отправлено: {sent}. Ошибок: {failed}.")
+        return True
     admin_action = command in {'/admin', '/refund'} or bool(data and (data.startswith('admin:') or data.startswith('broadcast:')))
     manager_action = command == '/manager' or data == 'manager:cases'
     if not admin_action and not manager_action:
