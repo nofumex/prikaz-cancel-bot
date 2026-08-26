@@ -449,7 +449,11 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             client, event, settings, session, user, generate_documents=generate_admin_documents
         ):
             return
-        if current_state == STATE_CONSULTATION_PHONE and (event.contact_phone or event.text):
+        if (
+            current_state == STATE_CONSULTATION_PHONE
+            and event.update_type != 'message_callback'
+            and (event.contact_phone or event.text)
+        ):
             await _handle_consultation_phone(client, event, session, settings, user)
             return
         if await handle_chat_update(client, event, settings, session, user):
