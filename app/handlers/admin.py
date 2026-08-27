@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import logging
+from collections import Counter
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -34,6 +36,7 @@ from app.utils import full_name, h, safe_json_loads, username_text
 
 router = Router(name="admin")
 PAGE_SIZE = 5
+logger = logging.getLogger(__name__)
 
 
 async def _edit_or_answer(callback: CallbackQuery, text: str, reply_markup=None) -> None:
@@ -126,13 +129,14 @@ async def _ensure_admin_callback(callback: CallbackQuery, user: User) -> bool:
 
 async def _send_consultation_broadcast(
     bot: Bot, session: AsyncSession, settings: Settings, *, test_ids: set[str] | None = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, Counter[str]]:
     """Send to every stored bot user; test mode is explicitly limited to staff IDs."""
     from app.adapters.max.client import MaxBotClient
     from app.adapters.max.keyboards import consultation_request_menu as max_consultation_request_menu
 
     users = await consultation_recipients(session, test_ids=test_ids)
     sent = failed = 0
+    errors: Counter[str] = Counter()
     max_client = MaxBotClient(settings.max_bot_token, settings.max_api_base_url) if settings.max_bot_token else None
     try:
         if max_client:
@@ -146,9 +150,15 @@ async def _send_consultation_broadcast(
                 else:
                     continue
                 sent += 1
-            except Exception:
+            except Exception as exc:
                 failed += 1
-        return sent, failed
+                reason = f"{type(exc).__name__}: {str(exc)[:160]}"
+                errors[reason] += 1
+                logger.warning(
+                    "Consultation broadcast failed platform=%s user_id=%s error=%s",
+                    recipient.platform, recipient.platform_user_id, reason,
+                )
+        return sent, failed, errors
     finally:
         if max_client:
             await max_client.close()
@@ -158,18 +168,20 @@ async def _send_consultation_broadcast(
 async def cmd_consult_message(message: Message, bot: Bot, session: AsyncSession, settings: Settings, current_user: User) -> None:
     if not await _ensure_admin_message(message, current_user):
         return
-    sent, failed = await _send_consultation_broadcast(bot, session, settings)
-    await message.answer(f"Рассылка консультации завершена. Отправлено: {sent}. Ошибок: {failed}.")
+    sent, failed, errors = await _send_consultation_broadcast(bot, session, settings)
+    details = "\n".join(f"• {count} × {reason}" for reason, count in errors.most_common(3))
+    await message.answer(f"Рассылка консультации завершена. Отправлено: {sent}. Ошибок: {failed}." + (f"\n\nПричины ошибок:\n{details}" if details else ""))
 
 
 @router.message(Command("test_consult_message"))
 async def cmd_test_consult_message(message: Message, bot: Bot, session: AsyncSession, settings: Settings, current_user: User) -> None:
     if not await _ensure_admin_message(message, current_user):
         return
-    sent, failed = await _send_consultation_broadcast(
+    sent, failed, errors = await _send_consultation_broadcast(
         bot, session, settings, test_ids=TEST_BROADCAST_USER_IDS
     )
-    await message.answer(f"Тестовая рассылка консультации завершена. Отправлено: {sent}. Ошибок: {failed}.")
+    details = "\n".join(f"• {count} × {reason}" for reason, count in errors.most_common(3))
+    await message.answer(f"Тестовая рассылка консультации завершена. Отправлено: {sent}. Ошибок: {failed}." + (f"\n\nПричины ошибок:\n{details}" if details else ""))
 
 
 @router.message(Command("admin"))

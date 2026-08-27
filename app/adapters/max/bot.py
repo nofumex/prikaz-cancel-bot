@@ -411,12 +411,12 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
         )
         if settings.amocrm_enabled and not user.is_admin and not user.is_manager:
             crm_case, created = await ensure_user_has_case(session, user, chat_id=event.chat_id)
-            if created or not (crm_case.amocrm_lead_id or crm_case.amo_lead_id):
+            if created:
                 schedule_crm_sync(
                     settings,
                     crm_case.id,
                     user.id,
-                    "user_started_bot" if created else "crm_reconciliation",
+                    "user_started_bot",
                     {"note": "MAX: пользователь зарегистрирован в боте"},
                 )
         if event.callback_id:

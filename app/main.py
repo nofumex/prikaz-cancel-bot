@@ -10,7 +10,6 @@ from app.adapters.telegram.bot import run_telegram_bot
 from app.config import get_settings
 from app.database import close_db, init_db
 from app.services.payment_web import run_payment_webhook
-from app.services.crm_reconciliation import run_crm_reconciliation
 from app.services.reminders import run_payment_reminders
 
 
@@ -34,8 +33,6 @@ async def main() -> None:
 
     telegram_active = settings.run_telegram and bool(settings.telegram_bot_token)
     max_active = settings.run_max and bool(settings.max_bot_token)
-    if settings.amocrm_enabled and (telegram_active or max_active):
-        tasks.append(run_crm_reconciliation(settings))
     payment_web_configured = bool(settings.yookassa_enabled or settings.yoomoney_receiver or settings.yoomoney_notification_secret or settings.payment_public_base_url)
     if max_active and not telegram_active:
         tasks.append(run_payment_reminders(None))

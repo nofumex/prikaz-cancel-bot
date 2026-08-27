@@ -38,12 +38,12 @@ class DbUserMiddleware(BaseMiddleware):
                         user,
                         chat_id=str(getattr(getattr(event, "chat", None), "id", "") or user.platform_user_id),
                     )
-                    if created or not (case.amocrm_lead_id or case.amo_lead_id):
+                    if created:
                         schedule_crm_sync(
                             self.settings,
                             case.id,
                             user.id,
-                            "user_started_bot" if created else "crm_reconciliation",
+                            "user_started_bot",
                             {"note": "Telegram: пользователь зарегистрирован в боте"},
                         )
             return await handler(event, data)

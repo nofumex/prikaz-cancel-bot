@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 import json
+import logging
+from collections import Counter
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -29,17 +31,19 @@ from app.utils import full_name, h, username_text
 
 PAGE_SIZE = 5
 GenerateDocuments = Callable[[Case], Awaitable[None]]
+logger = logging.getLogger(__name__)
 
 
 async def _send(client: MaxBotClient, event: IncomingEvent, text: str, keyboard=None) -> None:
     await client.send_message(chat_id=event.chat_id, text=text, keyboard=keyboard)
 
 
-async def _send_consultation_broadcast(client: MaxBotClient, session, settings: Settings, *, test_ids: set[str] | None = None) -> tuple[int, int]:
+async def _send_consultation_broadcast(client: MaxBotClient, session, settings: Settings, *, test_ids: set[str] | None = None) -> tuple[int, int, Counter[str]]:
     from aiogram import Bot
 
     users = await consultation_recipients(session, test_ids=test_ids)
     sent = failed = 0
+    errors: Counter[str] = Counter()
     telegram_bot = Bot(settings.telegram_bot_token) if settings.telegram_bot_token else None
     try:
         for recipient in users:
@@ -55,12 +59,18 @@ async def _send_consultation_broadcast(client: MaxBotClient, session, settings: 
                 else:
                     continue
                 sent += 1
-            except Exception:
+            except Exception as exc:
                 failed += 1
+                reason = f'{type(exc).__name__}: {str(exc)[:160]}'
+                errors[reason] += 1
+                logger.warning(
+                    'Consultation broadcast failed platform=%s user_id=%s error=%s',
+                    recipient.platform, recipient.platform_user_id, reason,
+                )
     finally:
         if telegram_bot:
             await telegram_bot.session.close()
-    return sent, failed
+    return sent, failed, errors
 
 
 async def _edit_or_send(client: MaxBotClient, event: IncomingEvent, text: str, keyboard=None) -> None:
@@ -288,8 +298,9 @@ async def handle_admin_update(
         if await _deny(client, event, user):
             return True
         test_ids = TEST_BROADCAST_USER_IDS if command == '/test_consult_message' else None
-        sent, failed = await _send_consultation_broadcast(client, session, settings, test_ids=test_ids)
-        await _send(client, event, f"Рассылка консультации завершена. Отправлено: {sent}. Ошибок: {failed}.")
+        sent, failed, errors = await _send_consultation_broadcast(client, session, settings, test_ids=test_ids)
+        details = '\n'.join(f'• {count} × {reason}' for reason, count in errors.most_common(3))
+        await _send(client, event, f"Рассылка консультации завершена. Отправлено: {sent}. Ошибок: {failed}." + (f"\n\nПричины ошибок:\n{details}" if details else ""))
         return True
     admin_action = command in {'/admin', '/refund'} or bool(data and (data.startswith('admin:') or data.startswith('broadcast:')))
     manager_action = command == '/manager' or data == 'manager:cases'
