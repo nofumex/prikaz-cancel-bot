@@ -139,6 +139,13 @@ def consultation_request_menu(*, test_mode: bool = False) -> InlineKeyboardMarku
     return InlineKeyboardMarkup(inline_keyboard=[[btn("Получить консультацию", callback_data)]])
 
 
+def consultation_broadcast_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("📣 Новая рассылка", "consult_broadcast:full")],
+        [btn("🔁 Повторить недоставленные", "consult_broadcast:retry")],
+    ])
+
+
 def chat_end_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[btn("Завершить чат", "chat:end")]])
 

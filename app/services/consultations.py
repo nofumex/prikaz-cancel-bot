@@ -3,10 +3,12 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 
+from datetime import datetime
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Case, User
+from app.models import Case, ConsultationBroadcast, ConsultationBroadcastDelivery, User
 from app.services.cases import ensure_user_has_case
 from app.services.crm_background import schedule_crm_sync
 from app.utils import full_name, h
@@ -81,3 +83,46 @@ async def consultation_recipients(session: AsyncSession, *, test_ids: set[str] |
     else:
         stmt = stmt.where(User.platform_user_id.in_(test_ids))
     return list((await session.execute(stmt.order_by(User.id))).scalars())
+
+
+async def start_consultation_broadcast(session: AsyncSession, *, test_mode: bool) -> ConsultationBroadcast:
+    broadcast = ConsultationBroadcast(is_test=test_mode)
+    session.add(broadcast)
+    await session.commit()
+    await session.refresh(broadcast)
+    return broadcast
+
+
+async def failed_consultation_recipients(session: AsyncSession, *, test_mode: bool) -> tuple[ConsultationBroadcast | None, list[User]]:
+    broadcast = await session.scalar(
+        select(ConsultationBroadcast)
+        .where(ConsultationBroadcast.is_test.is_(test_mode))
+        .order_by(ConsultationBroadcast.id.desc())
+        .limit(1)
+    )
+    if broadcast is None:
+        return None, []
+    users = list((await session.execute(
+        select(User)
+        .join(ConsultationBroadcastDelivery, ConsultationBroadcastDelivery.user_id == User.id)
+        .where(ConsultationBroadcastDelivery.broadcast_id == broadcast.id, ConsultationBroadcastDelivery.status == "failed")
+        .order_by(User.id)
+    )).scalars())
+    return broadcast, users
+
+
+async def save_consultation_delivery(session: AsyncSession, broadcast: ConsultationBroadcast, user: User, *, sent: bool, error: str | None = None) -> None:
+    delivery = await session.scalar(
+        select(ConsultationBroadcastDelivery).where(
+            ConsultationBroadcastDelivery.broadcast_id == broadcast.id,
+            ConsultationBroadcastDelivery.user_id == user.id,
+        )
+    )
+    if delivery is None:
+        delivery = ConsultationBroadcastDelivery(broadcast_id=broadcast.id, user_id=user.id)
+        session.add(delivery)
+    delivery.status = "sent" if sent else "failed"
+    delivery.error_message = error[:2000] if error else None
+    delivery.attempts += 1
+    delivery.last_attempt_at = datetime.utcnow()
+    await session.commit()

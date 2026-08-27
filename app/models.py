@@ -199,3 +199,24 @@ class UserState(Base):
     state: Mapped[str | None] = mapped_column(String(255))
     data_json: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class ConsultationBroadcast(Base):
+    __tablename__ = "consultation_broadcasts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    is_test: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class ConsultationBroadcastDelivery(Base):
+    __tablename__ = "consultation_broadcast_deliveries"
+    __table_args__ = (UniqueConstraint("broadcast_id", "user_id", name="uq_consultation_broadcast_delivery"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    broadcast_id: Mapped[int] = mapped_column(ForeignKey("consultation_broadcasts.id"), index=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="failed", nullable=False, index=True)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime)
