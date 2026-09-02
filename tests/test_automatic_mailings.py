@@ -102,6 +102,115 @@ async def test_state_is_checked_again_immediately_before_send(mailing_db, monkey
 
 
 @pytest.mark.asyncio
+async def test_crm_sales_is_checked_before_job_send_and_cancels_all_jobs(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    sender = AsyncMock(return_value=True)
+    note = AsyncMock(return_value=True)
+    crm = SimpleNamespace(
+        get_lead_location=AsyncMock(return_value=("Отдел продаж", "Новая заявка"))
+    )
+    monkeypatch.setattr(mailings, "_send_user_message", sender)
+    monkeypatch.setattr(mailings, "get_amocrm_service", lambda settings: crm)
+    monkeypatch.setattr(mailings, "record_action", note)
+    async with mailing_db() as session:
+        user = await _user(session)
+        await mailings.ensure_mailing_started(
+            session, user, started_at=datetime.utcnow() - timedelta(days=8)
+        )
+        session.add(Case(user_id=user.id, platform="telegram", amocrm_lead_id=777))
+        session.add(
+            MailingJob(
+                user_id=user.id,
+                stage=2,
+                due_at=datetime.utcnow() + timedelta(days=7),
+                status="pending",
+            )
+        )
+        await session.commit()
+        job_id = await session.scalar(select(MailingJob.id).where(MailingJob.stage == 1))
+
+    await mailings._deliver_job(settings, None, job_id)
+
+    async with mailing_db() as session:
+        jobs = list((await session.execute(select(MailingJob))).scalars())
+        state = await session.scalar(select(MailingState))
+    assert {job.status for job in jobs} == {"cancelled"}
+    assert state.participating is False
+    assert state.excluded_sales is True
+    sender.assert_not_awaited()
+    crm.get_lead_location.assert_awaited_once_with(777)
+    notes = [call.args[6] for call in note.await_args_list]
+    assert notes.count("Система рассылок: отменены будущие задания рассылки") == 1
+
+
+@pytest.mark.asyncio
+async def test_crm_consultation_status_blocks_job_immediately_before_send(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    sender = AsyncMock(return_value=True)
+    crm = SimpleNamespace(
+        get_lead_location=AsyncMock(
+            return_value=(settings.amocrm_pipeline_name, "Консультация")
+        )
+    )
+    monkeypatch.setattr(mailings, "_send_user_message", sender)
+    monkeypatch.setattr(mailings, "get_amocrm_service", lambda settings: crm)
+    async with mailing_db() as session:
+        user = await _user(session)
+        await mailings.ensure_mailing_started(
+            session, user, started_at=datetime.utcnow() - timedelta(days=8)
+        )
+        session.add(Case(user_id=user.id, platform="telegram", amocrm_lead_id=778))
+        await session.commit()
+        job_id = await session.scalar(select(MailingJob.id))
+
+    await mailings._deliver_job(settings, None, job_id)
+
+    async with mailing_db() as session:
+        job = await session.get(MailingJob, job_id)
+        state = await session.scalar(select(MailingState))
+    assert job.status == "cancelled"
+    assert state.participating is False
+    assert state.consultation_completed is True
+    sender.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_crm_consultation_no_status_still_allows_scheduled_job(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    sender = AsyncMock(return_value=True)
+    crm = SimpleNamespace(
+        get_lead_location=AsyncMock(
+            return_value=(settings.amocrm_pipeline_name, "Консультация - НО")
+        )
+    )
+    monkeypatch.setattr(mailings, "_send_user_message", sender)
+    monkeypatch.setattr(mailings, "get_amocrm_service", lambda settings: crm)
+    monkeypatch.setattr(mailings, "record_action", AsyncMock(return_value=True))
+    async with mailing_db() as session:
+        user = await _user(session)
+        state = await mailings.ensure_mailing_started(
+            session, user, started_at=datetime.utcnow() - timedelta(days=8)
+        )
+        state.consultation_no = True
+        session.add(Case(user_id=user.id, platform="telegram", amocrm_lead_id=779))
+        await session.commit()
+        job_id = await session.scalar(select(MailingJob.id))
+
+    await mailings._deliver_job(settings, None, job_id)
+
+    async with mailing_db() as session:
+        job = await session.get(MailingJob, job_id)
+    assert job.status == "sent"
+    sender.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_disable_is_idempotent_and_cancels_all_future_jobs(mailing_db, monkeypatch) -> None:
     settings = replace(get_settings(), amocrm_enabled=False)
     monkeypatch.setattr(mailings, "record_action", AsyncMock(return_value=True))
@@ -187,6 +296,7 @@ async def test_amocrm_polling_reenables_and_sales_excludes_without_duplicates(
     monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
     monkeypatch.setattr(crm_polling, "_send_user_message", sender)
     monkeypatch.setattr(crm_polling, "record_action", note)
+    monkeypatch.setattr(mailings, "record_action", note)
 
     async with mailing_db() as session:
         user = await _user(session)
@@ -213,6 +323,11 @@ async def test_amocrm_polling_reenables_and_sales_excludes_without_duplicates(
         assert notification.status == "sent"
         assert notification.lawyer_name == "Анна"
     assert sender.await_count == 1
+    note_texts = [call.args[6] for call in note.await_args_list]
+    assert (
+        "Система рассылок: сделка переведена в «Консультация - НО», пользователь возвращен в рассылку"
+        in note_texts
+    )
 
     location[:] = ["Отдел продаж", "Новая заявка"]
     no_leads.clear()
@@ -226,6 +341,8 @@ async def test_amocrm_polling_reenables_and_sales_excludes_without_duplicates(
     assert state.participating is False
     assert state.excluded_sales is True
     assert stage_two.status == "cancelled"
+    note_texts = [call.args[6] for call in note.await_args_list]
+    assert "Система рассылок: отменены будущие задания рассылки" in note_texts
 
 
 @pytest.mark.asyncio

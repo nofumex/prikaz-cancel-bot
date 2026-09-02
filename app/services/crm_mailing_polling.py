@@ -14,8 +14,8 @@ from app.models import Case, CrmDealNotification, MailingState, User
 from app.services.amocrm import get_amocrm_service
 from app.services.automatic_mailings import (
     _schedule_job,
-    cancel_future_jobs,
     due_for_stage,
+    exclude_user_for_sales,
     get_mailing_state,
     record_action,
 )
@@ -265,7 +265,7 @@ async def _process_consultation_no_lead(
             case,
             f"poll-consultation-no-detected:{deal_id}",
             "mailing_consultation_no",
-            f"Система рассылок: обнаружена сделка {deal_id} в «Консультация-НО»",
+            "Система рассылок: сделка переведена в «Консультация - НО», пользователь возвращен в рассылку",
         )
     elif row.status == "sent":
         await record_action(
@@ -284,12 +284,9 @@ async def _process_consultation_no_lead(
 async def _process_sales_lead(session: AsyncSession, settings, lead: dict) -> None:
     deal_id = int(lead["id"])
     case, user, state = await _local_deal(session, deal_id)
-    if case is None or user is None or state is None or state.excluded_sales:
+    if case is None or user is None or state is None:
         return
-    state.participating = False
-    state.consultation_no = False
-    state.excluded_sales = True
-    await cancel_future_jobs(session, user.id)
+    await exclude_user_for_sales(session, settings, user, case, state, deal_id)
     await session.execute(
         update(CrmDealNotification)
         .where(
@@ -299,15 +296,6 @@ async def _process_sales_lead(session: AsyncSession, settings, lead: dict) -> No
         .values(status="cancelled", lease_until=None)
     )
     await session.commit()
-    await record_action(
-        session,
-        settings,
-        user,
-        case,
-        f"poll-sales-excluded:{deal_id}",
-        "mailing_sales_excluded",
-        "Система рассылок: пользователь исключен из рассылки из-за перехода в «Отдел продаж»",
-    )
 
 
 async def poll_crm_mailing_once(settings, bot: Bot | None = None) -> None:

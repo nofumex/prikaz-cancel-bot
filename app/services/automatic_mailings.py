@@ -17,7 +17,7 @@ from app.adapters.max import keyboards as max_keyboards
 from app.database import SessionLocal
 from app.keyboards.common import automatic_mailing_menu
 from app.models import Case, MailingAction, MailingJob, MailingState, User
-from app.services.amocrm import AmoNoteVerificationPending, get_amocrm_service
+from app.services.amocrm import AmoNoteVerificationPending, PIPELINE_STATUSES, get_amocrm_service
 from app.services.cases import ensure_user_has_case
 from app.services.reminders import _send_user_message
 from app.utils import normalize_phone
@@ -34,6 +34,8 @@ PHONE_REQUEST_TEXT = "Укажите свой номер телефона для
 REMINDERS_DISABLED_TEXT = "Напоминания отключены"
 CONSULTATION_STATUS = "Консультация"
 CONSULTATION_LOCATION = "СУДЕБНЫЙ ПРИКАЗ / Консультация"
+CONSULTATION_NO_STATUSES = {"Консультация-НО", "Консультация - НО"}
+SALES_PIPELINE = "Отдел продаж"
 
 FIRST_TEXT = (
     "<b>Мы можем помочь вам с долгами по судебному приказу!</b>\n\n"
@@ -480,6 +482,102 @@ def _eligible(state: MailingState | None) -> bool:
     )
 
 
+async def exclude_user_for_sales(
+    session: AsyncSession,
+    settings,
+    user: User,
+    case: Case,
+    state: MailingState,
+    deal_id: int,
+) -> None:
+    """Persist the sales exclusion and its CRM notes idempotently."""
+    state.participating = False
+    state.consultation_no = False
+    state.excluded_sales = True
+    await cancel_future_jobs(session, user.id)
+    await session.commit()
+    actions = (
+        (
+            f"poll-sales-excluded:{deal_id}",
+            "mailing_sales_excluded",
+            "Система рассылок: пользователь исключен из рассылки из-за перехода в «Отдел продаж»",
+        ),
+        (
+            f"poll-sales-jobs-cancelled:{deal_id}",
+            "mailing_jobs_cancelled",
+            "Система рассылок: отменены будущие задания рассылки",
+        ),
+    )
+    for action_key, event_type, note in actions:
+        try:
+            await record_action(
+                session, settings, user, case, action_key, event_type, note
+            )
+        except Exception:
+            # record_action has already persisted a retryable outbox row.
+            logger.exception(
+                "Sales exclusion CRM note failed deal_id=%s action_key=%s",
+                deal_id,
+                action_key,
+            )
+
+
+async def _crm_case_for_user(session: AsyncSession, user: User) -> Case | None:
+    if user.amocrm_current_case_id:
+        current = await session.get(Case, user.amocrm_current_case_id)
+        if current is not None and (current.amocrm_lead_id or current.amo_lead_id):
+            return current
+    return await session.scalar(
+        select(Case)
+        .where(
+            Case.user_id == user.id,
+            or_(Case.amocrm_lead_id.is_not(None), Case.amo_lead_id.is_not(None)),
+        )
+        .order_by(Case.id.desc())
+        .limit(1)
+    )
+
+
+async def _crm_allows_job_delivery(
+    session: AsyncSession,
+    settings,
+    job: MailingJob,
+    user: User,
+    state: MailingState,
+) -> bool:
+    if not settings.amocrm_enabled:
+        return True
+    case = await _crm_case_for_user(session, user)
+    if case is None:
+        raise RuntimeError(f"amoCRM deal is missing for mailing user_id={user.id}")
+    deal_id = int(case.amocrm_lead_id or case.amo_lead_id)
+    pipeline_name, status_name = await get_amocrm_service(settings).get_lead_location(deal_id)
+    if not pipeline_name or not status_name:
+        raise RuntimeError(f"amoCRM location is incomplete for deal_id={deal_id}")
+
+    allowed_statuses = (set(PIPELINE_STATUSES) - {CONSULTATION_STATUS}) | CONSULTATION_NO_STATUSES
+    sales_exclusion = pipeline_name == SALES_PIPELINE
+    other_exclusion = (
+        pipeline_name != settings.amocrm_pipeline_name or status_name not in allowed_statuses
+    )
+    if not sales_exclusion and not other_exclusion:
+        return True
+
+    job.status = "cancelled"
+    job.cancelled_at = datetime.utcnow()
+    job.lease_until = None
+    if sales_exclusion:
+        await exclude_user_for_sales(session, settings, user, case, state, deal_id)
+    else:
+        state.participating = False
+        if status_name == CONSULTATION_STATUS:
+            state.consultation_completed = True
+            state.consultation_no = False
+        await cancel_future_jobs(session, user.id)
+        await session.commit()
+    return False
+
+
 async def _deliver_job(settings, bot: Bot | None, job_id: int) -> None:
     async with SessionLocal() as session:
         job = await session.get(MailingJob, job_id)
@@ -507,6 +605,18 @@ async def _deliver_job(settings, bot: Bot | None, job_id: int) -> None:
             job.cancelled_at = datetime.utcnow()
             job.lease_until = None
             await session.commit()
+            return
+        try:
+            if not await _crm_allows_job_delivery(session, settings, job, user, state):
+                return
+        except Exception as exc:
+            # No external message was attempted, so this claim can be retried safely.
+            job.status = "pending"
+            job.claimed_at = None
+            job.lease_until = None
+            job.error_message = str(exc)[:2000]
+            await session.commit()
+            logger.exception("Mailing CRM preflight failed job_id=%s", job_id)
             return
         telegram_markup = automatic_mailing_menu(allow_disable=job.stage >= 2)
         max_markup = max_keyboards.automatic_mailing_menu(allow_disable=job.stage >= 2)
