@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from calendar import monthrange
 from datetime import datetime, timedelta
 from typing import Any
 
 from aiogram import Bot
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,7 +17,7 @@ from app.adapters.max import keyboards as max_keyboards
 from app.database import SessionLocal
 from app.keyboards.common import automatic_mailing_menu
 from app.models import Case, MailingAction, MailingJob, MailingState, User
-from app.services.amocrm import get_amocrm_service
+from app.services.amocrm import AmoNoteVerificationPending, get_amocrm_service
 from app.services.cases import ensure_user_has_case
 from app.services.reminders import _send_user_message
 from app.utils import normalize_phone
@@ -46,6 +48,8 @@ FOLLOWUP_TEXT = (
     "Нажмите кнопку ниже и мы проконсультируем вас!"
 )
 LAST_STAGE = 12
+ACTION_LEASE = timedelta(minutes=5)
+JOB_LEASE = timedelta(minutes=5)
 
 
 def _add_months(value: datetime, months: int) -> datetime:
@@ -144,25 +148,164 @@ async def record_action(
     *,
     extra: dict[str, Any] | None = None,
 ) -> bool:
-    """Write an amoCRM note once, then persist the same idempotency key locally."""
-    exists = await session.scalar(
-        select(MailingAction.id).where(
+    """Atomically reserve and eventually execute one verifiable amoCRM note."""
+    marker = f"[mailing:{hashlib.sha256(f'{user.id}:{action_key}'.encode()).hexdigest()}]"
+    payload = {
+        "note": note,
+        "mailing_action_key": action_key,
+        "mailing_marker": marker,
+        **(extra or {}),
+    }
+    action = await session.scalar(
+        select(MailingAction).where(
             MailingAction.user_id == user.id, MailingAction.action_key == action_key
         )
     )
-    if exists is not None:
-        return False
-    payload = {"note": note, "mailing_action_key": action_key, **(extra or {})}
-    crm = get_amocrm_service(settings)
-    await crm.sync_case_event(session, case, user, event_type, payload)
-    session.add(
-        MailingAction(
+    if action is None:
+        action = MailingAction(
             user_id=user.id,
             case_id=case.id,
             action_key=action_key,
             event_type=event_type,
+            note_text=note,
+            payload_json=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            status="pending",
+        )
+        session.add(action)
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            action = await session.scalar(
+                select(MailingAction).where(
+                    MailingAction.user_id == user.id, MailingAction.action_key == action_key
+                )
+            )
+            if action is None:
+                raise
+    return await _execute_action(session, settings, action.id)
+
+
+async def _execute_action(session: AsyncSession, settings, action_id: int) -> bool:
+    now = datetime.utcnow()
+    lease_until = now + ACTION_LEASE
+    current = await session.get(MailingAction, action_id)
+    verification_only = bool(current and current.status == "verifying")
+    claim = await session.execute(
+        update(MailingAction)
+        .where(
+            MailingAction.id == action_id,
+            MailingAction.status != "completed",
+            or_(
+                MailingAction.status == "pending",
+                MailingAction.lease_until.is_(None),
+                MailingAction.lease_until < now,
+            ),
+        )
+        .values(
+            status="processing",
+            lease_until=lease_until,
+            attempts=MailingAction.attempts + 1,
+            error_message=None,
         )
     )
+    await session.commit()
+    if not claim.rowcount:
+        return False
+    action = await session.get(MailingAction, action_id)
+    case = await session.get(Case, action.case_id) if action and action.case_id else None
+    user = await session.get(User, action.user_id) if action else None
+    if action is None or case is None or user is None:
+        raise RuntimeError(f"mailing action target is missing action_id={action_id}")
+    try:
+        payload = json.loads(action.payload_json or "{}")
+        crm = get_amocrm_service(settings)
+        if verification_only:
+            marker = str(payload.get("mailing_marker") or "")
+            lead_id = case.amocrm_lead_id or case.amo_lead_id
+            if not marker or not lead_id or not await crm.lead_note_has_marker(int(lead_id), marker):
+                await session.execute(
+                    update(MailingAction)
+                    .where(MailingAction.id == action_id)
+                    .values(status="verifying", lease_until=datetime.utcnow() + ACTION_LEASE)
+                )
+                await session.commit()
+                return False
+        else:
+            await crm.sync_case_event(session, case, user, action.event_type, payload)
+    except AmoNoteVerificationPending as exc:
+        await session.execute(
+            update(MailingAction)
+            .where(MailingAction.id == action_id)
+            .values(
+                status="verifying",
+                lease_until=datetime.utcnow() + ACTION_LEASE,
+                error_message=str(exc)[:2000],
+            )
+        )
+        await session.commit()
+        return False
+    except Exception as exc:
+        await session.execute(
+            update(MailingAction)
+            .where(MailingAction.id == action_id, MailingAction.status == "processing")
+            .values(
+                status="pending",
+                lease_until=None,
+                error_message=str(exc)[:2000],
+            )
+        )
+        await session.commit()
+        raise
+    await session.execute(
+        update(MailingAction)
+        .where(MailingAction.id == action_id)
+        .values(
+            status="completed",
+            completed_at=datetime.utcnow(),
+            lease_until=None,
+            error_message=None,
+        )
+    )
+    await session.commit()
+    return True
+
+
+async def retry_pending_actions(session: AsyncSession, settings, *, limit: int = 100) -> None:
+    now = datetime.utcnow()
+    ids = list(
+        (await session.execute(
+            select(MailingAction.id)
+            .where(
+                MailingAction.status != "completed",
+                or_(
+                    MailingAction.status == "pending",
+                    MailingAction.lease_until.is_(None),
+                    MailingAction.lease_until < now,
+                ),
+            )
+            .order_by(MailingAction.id)
+            .limit(limit)
+        )).scalars()
+    )
+    for action_id in ids:
+        try:
+            await _execute_action(session, settings, action_id)
+        except Exception:
+            logger.exception("Mailing CRM action retry failed action_id=%s", action_id)
+
+
+async def resolve_verifying_action(
+    session: AsyncSession, action_id: int, *, note_exists: bool
+) -> bool:
+    """Resolve an amoCRM POST whose transport outcome could not be proven."""
+    action = await session.get(MailingAction, action_id)
+    if action is None or action.status != "verifying":
+        return False
+    action.status = "completed" if note_exists else "pending"
+    action.completed_at = datetime.utcnow() if note_exists else None
+    action.lease_until = None
+    action.error_message = None
     await session.commit()
     return True
 
@@ -349,6 +492,7 @@ async def _deliver_job(settings, bot: Bot | None, job_id: int) -> None:
             .values(
                 status="sending",
                 claimed_at=claimed_at,
+                lease_until=claimed_at + JOB_LEASE,
                 attempts=MailingJob.attempts + 1,
             )
         )
@@ -361,6 +505,7 @@ async def _deliver_job(settings, bot: Bot | None, job_id: int) -> None:
         if user is None or not _eligible(state):
             job.status = "cancelled"
             job.cancelled_at = datetime.utcnow()
+            job.lease_until = None
             await session.commit()
             return
         telegram_markup = automatic_mailing_menu(allow_disable=job.stage >= 2)
@@ -374,56 +519,101 @@ async def _deliver_job(settings, bot: Bot | None, job_id: int) -> None:
             max_keyboard=max_markup,
         )
         if not sent:
-            job.status = "pending"
-            job.due_at = datetime.utcnow() + timedelta(minutes=5)
-            job.error_message = "delivery failed"
+            # A transport error cannot prove whether Telegram/MAX accepted the
+            # message. Blind retry could duplicate it, so quarantine for an
+            # explicit delivered/not-delivered reconciliation.
+            job.status = "uncertain"
+            job.uncertain_at = datetime.utcnow()
+            job.lease_until = None
+            job.error_message = "delivery outcome was not confirmed"
             await session.commit()
             return
-        sent_at = datetime.utcnow()
-        job.status = "sent"
-        job.sent_at = sent_at
-        job.error_message = None
-        state.last_sent_stage = job.stage
-        state.last_sent_at = sent_at
-        state.next_stage = job.stage + 1
-        await _schedule_job(session, state, state.next_stage, due_for_stage(state.next_stage, sent_at))
-        await session.commit()
-        case = await _case_for_user(session, user)
-        await record_action(
-            session,
-            settings,
-            user,
-            case,
-            f"message:{job.stage}",
-            "mailing_message_sent",
-            f"Система рассылок: отправлено сообщение №{job.stage}",
-        )
-        logger.info("Система рассылок: отправлено сообщение №%s user_id=%s", job.stage, user.id)
+        await _complete_job(session, settings, job, user, state, datetime.utcnow())
+
+
+async def _complete_job(
+    session: AsyncSession,
+    settings,
+    job: MailingJob,
+    user: User,
+    state: MailingState,
+    sent_at: datetime,
+) -> None:
+    job.status = "sent"
+    job.sent_at = sent_at
+    job.lease_until = None
+    job.uncertain_at = None
+    job.error_message = None
+    state.last_sent_stage = job.stage
+    state.last_sent_at = sent_at
+    state.next_stage = job.stage + 1
+    await _schedule_job(session, state, state.next_stage, due_for_stage(state.next_stage, sent_at))
+    await session.commit()
+    case = await _case_for_user(session, user)
+    await record_action(
+        session,
+        settings,
+        user,
+        case,
+        f"message:{job.stage}",
+        "mailing_message_sent",
+        f"Система рассылок: отправлено сообщение №{job.stage}",
+    )
+    logger.info("Система рассылок: отправлено сообщение №%s user_id=%s", job.stage, user.id)
 
 
 async def recover_uncertain_jobs(session: AsyncSession) -> None:
-    """Advance old claimed sends without risking a duplicate Telegram message."""
-    jobs = list(
-        (await session.execute(select(MailingJob).where(MailingJob.status == "sending"))).scalars()
-    )
+    """Quarantine expired leases; never infer delivery merely from a claim."""
+    now = datetime.utcnow()
+    jobs = list((await session.execute(
+        select(MailingJob).where(
+            MailingJob.status == "sending",
+            or_(MailingJob.lease_until.is_(None), MailingJob.lease_until < now),
+        )
+    )).scalars())
     for job in jobs:
-        state = await get_mailing_state(session, job.user_id)
-        job.status = "sent"
-        job.sent_at = job.claimed_at or datetime.utcnow()
-        if state and state.next_stage <= job.stage:
-            state.last_sent_stage = job.stage
-            state.last_sent_at = job.sent_at
-            state.next_stage = job.stage + 1
-            await _schedule_job(session, state, state.next_stage, due_for_stage(state.next_stage, job.sent_at))
+        job.status = "uncertain"
+        job.uncertain_at = now
+        job.lease_until = None
+        job.error_message = "worker lease expired during external delivery"
     await session.commit()
 
 
+async def resolve_uncertain_job(
+    session: AsyncSession,
+    settings,
+    job_id: int,
+    *,
+    delivered: bool,
+    delivered_at: datetime | None = None,
+) -> bool:
+    """Operator/reconciliation hook for the unavoidable Bot API crash window."""
+    job = await session.get(MailingJob, job_id)
+    if job is None or job.status != "uncertain":
+        return False
+    if not delivered:
+        job.status = "pending"
+        job.due_at = datetime.utcnow()
+        job.uncertain_at = None
+        job.error_message = None
+        await session.commit()
+        return True
+    user = await session.get(User, job.user_id)
+    state = await get_mailing_state(session, job.user_id)
+    if user is None or state is None:
+        raise RuntimeError(f"mailing job target is missing job_id={job_id}")
+    await _complete_job(
+        session, settings, job, user, state, delivered_at or job.claimed_at or datetime.utcnow()
+    )
+    return True
+
+
 async def run_automatic_mailings(settings, bot: Bot | None = None) -> None:
-    async with SessionLocal() as session:
-        await recover_uncertain_jobs(session)
     while True:
         try:
             async with SessionLocal() as session:
+                await recover_uncertain_jobs(session)
+                await retry_pending_actions(session, settings)
                 ids = list(
                     (await session.execute(
                         select(MailingJob.id)
@@ -439,79 +629,3 @@ async def run_automatic_mailings(settings, bot: Bot | None = None) -> None:
         except Exception:
             logger.exception("Automatic mailing worker failed")
         await asyncio.sleep(30)
-
-
-def extract_amocrm_lead_ids(payload: dict[str, Any]) -> set[int]:
-    result: set[int] = set()
-    leads = payload.get("leads") if isinstance(payload, dict) else None
-    if isinstance(leads, dict):
-        for group in leads.values():
-            values = group.values() if isinstance(group, dict) else group if isinstance(group, list) else []
-            for item in values:
-                if isinstance(item, dict) and str(item.get("id") or "").isdigit():
-                    result.add(int(item["id"]))
-    direct = payload.get("lead_id") or payload.get("id")
-    if str(direct or "").isdigit():
-        result.add(int(direct))
-    for key, value in payload.items():
-        if str(key).startswith("leads[") and str(key).endswith("[id]") and str(value).isdigit():
-            result.add(int(value))
-    return result
-
-
-async def process_amocrm_status_webhook(payload: dict[str, Any], bot: Bot | None, settings) -> None:
-    """Reconcile campaign state from the actual amoCRM lead location."""
-    for lead_id in extract_amocrm_lead_ids(payload):
-        async with SessionLocal() as session:
-            case = await session.scalar(
-                select(Case).where(
-                    (Case.amocrm_lead_id == lead_id) | (Case.amo_lead_id == lead_id)
-                ).order_by(Case.id.desc()).limit(1)
-            )
-            if case is None:
-                continue
-            user = await session.get(User, case.user_id)
-            state = await get_mailing_state(session, case.user_id)
-            if user is None or state is None:
-                continue
-            crm = get_amocrm_service(settings)
-            pipeline_name, status_name = await crm.get_lead_location(lead_id)
-            if status_name == "Консультация - НО":
-                if state.consultation_no:
-                    continue
-                sent = await _send_user_message(settings, bot, user, CONSULTATION_NO_MESSAGE)
-                if not sent:
-                    raise RuntimeError(f"could not deliver Consultation-NO message user_id={user.id}")
-                state.participating = not state.reminders_disabled
-                state.consultation_completed = False
-                state.consultation_no = True
-                state.excluded_sales = False
-                if state.participating:
-                    await _schedule_job(
-                        session, state, state.next_stage, due_for_stage(state.next_stage, datetime.utcnow())
-                    )
-                await session.commit()
-                await record_action(
-                    session, settings, user, case, "consultation-no", "mailing_consultation_no",
-                    "Система рассылок: сделка переведена в «Консультация - НО», пользователь возвращен в рассылку",
-                )
-                await record_action(
-                    session, settings, user, case, "consultation-no-message", "mailing_consultation_no_message",
-                    "Система рассылок: отправлено сообщение «Вам звонил юрисконсульт Павел...»",
-                )
-            elif pipeline_name == "Отдел продаж":
-                if state.excluded_sales:
-                    continue
-                state.participating = False
-                state.consultation_no = False
-                state.excluded_sales = True
-                await cancel_future_jobs(session, user.id)
-                await session.commit()
-                await record_action(
-                    session, settings, user, case, "sales-excluded", "mailing_sales_excluded",
-                    "Система рассылок: пользователь исключен из рассылки из-за перехода в «Отдел продаж»",
-                )
-                await record_action(
-                    session, settings, user, case, "jobs-cancelled-sales", "mailing_jobs_cancelled",
-                    "Система рассылок: отменены будущие задания рассылки",
-                )

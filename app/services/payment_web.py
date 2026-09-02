@@ -10,7 +10,6 @@ from app.database import SessionLocal
 from app.services.crm_background import schedule_crm_sync
 from app.services.document_delivery import schedule_document_delivery
 from app.services.payments import mark_paid_by_external_payment_id, mark_paid_by_label, mark_yookassa_canceled, verify_yoomoney_sign
-from app.services.automatic_mailings import process_amocrm_status_webhook
 
 logger = logging.getLogger(__name__)
 
@@ -57,29 +56,10 @@ async def run_payment_webhook(bot: Bot | None, settings: Settings) -> None:
                     schedule_crm_sync(settings, case.id, case.user.id, "payment_canceled", {"payment": external_id, "note": "YooKassa payment.canceled"})
         return web.Response(text="OK")
 
-    async def amocrm(request: web.Request) -> web.Response:
-        expected = settings.amocrm_webhook_secret
-        supplied = request.headers.get("X-AmoCRM-Webhook-Secret") or request.query.get("secret")
-        if expected and supplied != expected:
-            return web.Response(status=403, text="bad secret")
-        try:
-            if request.content_type == "application/json":
-                payload = await request.json()
-            else:
-                payload = {key: value for key, value in (await request.post()).items()}
-            if not isinstance(payload, dict):
-                raise ValueError("payload is not an object")
-            await process_amocrm_status_webhook(payload, bot, settings)
-        except Exception:
-            logger.exception("amoCRM status webhook failed")
-            return web.Response(status=500, text="retry")
-        return web.Response(text="OK")
-
     app = web.Application()
     app.router.add_post("/payments/yoomoney", yoomoney)
     yookassa_path = settings.yookassa_webhook_path or "/payments/yookassa"
     app.router.add_post(yookassa_path, yookassa)
-    app.router.add_post(settings.amocrm_webhook_path or "/webhooks/amocrm", amocrm)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, settings.payment_web_host, settings.payment_web_port)

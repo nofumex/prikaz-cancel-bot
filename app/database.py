@@ -199,6 +199,37 @@ async def _upgrade_sqlite_schema(conn) -> None:
         ],
     )
 
+    await _sqlite_add_columns(
+        conn,
+        "mailing_jobs",
+        [
+            ("lease_until", "lease_until DATETIME"),
+            ("uncertain_at", "uncertain_at DATETIME"),
+        ],
+    )
+    await _sqlite_add_columns(
+        conn,
+        "mailing_actions",
+        [
+            ("note_text", "note_text TEXT"),
+            ("payload_json", "payload_json TEXT"),
+            ("status", "status VARCHAR(16) NOT NULL DEFAULT 'completed'"),
+            ("attempts", "attempts INTEGER NOT NULL DEFAULT 0"),
+            ("lease_until", "lease_until DATETIME"),
+            ("completed_at", "completed_at DATETIME"),
+            ("error_message", "error_message TEXT"),
+        ],
+    )
+    await conn.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_mailing_jobs_lease_until ON mailing_jobs (lease_until)"
+    )
+    await conn.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_mailing_actions_status ON mailing_actions (status)"
+    )
+    await conn.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_mailing_actions_lease_until ON mailing_actions (lease_until)"
+    )
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

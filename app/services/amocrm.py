@@ -22,6 +22,10 @@ from app.utils import safe_json_loads
 logger = logging.getLogger(__name__)
 _LAST_NOTE_ERROR: ContextVar[str | None] = ContextVar("amocrm_last_note_error", default=None)
 
+
+class AmoNoteVerificationPending(RuntimeError):
+    """The note POST succeeded, but read-after-write is not visible yet."""
+
 PIPELINE_STATUSES = [
     "Подписался на бота",
     "Отправил приказ",
@@ -30,7 +34,7 @@ PIPELINE_STATUSES = [
     "Получил напоминание",
     "Получил предложение о консультации",
     "Консультация",
-    "Консультация - НО",
+    "Консультация-НО",
 ]
 
 
@@ -526,6 +530,92 @@ class AmoCrmService:
                 return lead_ids, None
             page += 1
 
+    async def _list_leads_filtered(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        leads: list[dict[str, Any]] = []
+        for page in range(1, 100):
+            page_params = {**params, "limit": 250, "page": page, "with": "contacts"}
+            data, error = await self.request("GET", "/leads", params=page_params)
+            if error:
+                raise RuntimeError(f"amoCRM leads polling failed: {error}")
+            if not isinstance(data, dict):
+                raise RuntimeError("amoCRM returned an invalid leads polling response")
+            items = data.get("_embedded", {}).get("leads", [])
+            leads.extend(item for item in items if isinstance(item, dict) and not item.get("is_deleted"))
+            if len(items) < 250:
+                break
+        return leads
+
+    async def list_leads_in_status(
+        self, pipeline_name: str, status_names: tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        pipeline = await self.get_pipeline_by_name(pipeline_name)
+        if not pipeline or not pipeline.get("id"):
+            return []
+        pipeline_id = int(pipeline["id"])
+        statuses = await self.get_statuses(pipeline_id)
+        result: dict[int, dict[str, Any]] = {}
+        for status_name in status_names:
+            status_id = statuses.get(status_name)
+            if not status_id:
+                continue
+            items = await self._list_leads_filtered({
+                "filter[statuses][0][pipeline_id]": pipeline_id,
+                "filter[statuses][0][status_id]": int(status_id),
+            })
+            result.update({int(item["id"]): item for item in items if item.get("id")})
+        return list(result.values())
+
+    async def list_leads_in_pipeline(self, pipeline_name: str) -> list[dict[str, Any]]:
+        pipeline = await self.get_pipeline_by_name(pipeline_name)
+        if not pipeline or not pipeline.get("id"):
+            return []
+        return await self._list_leads_filtered({"filter[pipeline_id]": int(pipeline["id"])})
+
+    @staticmethod
+    def _custom_field_value(
+        entity: dict[str, Any], *, hints: tuple[str, ...], excludes: tuple[str, ...] = ()
+    ) -> str | None:
+        for field in entity.get("custom_fields_values") or []:
+            label = f"{field.get('field_name') or ''} {field.get('field_code') or ''}".lower()
+            if not all(hint in label for hint in hints):
+                continue
+            if any(hint in label for hint in excludes):
+                continue
+            for value in field.get("values") or []:
+                raw = str(value.get("value") or "").strip()
+                if raw:
+                    return raw
+        return None
+
+    async def get_lead_lawyer(self, lead: dict[str, Any]) -> tuple[str, str]:
+        """Resolve lawyer identity from lead fields, then its responsible amoCRM user."""
+        name = (
+            self._custom_field_value(
+                lead, hints=("юрисконсульт",), excludes=("телефон", "phone")
+            )
+            or self._custom_field_value(
+                lead, hints=("юрист",), excludes=("телефон", "phone")
+            )
+        )
+        phone = (
+            self._custom_field_value(lead, hints=("телефон", "юрис"))
+            or self._custom_field_value(lead, hints=("lawyer", "phone"))
+        )
+        responsible_id = int(lead.get("responsible_user_id") or 0)
+        responsible: dict[str, Any] = {}
+        if responsible_id:
+            data, error = await self.request("GET", f"/users/{responsible_id}")
+            if not error and isinstance(data, dict):
+                responsible = data
+        name = name or str(responsible.get("name") or "").strip() or "Павел"
+        phone = (
+            phone
+            or str(responsible.get("phone") or responsible.get("work_phone") or "").strip()
+            or self._custom_field_value(responsible, hints=("phone",))
+            or "+79230165336"
+        )
+        return name, phone
+
     async def create_lead(self, case: Case, user: User, status_name: str, *, current_case_id: int | None = None) -> int | None:
         pipeline = await self.ensure_pipeline()
         if not pipeline:
@@ -648,11 +738,38 @@ class AmoCrmService:
             "POST",
             f"/leads/{int(lead_id)}/notes",
             json_body=[{"entity_id": int(lead_id), "note_type": "common", "params": {"text": text[:65000]}}],
+            retries=1 if "[mailing:" in text else 3,
         )
         if error:
             _LAST_NOTE_ERROR.set(error)
             logger.error("amoCRM note creation failed lead_id=%s error=%s", lead_id, error)
+            if "[mailing:" in text and not str(error).lstrip().startswith("HTTP 4"):
+                raise AmoNoteVerificationPending(
+                    f"amoCRM note POST outcome is uncertain on lead {lead_id}: {error}"
+                )
         return error is None
+
+    async def lead_note_has_marker(self, lead_id: int, marker: str) -> bool:
+        """Check amoCRM itself so a crash after note POST remains retry-safe."""
+        for page in range(1, 11):
+            data, error = await self.request(
+                "GET",
+                f"/leads/{int(lead_id)}/notes",
+                params={"filter[note_type]": "common", "limit": 250, "page": page},
+            )
+            if error:
+                raise RuntimeError(f"amoCRM note verification failed: {error}")
+            if not isinstance(data, dict):
+                raise RuntimeError("amoCRM returned an invalid notes list")
+            notes = data.get("_embedded", {}).get("notes", [])
+            for item in notes:
+                params = item.get("params") if isinstance(item, dict) else None
+                text = params.get("text") if isinstance(params, dict) else None
+                if marker in str(text or ""):
+                    return True
+            if len(notes) < 250:
+                return False
+        return False
 
     async def _request_raw_url(
         self,
@@ -1093,13 +1210,27 @@ class AmoCrmService:
             if attached_files:
                 response_payload["attached_files"] = attached_files
 
+            marker = str(payload.get("mailing_marker") or "").strip()
+            note_text = "\n".join(note_parts)
+            if marker:
+                note_text = f"{note_text}\n{marker}"
             _LAST_NOTE_ERROR.set(None)
-            note_added = await self.add_lead_note(case, "\n".join(note_parts))
+            note_added = bool(
+                marker
+                and current_lead_id
+                and await self.lead_note_has_marker(int(current_lead_id), marker)
+            )
+            if not note_added:
+                note_added = await self.add_lead_note(case, note_text)
             if not note_added:
                 lead_id = case.amocrm_lead_id or case.amo_lead_id
                 note_error = _LAST_NOTE_ERROR.get()
                 detail = f": {note_error}" if note_error else ""
                 raise RuntimeError(f"amoCRM did not add note to lead {lead_id}{detail}")
+            if marker and current_lead_id and not await self.lead_note_has_marker(int(current_lead_id), marker):
+                raise AmoNoteVerificationPending(
+                    f"amoCRM note marker is awaiting visibility on lead {current_lead_id}"
+                )
 
             if session:
                 await self._log_sync(

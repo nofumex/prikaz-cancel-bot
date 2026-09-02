@@ -255,8 +255,10 @@ class MailingJob(Base):
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True, nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, index=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime)
+    uncertain_at: Mapped[datetime | None] = mapped_column(DateTime)
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
@@ -272,4 +274,37 @@ class MailingAction(Base):
     case_id: Mapped[int | None] = mapped_column(ForeignKey("cases.id"), index=True)
     action_key: Mapped[str] = mapped_column(String(255), nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    note_text: Mapped[str | None] = mapped_column(Text)
+    payload_json: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class CrmDealNotification(Base):
+    """Persistent, race-safe delivery ledger for CRM-triggered notifications."""
+
+    __tablename__ = "crm_deal_notifications"
+    __table_args__ = (
+        UniqueConstraint("amocrm_deal_id", "notification_type", name="uq_crm_deal_notification"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    amocrm_deal_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    notification_type: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    case_id: Mapped[int] = mapped_column(ForeignKey("cases.id"), index=True, nullable=False)
+    lawyer_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    lawyer_phone: Mapped[str] = mapped_column(String(64), nullable=False)
+    message_text: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime)
+    uncertain_at: Mapped[datetime | None] = mapped_column(DateTime)
+    error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)

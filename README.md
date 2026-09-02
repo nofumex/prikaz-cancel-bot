@@ -116,11 +116,16 @@ python scripts/smoke_test.py
 
 Бот использует воронку `Судебный приказ`.
 
-Для реакции рассылки на этап `Консультация - НО` и переход в воронку
-`Отдел продаж` настройте исходящий webhook amoCRM на
-`https://YOUR_DOMAIN/webhooks/amocrm`. Путь задаётся через
-`AMOCRM_WEBHOOK_PATH`. Если используется `AMOCRM_WEBHOOK_SECRET`, передавайте
-его в заголовке `X-AmoCRM-Webhook-Secret` или query-параметре `secret`.
+Этап `Консультация-НО` и переход в воронку `Отдел продаж` проверяются
+фоновым polling worker раз в 60 секунд; webhook amoCRM для этого не требуется.
+
+Проверка доставок с неопределённым результатом после аварийного завершения:
+
+```powershell
+python scripts/reconcile_mailing_delivery.py
+python scripts/reconcile_mailing_delivery.py --notification-id 12 --delivered yes
+python scripts/reconcile_mailing_delivery.py --job-id 34 --delivered no
+```
 Недостающие этапы создаются (если разрешено), старые/лишние этапы не удаляются автоматически.
 
 Этапы (6):

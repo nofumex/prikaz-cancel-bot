@@ -422,6 +422,41 @@ async def test_duplicate_crm_event_skips_note_and_network_calls():
 
 
 @pytest.mark.asyncio
+async def test_mailing_note_marker_prevents_second_post_after_local_crash_window():
+    service = AmoCrmService(_settings(amocrm_enabled=True))
+    case = Case(id=63, user_id=1, amocrm_lead_id=123)
+    user = User(id=1, platform="telegram", platform_user_id="1", amocrm_current_case_id=63)
+    stored_notes = []
+    post_count = 0
+
+    async def fake_request(method, path, *, json_body=None, params=None, files=None, retries=3):
+        nonlocal post_count
+        assert path == "/leads/123/notes"
+        if method == "POST":
+            post_count += 1
+            stored_notes.append(json_body[0]["params"]["text"])
+            return {"_embedded": {"notes": [{"id": 1}]}}, None
+        return {
+            "_embedded": {
+                "notes": [
+                    {"params": {"text": text}}
+                    for text in stored_notes
+                ]
+            }
+        }, None
+
+    service.request = fake_request
+    payload = {
+        "note": "Система рассылок: отправлено сообщение №1",
+        "mailing_marker": "[mailing:stable-marker]",
+    }
+    await service.sync_case_event(None, case, user, "mailing_message_sent", payload)
+    await service.sync_case_event(None, case, user, "mailing_message_sent", payload)
+
+    assert post_count == 1
+
+
+@pytest.mark.asyncio
 async def test_update_lead_status_skips_backward_without_new_cycle():
     service = AmoCrmService(_settings(amocrm_enabled=True))
     calls = []
