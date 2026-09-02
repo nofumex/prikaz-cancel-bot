@@ -16,7 +16,6 @@ from app.middlewares.user import DbUserMiddleware
 from app.services.payment_web import run_payment_webhook
 from app.services.reminders import run_payment_reminders
 from app.services.automatic_mailings import run_automatic_mailings
-from app.services.crm_mailing_polling import run_crm_mailing_polling
 
 
 async def set_commands(bot: Bot) -> None:
@@ -49,8 +48,10 @@ async def on_error(event: ErrorEvent) -> None:
         logging.exception("Failed to send error message")
 
 
-async def run_telegram_bot(settings: Settings) -> None:
-    bot = Bot(settings.telegram_bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+async def run_telegram_bot(settings: Settings, bot: Bot | None = None) -> None:
+    owns_bot = bot is None
+    if bot is None:
+        bot = Bot(settings.telegram_bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(settings=settings)
     middleware = DbUserMiddleware(settings)
     dp.message.outer_middleware(middleware)
@@ -65,8 +66,6 @@ async def run_telegram_bot(settings: Settings) -> None:
     try:
         tasks.append(asyncio.create_task(run_payment_reminders(bot)))
         tasks.append(asyncio.create_task(run_automatic_mailings(settings, bot)))
-        if settings.amocrm_enabled:
-            tasks.append(asyncio.create_task(run_crm_mailing_polling(settings, bot)))
         if settings.yookassa_enabled or settings.yoomoney_receiver or settings.yoomoney_notification_secret or settings.payment_public_base_url:
             tasks.append(asyncio.create_task(run_payment_webhook(bot, settings)))
         if settings.drop_pending_updates:
@@ -77,4 +76,5 @@ async def run_telegram_bot(settings: Settings) -> None:
     finally:
         for task in tasks:
             task.cancel()
-        await bot.session.close()
+        if owns_bot:
+            await bot.session.close()

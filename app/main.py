@@ -4,6 +4,10 @@ import asyncio
 import logging
 import sys
 
+from aiogram import Bot
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
 from app.adapters.max.bot import run_max_bot
 from app.adapters.max.webhook import run_max_webhook
 from app.adapters.telegram.bot import run_telegram_bot
@@ -23,9 +27,18 @@ async def main() -> None:
     setup_logging()
     settings = get_settings()
     await init_db()
+
+    telegram_active = settings.run_telegram and bool(settings.telegram_bot_token)
+    max_active = settings.run_max and bool(settings.max_bot_token)
+    telegram_bot = (
+        Bot(settings.telegram_bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        if telegram_active
+        else None
+    )
+
     tasks = []
-    if settings.run_telegram and settings.telegram_bot_token:
-        tasks.append(run_telegram_bot(settings))
+    if telegram_active:
+        tasks.append(run_telegram_bot(settings, telegram_bot))
     else:
         logging.info("Telegram skipped: RUN_TELEGRAM=%s token_set=%s", settings.run_telegram, bool(settings.telegram_bot_token))
     if settings.run_max and settings.max_bot_token:
@@ -33,14 +46,14 @@ async def main() -> None:
     else:
         logging.info("MAX skipped: RUN_MAX=%s token_set=%s", settings.run_max, bool(settings.max_bot_token))
 
-    telegram_active = settings.run_telegram and bool(settings.telegram_bot_token)
-    max_active = settings.run_max and bool(settings.max_bot_token)
     payment_web_configured = bool(settings.yookassa_enabled or settings.yoomoney_receiver or settings.yoomoney_notification_secret or settings.payment_public_base_url)
+
+    if settings.amocrm_enabled:
+        tasks.append(run_crm_mailing_polling(settings, telegram_bot))
+
     if max_active and not telegram_active:
         tasks.append(run_payment_reminders(None))
         tasks.append(run_automatic_mailings(settings, None))
-        if settings.amocrm_enabled:
-            tasks.append(run_crm_mailing_polling(settings, None))
         if payment_web_configured:
             tasks.append(run_payment_webhook(None, settings))
 
@@ -50,6 +63,8 @@ async def main() -> None:
     try:
         await asyncio.gather(*tasks)
     finally:
+        if telegram_bot is not None:
+            await telegram_bot.session.close()
         await close_db()
 
 
