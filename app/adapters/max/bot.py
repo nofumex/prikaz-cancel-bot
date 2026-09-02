@@ -39,7 +39,7 @@ from app.services.received_date import received_date_prompt_text, save_received_
 from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaReceiptContactRequired
 from app.services.users import get_or_create_platform_user
-from app.services.consultations import CONSULTATION_ACCEPTED_TEXT, CONSULTATION_PHONE_TEXT, consultation_notification_ids, submit_consultation
+from app.services.consultations import CONSULTATION_ACCEPTED_TEXT, CONSULTATION_PHONE_TEXT, consultation_notification, consultation_notification_ids, submit_consultation
 from app.services.automatic_mailings import (
     PAVEL_MESSAGE, PHONE_REQUEST_TEXT, REMINDERS_DISABLED_TEXT, begin_consultation,
     deliver_pavel_message, disable_reminders, ensure_mailing_started,
@@ -358,9 +358,16 @@ async def _handle_consultation_phone(
         case = await session.get(Case, int(state_data['consultation_case_id']))
         await save_campaign_phone(session, settings, user, case, phone)
         if await prepare_consultation(session, settings, user, case):
-            await deliver_pavel_message(
+            sent = await deliver_pavel_message(
                 session, settings, user, case, lambda: _send(client, event, PAVEL_MESSAGE)
             )
+            if sent:
+                await _notify_consultation_staff_max(
+                    client,
+                    settings,
+                    consultation_notification(user),
+                    test_mode=False,
+                )
         await _clear_state(session, event)
         return
     await _submit_max_consultation(
@@ -767,13 +774,20 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
                 case, ready = await begin_consultation(session, settings, user, chat_id=event.chat_id)
                 if ready:
                     if await prepare_consultation(session, settings, user, case):
-                        await deliver_pavel_message(
+                        sent = await deliver_pavel_message(
                             session,
                             settings,
                             user,
                             case,
                             lambda: _send(client, event, PAVEL_MESSAGE),
                         )
+                        if sent:
+                            await _notify_consultation_staff_max(
+                                client,
+                                settings,
+                                consultation_notification(user),
+                                test_mode=False,
+                            )
                 elif not user.phone:
                     await _set_state(session, event, STATE_CONSULTATION_PHONE, {
                         'automatic_mailing_consultation': True,

@@ -12,6 +12,7 @@ from app.adapters.max.mapper import IncomingEvent
 from app.config import get_settings
 from app.enums import CaseStatus
 from app.models import Case, User
+from app.services.consultations import consultation_notification_ids
 from app.services.legal_data import normalize_order_data
 
 
@@ -49,6 +50,76 @@ def _case(**kwargs) -> Case:
     )
     base.update(kwargs)
     return Case(**base)
+
+
+@pytest.mark.asyncio
+async def test_max_automatic_consultation_notifies_three_telegram_accounts(
+    monkeypatch,
+) -> None:
+    from app.adapters.max import bot as max_bot
+
+    settings = _make_settings(admin_ids={123456789}, telegram_bot_token="test-token")
+    expected_ids = consultation_notification_ids(settings, test_mode=False)
+    assert len(expected_ids) == 3
+    sent_to = []
+
+    class FakeSession:
+        async def close(self):
+            return None
+
+    class FakeTelegramBot:
+        def __init__(self, token):
+            self.session = FakeSession()
+
+        async def send_message(self, chat_id, text, parse_mode=None):
+            sent_to.append(chat_id)
+
+    monkeypatch.setattr("aiogram.Bot", FakeTelegramBot)
+    max_client = SimpleNamespace(send_message=AsyncMock())
+
+    await max_bot._notify_consultation_staff_max(
+        max_client, settings, "new consultation", test_mode=False
+    )
+
+    assert set(sent_to) == expected_ids
+    max_client.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_max_automatic_consultation_notifies_staff_after_durable_send(
+    monkeypatch,
+) -> None:
+    from app.adapters.max import bot as max_bot
+
+    settings = _make_settings()
+    user = User(id=1, platform="max", platform_user_id="42")
+    case = Case(id=5, user_id=user.id, platform="max")
+    event = IncomingEvent(
+        platform_user_id="42", chat_id="chat-1", contact_phone="+79990000000"
+    )
+    session = SimpleNamespace(get=AsyncMock(return_value=case), commit=AsyncMock())
+    notifier = AsyncMock()
+    monkeypatch.setattr(
+        max_bot,
+        "_state_data",
+        AsyncMock(
+            return_value={
+                "automatic_mailing_consultation": True,
+                "consultation_case_id": case.id,
+            }
+        ),
+    )
+    monkeypatch.setattr(max_bot, "save_campaign_phone", AsyncMock())
+    monkeypatch.setattr(max_bot, "prepare_consultation", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_bot, "deliver_pavel_message", AsyncMock(return_value=True))
+    monkeypatch.setattr(max_bot, "_notify_consultation_staff_max", notifier)
+    monkeypatch.setattr(max_bot, "_clear_state", AsyncMock())
+
+    await max_bot._handle_consultation_phone(
+        SimpleNamespace(), event, session, settings, user
+    )
+
+    notifier.assert_awaited_once()
 
 
 @pytest.mark.asyncio
