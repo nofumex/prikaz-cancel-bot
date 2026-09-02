@@ -18,12 +18,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.enums import CaseStatus, PaymentStatus
-from app.keyboards.common import case_menu, confirm_extraction, debtor_name_fix_menu, document_details_menu, documents_menu, edit_fields_menu, envelope_choice, main_menu, ocr_field_confirmation, order_rephoto_menu, phone_request_keyboard, paid_date_required_menu, paid_document_actions, paid_edit_fields_menu, paid_review_menu, restore_reason_menu
+from app.keyboards.common import campaign_phone_request_keyboard, case_menu, confirm_extraction, debtor_name_fix_menu, document_details_menu, documents_menu, edit_fields_menu, envelope_choice, main_menu, ocr_field_confirmation, order_rephoto_menu, phone_request_keyboard, paid_date_required_menu, paid_document_actions, paid_edit_fields_menu, paid_review_menu, restore_reason_menu
 from app.models import Case, Payment, User
 from app.services.amocrm import get_amocrm_service
 from app.services.crm_background import schedule_crm_sync
 from app.services.document_delivery import delivery_instruction_text
-from app.services.cases import create_case, generated_case_for_user, generated_cases, get_or_create_active_case, latest_case, latest_open_case, save_photo_path, set_received_date
+from app.services.cases import generated_case_for_user, generated_cases, get_or_create_active_case, latest_case, latest_open_case, save_photo_path, set_received_date
 from app.services.documents import MANUAL_REVIEW_USER_TEXT, create_case_documents_reviewed, extraction_preview
 from app.services.document_background import start_document_preparation, wait_started_document_preparation
 from app.services.app_settings import payments_enabled
@@ -57,9 +57,19 @@ from app.services.paid_correction import (
 from app.services.received_date import received_date_prompt_text, save_received_date, validate_received_date
 from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaError, YooKassaReceiptContactRequired
-from app.texts import case_summary, manual_received_date_prompt_text, payment_text
+from app.texts import manual_received_date_prompt_text, payment_text
 from app.utils import ensure_dir, h, normalize_phone, normalize_receipt_contact, parse_russian_date, parse_structured_date
-from app.services.consultations import CONSULTATION_ACCEPTED_TEXT, CONSULTATION_PHONE_TEXT, consultation_notification_ids, submit_consultation
+from app.services.consultations import CONSULTATION_ACCEPTED_TEXT, CONSULTATION_PHONE_TEXT, consultation_notification, consultation_notification_ids, submit_consultation
+from app.services.automatic_mailings import (
+    PAVEL_MESSAGE,
+    PHONE_REQUEST_TEXT,
+    REMINDERS_DISABLED_TEXT,
+    begin_consultation,
+    disable_reminders,
+    finish_consultation,
+    prepare_consultation,
+    save_campaign_phone,
+)
 
 router = Router(name="case_flow")
 logger = logging.getLogger(__name__)
@@ -596,6 +606,54 @@ async def _notify_consultation_staff(message: Message, settings: Settings, text:
             logger.exception("Could not notify consultation staff telegram_id=%s", staff_id)
 
 
+@router.callback_query(F.data == "mailing:consult")
+async def request_automatic_consultation(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    settings: Settings,
+    current_user: User,
+) -> None:
+    await callback.answer()
+    case, ready = await begin_consultation(
+        session, settings, current_user, chat_id=str(callback.message.chat.id)
+    )
+    if not ready:
+        if not current_user.phone:
+            await state.update_data(
+                automatic_mailing_consultation=True,
+                consultation_case_id=case.id,
+                consultation_chat_id=str(callback.message.chat.id),
+            )
+            await state.set_state(CaseStates.waiting_consultation_phone)
+            await callback.message.answer(
+                PHONE_REQUEST_TEXT, reply_markup=campaign_phone_request_keyboard()
+            )
+        return
+    if not await prepare_consultation(session, settings, current_user, case):
+        return
+    await callback.message.answer(PAVEL_MESSAGE)
+    await finish_consultation(session, settings, current_user, case)
+    await _notify_consultation_staff(
+        callback.message,
+        settings,
+        consultation_notification(current_user),
+        test_mode=False,
+    )
+
+
+@router.callback_query(F.data == "mailing:disable")
+async def disable_automatic_reminders(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+    current_user: User,
+) -> None:
+    await callback.answer()
+    await disable_reminders(session, settings, current_user)
+    await callback.message.answer(REMINDERS_DISABLED_TEXT)
+
+
 @router.callback_query(F.data.in_({"consultation:request", "consultation:request:test"}))
 async def request_consultation(callback: CallbackQuery, state: FSMContext, session: AsyncSession, settings: Settings, current_user: User) -> None:
     test_mode = callback.data == "consultation:request:test"
@@ -618,11 +676,29 @@ async def receive_consultation_phone(message: Message, state: FSMContext, sessio
     raw_phone = message.contact.phone_number if message.contact else message.text
     phone = normalize_phone(raw_phone)
     if not phone:
-        await message.answer("Укажите корректный номер телефона.", reply_markup=phone_request_keyboard())
+        data = await state.get_data()
+        keyboard = campaign_phone_request_keyboard() if data.get("automatic_mailing_consultation") else phone_request_keyboard()
+        await message.answer("Укажите корректный номер телефона.", reply_markup=keyboard)
+        return
+    data = await state.get_data()
+    if data.get("automatic_mailing_consultation"):
+        case = await session.get(Case, int(data["consultation_case_id"]))
+        await save_campaign_phone(session, settings, current_user, case, phone)
+        if not await prepare_consultation(session, settings, current_user, case):
+            await state.clear()
+            return
+        await message.answer(PAVEL_MESSAGE, reply_markup=ReplyKeyboardRemove())
+        await finish_consultation(session, settings, current_user, case)
+        await _notify_consultation_staff(
+            message,
+            settings,
+            consultation_notification(current_user),
+            test_mode=False,
+        )
+        await state.clear()
         return
     current_user.phone = phone
     await session.commit()
-    data = await state.get_data()
     test_mode = bool(data.get("consultation_test_mode"))
     await submit_consultation(
         session, settings, current_user, chat_id=data.get("consultation_chat_id"),

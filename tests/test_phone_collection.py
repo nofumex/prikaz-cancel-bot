@@ -255,3 +255,18 @@ async def test_phone_event_updates_existing_amocrm_contact(monkeypatch) -> None:
 
     update_contact.assert_awaited_once_with(user)
     assert case.amocrm_contact_id == 601
+
+
+@pytest.mark.asyncio
+async def test_amocrm_phone_verification_reads_phone_custom_field(monkeypatch) -> None:
+    service = AmoCrmService(_settings(amocrm_enabled=True))
+    service.request = AsyncMock(return_value=({
+        "id": 601,
+        "custom_fields_values": [{
+            "field_code": "PHONE",
+            "values": [{"value": "+7 (999) 123-45-67"}],
+        }],
+    }, None))
+
+    assert await service.verify_contact_phone(601, "+79991234567") is True
+    service.request.assert_awaited_once_with("GET", "/contacts/601")

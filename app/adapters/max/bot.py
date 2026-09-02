@@ -40,7 +40,12 @@ from app.services.uploaded_documents import normalize_order_upload
 from app.services.yookassa import YooKassaReceiptContactRequired
 from app.services.users import get_or_create_platform_user
 from app.services.consultations import CONSULTATION_ACCEPTED_TEXT, CONSULTATION_PHONE_TEXT, consultation_notification_ids, submit_consultation
-from app.texts import case_summary, help_text, manual_received_date_prompt_text, payment_text, profile_text, welcome_text
+from app.services.automatic_mailings import (
+    PAVEL_MESSAGE, PHONE_REQUEST_TEXT, REMINDERS_DISABLED_TEXT, begin_consultation,
+    disable_reminders, ensure_mailing_started, finish_consultation,
+    prepare_consultation, save_campaign_phone,
+)
+from app.texts import help_text, manual_received_date_prompt_text, payment_text, profile_text, welcome_text
 from app.utils import ensure_dir, h, normalize_phone, normalize_receipt_contact, parse_russian_date, parse_structured_date
 
 DATE_PROMPT = received_date_prompt_text()
@@ -349,6 +354,14 @@ async def _handle_consultation_phone(
     user.phone = phone
     await session.commit()
     state_data = await _state_data(session, event)
+    if state_data.get('automatic_mailing_consultation'):
+        case = await session.get(Case, int(state_data['consultation_case_id']))
+        await save_campaign_phone(session, settings, user, case, phone)
+        if await prepare_consultation(session, settings, user, case):
+            await _send(client, event, PAVEL_MESSAGE)
+            await finish_consultation(session, settings, user, case)
+        await _clear_state(session, event)
+        return
     await _submit_max_consultation(
         client, event, session, settings, user,
         test_mode=bool(state_data.get('consultation_test_mode')),
@@ -474,6 +487,8 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
 
         if data == "menu:main" or (data is None and event.text == "/start"):
             await _clear_state(session, event)
+            if event.text == "/start" and not user.is_admin and not user.is_manager:
+                await ensure_mailing_started(session, user)
             await _send(client, event, welcome_text(settings.company_name), keyboards.main_menu())
             return
         if data == "profile:show":
@@ -747,6 +762,25 @@ async def handle_update(client: MaxBotClient, event: IncomingEvent, settings: Se
             return
 
         if event.update_type == 'message_callback':
+            if data == 'mailing:consult':
+                case, ready = await begin_consultation(session, settings, user, chat_id=event.chat_id)
+                if ready:
+                    if await prepare_consultation(session, settings, user, case):
+                        await _send(client, event, PAVEL_MESSAGE)
+                        await finish_consultation(session, settings, user, case)
+                elif not user.phone:
+                    await _set_state(session, event, STATE_CONSULTATION_PHONE, {
+                        'automatic_mailing_consultation': True,
+                        'consultation_case_id': case.id,
+                    })
+                    await _send(client, event, PHONE_REQUEST_TEXT, keyboards.campaign_phone_request_keyboard())
+                await client.answer_callback(event.callback_id)
+                return
+            if data == 'mailing:disable':
+                await disable_reminders(session, settings, user)
+                await _send(client, event, REMINDERS_DISABLED_TEXT)
+                await client.answer_callback(event.callback_id)
+                return
             if data in {'consultation:request', 'consultation:request:test'}:
                 test_mode = data == 'consultation:request:test'
                 if user.phone and not test_mode:

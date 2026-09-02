@@ -30,6 +30,7 @@ PIPELINE_STATUSES = [
     "Получил напоминание",
     "Получил предложение о консультации",
     "Консультация",
+    "Консультация - НО",
 ]
 
 
@@ -47,6 +48,18 @@ DEDUPED_EVENTS = {
     "chat_message",
     "history_replay",
     "crm_stage_reconciliation",
+    "mailing_consultation_clicked",
+    "mailing_phone_requested",
+    "mailing_phone_received",
+    "mailing_phone_saved_amocrm",
+    "mailing_consultation_stage",
+    "mailing_pavel_message_sent",
+    "mailing_message_sent",
+    "mailing_consultation_no",
+    "mailing_consultation_no_message",
+    "mailing_sales_excluded",
+    "mailing_reminders_disabled",
+    "mailing_jobs_cancelled",
 }
 
 
@@ -424,6 +437,25 @@ class AmoCrmService:
             )
         return int(contact_id) if contact_id else None
 
+    async def verify_contact_phone(self, contact_id: int, expected_phone: str) -> bool:
+        """Read the contact back and verify the PHONE custom field, not just PATCH success."""
+        data, error = await self.request("GET", f"/contacts/{int(contact_id)}")
+        if error or not isinstance(data, dict):
+            return False
+        expected = "".join(char for char in expected_phone if char.isdigit())
+        if expected.startswith("8") and len(expected) == 11:
+            expected = "7" + expected[1:]
+        for field in data.get("custom_fields_values") or []:
+            if field.get("field_code") != "PHONE":
+                continue
+            for item in field.get("values") or []:
+                actual = "".join(char for char in str(item.get("value") or "") if char.isdigit())
+                if actual.startswith("8") and len(actual) == 11:
+                    actual = "7" + actual[1:]
+                if actual == expected and expected:
+                    return True
+        return False
+
     def _lead_name(self, case: Case, user: User) -> str:
         username = user.telegram_username or user.username
         if username:
@@ -573,6 +605,38 @@ class AmoCrmService:
         case.amocrm_status_id = status_id
         case.amocrm_status_name = status_name
         return True
+
+    async def verify_lead_status(self, case: Case, expected_status: str) -> bool:
+        lead_id = case.amocrm_lead_id or case.amo_lead_id
+        if not lead_id:
+            return False
+        data, error = await self.request("GET", f"/leads/{int(lead_id)}")
+        if error or not isinstance(data, dict):
+            return False
+        expected_id = await self.get_status_id(expected_status)
+        actual_id = int(data.get("status_id") or 0)
+        if not expected_id or actual_id != int(expected_id):
+            return False
+        case.amocrm_status_id = actual_id
+        case.amocrm_status_name = expected_status
+        return True
+
+    async def get_lead_location(self, lead_id: int) -> tuple[str | None, str | None]:
+        """Return authoritative pipeline/status names for an incoming amoCRM webhook."""
+        lead, error = await self.request("GET", f"/leads/{int(lead_id)}")
+        if error or not isinstance(lead, dict):
+            raise RuntimeError(error or f"amoCRM lead {lead_id} was not returned")
+        pipeline_id = int(lead.get("pipeline_id") or 0)
+        status_id = int(lead.get("status_id") or 0)
+        pipeline, error = await self.request("GET", f"/leads/pipelines/{pipeline_id}")
+        if error or not isinstance(pipeline, dict):
+            raise RuntimeError(error or f"amoCRM pipeline {pipeline_id} was not returned")
+        status_name = None
+        for status in pipeline.get("_embedded", {}).get("statuses", []):
+            if int(status.get("id") or 0) == status_id:
+                status_name = str(status.get("name") or "") or None
+                break
+        return str(pipeline.get("name") or "") or None, status_name
 
     async def add_lead_note(self, case: Case, text: str) -> bool:
         lead_id = case.amocrm_lead_id or case.amo_lead_id

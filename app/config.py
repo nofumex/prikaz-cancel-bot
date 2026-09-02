@@ -137,6 +137,8 @@ class Settings:
     order_recognition_mode: str = "tesseract_text"
     order_crop_vision_enabled: bool = False
     order_type_precheck_model: str = ""
+    amocrm_webhook_path: str = "/webhooks/amocrm"
+    amocrm_webhook_secret: str | None = None
 
     @property
     def staff_ids(self) -> set[int]:
@@ -242,4 +244,6 @@ def get_settings() -> Settings:
         order_recognition_mode=(getenv("ORDER_RECOGNITION_MODE") or "tesseract_text").strip().lower(),
         order_crop_vision_enabled=_parse_bool(getenv("ORDER_CROP_VISION_ENABLED"), False),
         order_type_precheck_model=(getenv("ORDER_TYPE_PRECHECK_MODEL") or "gpt-4.1-mini").strip(),
+        amocrm_webhook_path=(getenv("AMOCRM_WEBHOOK_PATH") or "/webhooks/amocrm").strip(),
+        amocrm_webhook_secret=(getenv("AMOCRM_WEBHOOK_SECRET") or "").strip() or None,
     )

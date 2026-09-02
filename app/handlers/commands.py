@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.keyboards.common import main_menu, profile_menu
 from app.models import User
+from app.services.automatic_mailings import ensure_mailing_started
 from app.services.cases import latest_case
 from app.texts import help_text, profile_text, welcome_text
 
@@ -16,8 +17,16 @@ router = Router(name="commands")
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext, settings: Settings) -> None:
+async def cmd_start(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    current_user: User,
+    settings: Settings,
+) -> None:
     await state.clear()
+    if not current_user.is_admin and not current_user.is_manager:
+        await ensure_mailing_started(session, current_user)
     await message.answer(welcome_text(settings.company_name), reply_markup=main_menu())
 
 

@@ -3,12 +3,19 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 
-def btn(text: str, callback_data: str | None = None, url: str | None = None) -> InlineKeyboardButton:
+def btn(
+    text: str,
+    callback_data: str | None = None,
+    url: str | None = None,
+    style: str | None = None,
+) -> InlineKeyboardButton:
     kwargs = {"text": text}
     if callback_data:
         kwargs["callback_data"] = callback_data
     if url:
         kwargs["url"] = url
+    if style:
+        kwargs["style"] = style
     return InlineKeyboardButton(**kwargs)
 
 
@@ -18,6 +25,23 @@ def phone_request_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         one_time_keyboard=True,
     )
+
+
+def campaign_phone_request_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Поделиться номером", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def automatic_mailing_menu(*, allow_disable: bool) -> InlineKeyboardMarkup:
+    rows = [[btn("Получить консультацию", "mailing:consult", style="primary")]]
+    if allow_disable:
+        # Telegram does not expose arbitrary button colors. The neutral text-only
+        # second row is the least prominent native inline-button presentation.
+        rows.append([btn("Не присылать напоминания", "mailing:disable")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def main_menu() -> InlineKeyboardMarkup:

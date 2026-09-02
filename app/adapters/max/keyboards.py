@@ -45,6 +45,17 @@ def phone_request_keyboard() -> MaxKeyboard:
     return [[contact_btn("Поделиться контактом")]]
 
 
+def campaign_phone_request_keyboard() -> MaxKeyboard:
+    return [[contact_btn("Поделиться номером")]]
+
+
+def automatic_mailing_menu(*, allow_disable: bool) -> MaxKeyboard:
+    rows = [[btn("Получить консультацию", "mailing:consult")]]
+    if allow_disable:
+        rows.append([btn("Не присылать напоминания", "mailing:disable")])
+    return rows
+
+
 def main_menu() -> MaxKeyboard:
     return [
         [btn("📝 Подготовить заявление", "case:new")],

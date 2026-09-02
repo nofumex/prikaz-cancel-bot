@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -16,6 +15,7 @@ from app.handlers import admin, case_flow, chat, commands
 from app.middlewares.user import DbUserMiddleware
 from app.services.payment_web import run_payment_webhook
 from app.services.reminders import run_payment_reminders
+from app.services.automatic_mailings import run_automatic_mailings
 
 
 async def set_commands(bot: Bot) -> None:
@@ -63,7 +63,8 @@ async def run_telegram_bot(settings: Settings) -> None:
     tasks: list[asyncio.Task] = []
     try:
         tasks.append(asyncio.create_task(run_payment_reminders(bot)))
-        if settings.yookassa_enabled or settings.yoomoney_receiver or settings.yoomoney_notification_secret or settings.payment_public_base_url:
+        tasks.append(asyncio.create_task(run_automatic_mailings(settings, bot)))
+        if settings.yookassa_enabled or settings.yoomoney_receiver or settings.yoomoney_notification_secret or settings.payment_public_base_url or settings.amocrm_enabled:
             tasks.append(asyncio.create_task(run_payment_webhook(bot, settings)))
         if settings.drop_pending_updates:
             await bot.delete_webhook(drop_pending_updates=True)

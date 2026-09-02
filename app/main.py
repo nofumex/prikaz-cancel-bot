@@ -11,6 +11,7 @@ from app.config import get_settings
 from app.database import close_db, init_db
 from app.services.payment_web import run_payment_webhook
 from app.services.reminders import run_payment_reminders
+from app.services.automatic_mailings import run_automatic_mailings
 
 
 def setup_logging() -> None:
@@ -33,9 +34,10 @@ async def main() -> None:
 
     telegram_active = settings.run_telegram and bool(settings.telegram_bot_token)
     max_active = settings.run_max and bool(settings.max_bot_token)
-    payment_web_configured = bool(settings.yookassa_enabled or settings.yoomoney_receiver or settings.yoomoney_notification_secret or settings.payment_public_base_url)
+    payment_web_configured = bool(settings.yookassa_enabled or settings.yoomoney_receiver or settings.yoomoney_notification_secret or settings.payment_public_base_url or settings.amocrm_enabled)
     if max_active and not telegram_active:
         tasks.append(run_payment_reminders(None))
+        tasks.append(run_automatic_mailings(settings, None))
         if payment_web_configured:
             tasks.append(run_payment_webhook(None, settings))
 

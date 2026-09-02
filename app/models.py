@@ -220,3 +220,56 @@ class ConsultationBroadcastDelivery(Base):
     error_message: Mapped[str | None] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class MailingState(Base):
+    """Persistent participation state for the automatic consultation campaign."""
+
+    __tablename__ = "mailing_states"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    participating: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    reminders_disabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    consultation_completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    awaiting_phone: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    consultation_no: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    excluded_sales: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    next_stage: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    last_sent_stage: Mapped[int | None] = mapped_column(Integer)
+    last_sent_at: Mapped[datetime | None] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class MailingJob(Base):
+    """Database outbox entry; one durable job per user and campaign stage."""
+
+    __tablename__ = "mailing_jobs"
+    __table_args__ = (UniqueConstraint("user_id", "stage", name="uq_mailing_job_user_stage"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    stage: Mapped[int] = mapped_column(Integer, nullable=False)
+    due_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class MailingAction(Base):
+    """Idempotency ledger for callbacks, webhooks and amoCRM notes."""
+
+    __tablename__ = "mailing_actions"
+    __table_args__ = (UniqueConstraint("user_id", "action_key", name="uq_mailing_action_user_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    case_id: Mapped[int | None] = mapped_column(ForeignKey("cases.id"), index=True)
+    action_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
