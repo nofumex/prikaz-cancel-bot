@@ -300,12 +300,21 @@ async def _process_sales_lead(session: AsyncSession, settings, lead: dict) -> No
 
 async def poll_crm_mailing_once(settings, bot: Bot | None = None) -> None:
     crm = get_amocrm_service(settings)
-    no_leads = await crm.list_leads_in_status(settings.amocrm_pipeline_name, NO_STATUS_NAMES)
-    sales_leads = await crm.list_leads_in_pipeline("Отдел продаж")
+
+    no_leads = await crm.list_leads_in_status(
+        settings.amocrm_pipeline_name,
+        NO_STATUS_NAMES,
+    )
+
     async with SessionLocal() as session:
         await recover_notification_leases(session)
+
         for lead in no_leads:
             await _process_consultation_no_lead(session, settings, bot, lead)
+
+    sales_leads = await crm.list_leads_in_pipeline("Отдел продаж")
+
+    async with SessionLocal() as session:
         for lead in sales_leads:
             await _process_sales_lead(session, settings, lead)
 
