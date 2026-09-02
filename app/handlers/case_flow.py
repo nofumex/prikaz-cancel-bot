@@ -65,8 +65,8 @@ from app.services.automatic_mailings import (
     PHONE_REQUEST_TEXT,
     REMINDERS_DISABLED_TEXT,
     begin_consultation,
+    deliver_pavel_message,
     disable_reminders,
-    finish_consultation,
     prepare_consultation,
     save_campaign_phone,
 )
@@ -632,8 +632,15 @@ async def request_automatic_consultation(
         return
     if not await prepare_consultation(session, settings, current_user, case):
         return
-    await callback.message.answer(PAVEL_MESSAGE)
-    await finish_consultation(session, settings, current_user, case)
+    sent = await deliver_pavel_message(
+        session,
+        settings,
+        current_user,
+        case,
+        lambda: callback.message.answer(PAVEL_MESSAGE),
+    )
+    if not sent:
+        return
     await _notify_consultation_staff(
         callback.message,
         settings,
@@ -687,8 +694,16 @@ async def receive_consultation_phone(message: Message, state: FSMContext, sessio
         if not await prepare_consultation(session, settings, current_user, case):
             await state.clear()
             return
-        await message.answer(PAVEL_MESSAGE, reply_markup=ReplyKeyboardRemove())
-        await finish_consultation(session, settings, current_user, case)
+        sent = await deliver_pavel_message(
+            session,
+            settings,
+            current_user,
+            case,
+            lambda: message.answer(PAVEL_MESSAGE, reply_markup=ReplyKeyboardRemove()),
+        )
+        if not sent:
+            await state.clear()
+            return
         await _notify_consultation_staff(
             message,
             settings,

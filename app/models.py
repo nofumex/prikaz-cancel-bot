@@ -263,6 +263,28 @@ class MailingJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 
+class PavelMessageDelivery(Base):
+    """Durable delivery ledger for the automatic-consultation Pavel message."""
+
+    __tablename__ = "pavel_message_deliveries"
+    __table_args__ = (
+        UniqueConstraint("user_id", "consultation_key", name="uq_pavel_delivery_user_consultation"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    case_id: Mapped[int] = mapped_column(ForeignKey("cases.id"), index=True, nullable=False)
+    consultation_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime)
+    uncertain_at: Mapped[datetime | None] = mapped_column(DateTime)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
 class MailingAction(Base):
     """Idempotency ledger for callbacks, webhooks and amoCRM notes."""
 

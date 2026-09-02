@@ -6,6 +6,7 @@ import json
 import logging
 from calendar import monthrange
 from datetime import datetime, timedelta
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import Bot
@@ -16,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.max import keyboards as max_keyboards
 from app.database import SessionLocal
 from app.keyboards.common import automatic_mailing_menu
-from app.models import Case, MailingAction, MailingJob, MailingState, User
+from app.models import Case, MailingAction, MailingJob, MailingState, PavelMessageDelivery, User
 from app.services.amocrm import AmoNoteVerificationPending, PIPELINE_STATUSES, get_amocrm_service
 from app.services.cases import ensure_user_has_case
 from app.services.reminders import _send_user_message
@@ -52,6 +53,7 @@ FOLLOWUP_TEXT = (
 LAST_STAGE = 12
 ACTION_LEASE = timedelta(minutes=5)
 JOB_LEASE = timedelta(minutes=5)
+PAVEL_DELIVERY_LEASE = timedelta(minutes=5)
 
 
 def _add_months(value: datetime, months: int) -> datetime:
@@ -409,7 +411,12 @@ async def prepare_consultation(
 
 
 async def finish_consultation(
-    session: AsyncSession, settings, user: User, case: Case
+    session: AsyncSession,
+    settings,
+    user: User,
+    case: Case,
+    *,
+    consultation_key: str | None = None,
 ) -> None:
     state = await get_mailing_state(session, user.id)
     if state is None:
@@ -425,7 +432,7 @@ async def finish_consultation(
         settings,
         user,
         case,
-        f"pavel-message:{state.next_stage}",
+        f"pavel-message:{consultation_key or state.next_stage}",
         "mailing_pavel_message_sent",
         "Система рассылок: отправлено сообщение с номером юрисконсульта Павла",
     )
@@ -434,10 +441,208 @@ async def finish_consultation(
         settings,
         user,
         case,
-        f"jobs-cancelled-consultation:{state.next_stage}",
+        f"jobs-cancelled-consultation:{consultation_key or state.next_stage}",
         "mailing_jobs_cancelled",
         f"Система рассылок: отменены будущие задания рассылки ({cancelled})",
     )
+
+
+def pavel_consultation_key(state: MailingState, case: Case) -> str:
+    cycle = "after-no" if state.consultation_no else "initial"
+    return f"case:{case.id}:stage:{state.next_stage}:{cycle}"
+
+
+async def _ensure_pavel_delivery(
+    session: AsyncSession,
+    user: User,
+    case: Case,
+    state: MailingState,
+) -> PavelMessageDelivery:
+    consultation_key = pavel_consultation_key(state, case)
+    row = await session.scalar(
+        select(PavelMessageDelivery).where(
+            PavelMessageDelivery.user_id == user.id,
+            PavelMessageDelivery.consultation_key == consultation_key,
+        )
+    )
+    if row is not None:
+        return row
+    row = PavelMessageDelivery(
+        user_id=user.id,
+        case_id=case.id,
+        consultation_key=consultation_key,
+        status="pending",
+    )
+    session.add(row)
+    try:
+        await session.commit()
+        return row
+    except IntegrityError:
+        await session.rollback()
+        row = await session.scalar(
+            select(PavelMessageDelivery).where(
+                PavelMessageDelivery.user_id == user.id,
+                PavelMessageDelivery.consultation_key == consultation_key,
+            )
+        )
+        if row is None:
+            raise
+        return row
+
+
+async def recover_pavel_delivery_leases(session: AsyncSession) -> None:
+    now = datetime.utcnow()
+    await session.execute(
+        update(PavelMessageDelivery)
+        .where(
+            PavelMessageDelivery.status == "sending",
+            or_(
+                PavelMessageDelivery.lease_until.is_(None),
+                PavelMessageDelivery.lease_until < now,
+            ),
+        )
+        .values(
+            status="uncertain",
+            uncertain_at=now,
+            lease_until=None,
+            error_message="worker lease expired during Pavel message delivery",
+        )
+    )
+    await session.commit()
+
+
+async def deliver_pavel_message(
+    session: AsyncSession,
+    settings,
+    user: User,
+    case: Case,
+    send: Callable[[], Awaitable[Any]],
+) -> bool:
+    """Send PAVEL_MESSAGE once, then complete the consultation durably."""
+    state = await get_mailing_state(session, user.id)
+    if state is None:
+        state = await ensure_mailing_started(session, user)
+    row = await _ensure_pavel_delivery(session, user, case, state)
+    now = datetime.utcnow()
+    await session.execute(
+        update(PavelMessageDelivery)
+        .where(
+            PavelMessageDelivery.id == row.id,
+            PavelMessageDelivery.status == "sending",
+            or_(
+                PavelMessageDelivery.lease_until.is_(None),
+                PavelMessageDelivery.lease_until < now,
+            ),
+        )
+        .values(
+            status="uncertain",
+            uncertain_at=now,
+            lease_until=None,
+            error_message="worker lease expired during Pavel message delivery",
+        )
+    )
+    await session.commit()
+    await session.refresh(row)
+    if row.status == "sent":
+        await finish_consultation(
+            session,
+            settings,
+            user,
+            case,
+            consultation_key=row.consultation_key,
+        )
+        return False
+    if row.status != "pending":
+        return False
+
+    claimed_at = datetime.utcnow()
+    claim = await session.execute(
+        update(PavelMessageDelivery)
+        .where(
+            PavelMessageDelivery.id == row.id,
+            PavelMessageDelivery.status == "pending",
+        )
+        .values(
+            status="sending",
+            claimed_at=claimed_at,
+            lease_until=claimed_at + PAVEL_DELIVERY_LEASE,
+            attempts=PavelMessageDelivery.attempts + 1,
+            error_message=None,
+        )
+    )
+    await session.commit()
+    if not claim.rowcount:
+        return False
+    await session.refresh(row)
+    try:
+        result = await send()
+    except Exception as exc:
+        row.status = "uncertain"
+        row.uncertain_at = datetime.utcnow()
+        row.lease_until = None
+        row.error_message = str(exc)[:2000]
+        await session.commit()
+        logger.exception("Pavel message delivery outcome is uncertain delivery_id=%s", row.id)
+        return False
+    if not result:
+        row.status = "uncertain"
+        row.uncertain_at = datetime.utcnow()
+        row.lease_until = None
+        row.error_message = "delivery outcome was not confirmed"
+        await session.commit()
+        return False
+
+    row.status = "sent"
+    row.sent_at = datetime.utcnow()
+    row.lease_until = None
+    row.uncertain_at = None
+    row.error_message = None
+    await session.commit()
+    await finish_consultation(
+        session,
+        settings,
+        user,
+        case,
+        consultation_key=row.consultation_key,
+    )
+    return True
+
+
+async def resolve_uncertain_pavel_delivery(
+    session: AsyncSession,
+    settings,
+    delivery_id: int,
+    *,
+    delivered: bool,
+    delivered_at: datetime | None = None,
+) -> bool:
+    row = await session.get(PavelMessageDelivery, delivery_id)
+    if row is None or row.status != "uncertain":
+        return False
+    if not delivered:
+        row.status = "pending"
+        row.uncertain_at = None
+        row.error_message = None
+        await session.commit()
+        return True
+    row.status = "sent"
+    row.sent_at = delivered_at or row.claimed_at or datetime.utcnow()
+    row.uncertain_at = None
+    row.lease_until = None
+    row.error_message = None
+    await session.commit()
+    user = await session.get(User, row.user_id)
+    case = await session.get(Case, row.case_id)
+    if user is None or case is None:
+        raise RuntimeError(f"Pavel delivery target is missing delivery_id={delivery_id}")
+    await finish_consultation(
+        session,
+        settings,
+        user,
+        case,
+        consultation_key=row.consultation_key,
+    )
+    return True
 
 
 async def disable_reminders(session: AsyncSession, settings, user: User) -> bool:
@@ -723,6 +928,7 @@ async def run_automatic_mailings(settings, bot: Bot | None = None) -> None:
         try:
             async with SessionLocal() as session:
                 await recover_uncertain_jobs(session)
+                await recover_pavel_delivery_leases(session)
                 await retry_pending_actions(session, settings)
                 ids = list(
                     (await session.execute(

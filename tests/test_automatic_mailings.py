@@ -11,7 +11,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import get_settings
-from app.models import Base, Case, CrmDealNotification, MailingAction, MailingJob, MailingState, User
+from app.models import (
+    Base,
+    Case,
+    CrmDealNotification,
+    MailingAction,
+    MailingJob,
+    MailingState,
+    PavelMessageDelivery,
+    User,
+)
 from app.services import automatic_mailings as mailings
 from app.services import crm_mailing_polling as crm_polling
 
@@ -99,6 +108,178 @@ async def test_state_is_checked_again_immediately_before_send(mailing_db, monkey
         job = await session.get(MailingJob, job_id)
     assert job.status == "cancelled"
     sender.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_repeated_consultation_click_does_not_resend_pavel_message(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    sender = AsyncMock(return_value=object())
+    monkeypatch.setattr(mailings, "record_action", AsyncMock(return_value=True))
+    async with mailing_db() as session:
+        user = await _user(session)
+        await mailings.ensure_mailing_started(session, user)
+        case = Case(user_id=user.id, platform="telegram")
+        session.add(case)
+        await session.commit()
+
+        assert await mailings.deliver_pavel_message(
+            session, settings, user, case, sender
+        ) is True
+        assert await mailings.deliver_pavel_message(
+            session, settings, user, case, sender
+        ) is False
+        delivery = await session.scalar(select(PavelMessageDelivery))
+
+    assert delivery.status == "sent"
+    assert sender.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_parallel_consultation_callbacks_claim_pavel_message_once(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_send():
+        started.set()
+        await release.wait()
+        return object()
+
+    monkeypatch.setattr(mailings, "record_action", AsyncMock(return_value=True))
+    async with mailing_db() as setup:
+        user = await _user(setup)
+        await mailings.ensure_mailing_started(setup, user)
+        case = Case(user_id=user.id, platform="telegram")
+        setup.add(case)
+        await setup.commit()
+        user_id, case_id = user.id, case.id
+
+    async with mailing_db() as first, mailing_db() as second:
+        first_user, first_case = await first.get(User, user_id), await first.get(Case, case_id)
+        second_user, second_case = await second.get(User, user_id), await second.get(Case, case_id)
+        first_task = asyncio.create_task(
+            mailings.deliver_pavel_message(
+                first, settings, first_user, first_case, slow_send
+            )
+        )
+        await started.wait()
+        assert await mailings.deliver_pavel_message(
+            second,
+            settings,
+            second_user,
+            second_case,
+            AsyncMock(return_value=object()),
+        ) is False
+        release.set()
+        assert await first_task is True
+
+    async with mailing_db() as session:
+        delivery = await session.scalar(select(PavelMessageDelivery))
+    assert delivery.status == "sent"
+    assert delivery.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_pavel_claim_becomes_uncertain_without_blind_resend(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    sender = AsyncMock(return_value=object())
+    monkeypatch.setattr(mailings, "record_action", AsyncMock(return_value=True))
+    async with mailing_db() as setup:
+        user = await _user(setup)
+        state = await mailings.ensure_mailing_started(setup, user)
+        case = Case(user_id=user.id, platform="telegram")
+        setup.add(case)
+        await setup.commit()
+        delivery = await mailings._ensure_pavel_delivery(setup, user, case, state)
+        delivery.status = "sending"
+        delivery.claimed_at = datetime.utcnow() - timedelta(minutes=10)
+        delivery.lease_until = datetime.utcnow() - timedelta(seconds=1)
+        await setup.commit()
+        delivery_id, user_id, case_id = delivery.id, user.id, case.id
+
+    async with mailing_db() as restarted:
+        user = await restarted.get(User, user_id)
+        case = await restarted.get(Case, case_id)
+        assert await mailings.deliver_pavel_message(
+            restarted, settings, user, case, sender
+        ) is False
+        delivery = await restarted.get(PavelMessageDelivery, delivery_id)
+
+    assert delivery.status == "uncertain"
+    sender.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_uncertain_pavel_result_requires_explicit_reconciliation(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    uncertain_sender = AsyncMock(return_value=False)
+    retry_sender = AsyncMock(return_value=object())
+    monkeypatch.setattr(mailings, "record_action", AsyncMock(return_value=True))
+    async with mailing_db() as session:
+        user = await _user(session)
+        await mailings.ensure_mailing_started(session, user)
+        case = Case(user_id=user.id, platform="telegram")
+        session.add(case)
+        await session.commit()
+
+        assert await mailings.deliver_pavel_message(
+            session, settings, user, case, uncertain_sender
+        ) is False
+        delivery = await session.scalar(select(PavelMessageDelivery))
+        assert delivery.status == "uncertain"
+        assert await mailings.deliver_pavel_message(
+            session, settings, user, case, retry_sender
+        ) is False
+        retry_sender.assert_not_awaited()
+        assert await mailings.resolve_uncertain_pavel_delivery(
+            session, settings, delivery.id, delivered=False
+        ) is True
+        assert await mailings.deliver_pavel_message(
+            session, settings, user, case, retry_sender
+        ) is True
+
+    assert uncertain_sender.await_count == 1
+    assert retry_sender.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_successful_pavel_consultation_still_cancels_future_jobs(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    monkeypatch.setattr(mailings, "record_action", AsyncMock(return_value=True))
+    async with mailing_db() as session:
+        user = await _user(session)
+        await mailings.ensure_mailing_started(session, user)
+        session.add(
+            MailingJob(
+                user_id=user.id,
+                stage=2,
+                due_at=datetime.utcnow() + timedelta(days=7),
+                status="pending",
+            )
+        )
+        case = Case(user_id=user.id, platform="telegram")
+        session.add(case)
+        await session.commit()
+
+        assert await mailings.deliver_pavel_message(
+            session, settings, user, case, AsyncMock(return_value=object())
+        ) is True
+        jobs = list((await session.execute(select(MailingJob))).scalars())
+        state = await session.scalar(select(MailingState))
+
+    assert {job.status for job in jobs} == {"cancelled"}
+    assert state.consultation_completed is True
+    assert state.participating is False
 
 
 @pytest.mark.asyncio
