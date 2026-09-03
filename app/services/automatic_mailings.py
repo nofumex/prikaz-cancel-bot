@@ -380,27 +380,42 @@ async def begin_consultation(
     if state is None:
         state = await ensure_mailing_started(session, user)
     case = await _case_for_user(session, user, chat_id)
+    next_state = "requested" if user.phone else "awaiting_phone"
+    claimed = await session.execute(
+        update(MailingState)
+        .where(
+            MailingState.id == state.id,
+            MailingState.consultation_state == "ready",
+        )
+        .values(
+            consultation_cycle=MailingState.consultation_cycle + 1,
+            consultation_state=next_state,
+            awaiting_phone=not bool(user.phone),
+            consultation_no=False,
+        )
+    )
+    await session.commit()
+    await session.refresh(state)
+    if not claimed.rowcount:
+        return case, False
+    cycle = state.consultation_cycle
     await record_action(
         session,
         settings,
         user,
         case,
-        f"consult-click:{state.next_stage}",
+        f"consult-click:cycle:{cycle}",
         "mailing_consultation_clicked",
         "Клиент нажал кнопку «Получить консультацию». Заявка передана юрисконсульту.",
         execute_immediately=False,
     )
-    if state.consultation_completed and not state.consultation_no:
-        return case, False
     if not user.phone:
-        state.awaiting_phone = True
-        await session.commit()
         await record_action(
             session,
             settings,
             user,
             case,
-            f"phone-request:{state.next_stage}",
+            f"phone-request:cycle:{cycle}",
             "mailing_phone_requested",
             "Для консультации у клиента запрошен номер телефона.",
             execute_immediately=False,
@@ -418,14 +433,24 @@ async def save_campaign_phone(
     user.phone = phone
     state = await get_mailing_state(session, user.id)
     if state:
-        state.awaiting_phone = False
+        transitioned = await session.execute(
+            update(MailingState)
+            .where(
+                MailingState.id == state.id,
+                MailingState.consultation_state == "awaiting_phone",
+            )
+            .values(awaiting_phone=False, consultation_state="requested")
+        )
+        if not transitioned.rowcount:
+            raise RuntimeError("consultation is not awaiting a phone number")
+        await session.refresh(state)
     await session.commit()
     await record_action(
         session,
         settings,
         user,
         case,
-        f"phone-received:{phone}",
+        f"phone-received:cycle:{state.consultation_cycle if state else 0}",
         "mailing_phone_received",
         f"Клиент указал номер телефона для консультации: {phone}.",
         execute_immediately=False,
@@ -438,14 +463,14 @@ async def prepare_consultation(
 ) -> bool:
     """Queue CRM updates without delaying the confirmation shown to the client."""
     state = await get_mailing_state(session, user.id)
-    if state and state.consultation_completed and not state.consultation_no:
+    if state is None or state.consultation_state != "requested":
         return False
     await record_action(
         session,
         settings,
         user,
         case,
-        f"phone-saved-amocrm:{user.phone}",
+        f"phone-saved-amocrm:cycle:{state.consultation_cycle}",
         "mailing_phone_saved_amocrm",
         f"Номер телефона клиента для консультации: {user.phone}.",
         execute_immediately=False,
@@ -455,7 +480,7 @@ async def prepare_consultation(
         settings,
         user,
         case,
-        f"consultation-stage:{state.next_stage if state else 1}",
+        f"consultation-stage:cycle:{state.consultation_cycle}",
         "mailing_consultation_stage",
         f"Клиент запросил консультацию. Сделка переводится в этап «{CONSULTATION_STATUS}».",
         extra={"status_name_override": CONSULTATION_STATUS, "force_status": True},
@@ -479,6 +504,7 @@ async def finish_consultation(
     state.consultation_completed = True
     state.consultation_no = False
     state.awaiting_phone = False
+    state.consultation_state = "completed"
     cancelled = await cancel_future_jobs(session, user.id)
     await session.commit()
     await record_action(
@@ -505,8 +531,10 @@ async def finish_consultation(
 
 
 def pavel_consultation_key(state: MailingState, case: Case) -> str:
-    cycle = state.consultation_cycle if state.consultation_no else 0
-    return f"case:{case.id}:stage:{state.next_stage}:consultation-cycle:{cycle}"
+    return (
+        f"case:{case.id}:stage:{state.next_stage}:"
+        f"consultation-cycle:{state.consultation_cycle}"
+    )
 
 
 async def _ensure_pavel_delivery(

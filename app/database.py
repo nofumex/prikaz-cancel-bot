@@ -34,6 +34,68 @@ async def _sqlite_add_columns(conn, table_name: str, columns: list[tuple[str, st
     return added
 
 
+async def _sqlite_upgrade_crm_notification_cycle_unique(conn) -> None:
+    result = await conn.exec_driver_sql(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'crm_deal_notifications'"
+    )
+    row = result.first()
+    table_sql = "".join(str(row[0] if row else "").lower().split())
+    if "unique(amocrm_deal_id,notification_type,cycle)" in table_sql:
+        return
+    await conn.exec_driver_sql(
+        "ALTER TABLE crm_deal_notifications RENAME TO crm_deal_notifications_legacy_cycle"
+    )
+    await conn.exec_driver_sql(
+        """
+        CREATE TABLE crm_deal_notifications (
+            id INTEGER PRIMARY KEY,
+            amocrm_deal_id BIGINT NOT NULL,
+            notification_type VARCHAR(64) NOT NULL,
+            cycle INTEGER NOT NULL DEFAULT 1,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            case_id INTEGER NOT NULL REFERENCES cases(id),
+            lawyer_name VARCHAR(255) NOT NULL,
+            lawyer_phone VARCHAR(64) NOT NULL,
+            message_text TEXT NOT NULL,
+            status VARCHAR(16) NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            claimed_at DATETIME,
+            lease_until DATETIME,
+            sent_at DATETIME,
+            uncertain_at DATETIME,
+            error_message TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+            CONSTRAINT uq_crm_deal_notification_cycle
+                UNIQUE (amocrm_deal_id, notification_type, cycle)
+        )
+        """
+    )
+    await conn.exec_driver_sql(
+        """
+        INSERT INTO crm_deal_notifications (
+            id, amocrm_deal_id, notification_type, cycle, user_id, case_id,
+            lawyer_name, lawyer_phone, message_text, status, attempts,
+            claimed_at, lease_until, sent_at, uncertain_at, error_message, created_at
+        )
+        SELECT
+            id, amocrm_deal_id, notification_type, cycle, user_id, case_id,
+            lawyer_name, lawyer_phone, message_text, status, attempts,
+            claimed_at, lease_until, sent_at, uncertain_at, error_message, created_at
+        FROM crm_deal_notifications_legacy_cycle
+        """
+    )
+    await conn.exec_driver_sql("DROP TABLE crm_deal_notifications_legacy_cycle")
+    for index_sql in (
+        "CREATE INDEX ix_crm_deal_notifications_amocrm_deal_id ON crm_deal_notifications (amocrm_deal_id)",
+        "CREATE INDEX ix_crm_deal_notifications_notification_type ON crm_deal_notifications (notification_type)",
+        "CREATE INDEX ix_crm_deal_notifications_user_id ON crm_deal_notifications (user_id)",
+        "CREATE INDEX ix_crm_deal_notifications_case_id ON crm_deal_notifications (case_id)",
+        "CREATE INDEX ix_crm_deal_notifications_status ON crm_deal_notifications (status)",
+        "CREATE INDEX ix_crm_deal_notifications_lease_until ON crm_deal_notifications (lease_until)",
+    ):
+        await conn.exec_driver_sql(index_sql)
+
+
 async def _upgrade_sqlite_schema(conn) -> None:
     added_case_columns = await _sqlite_add_columns(
         conn,
@@ -207,12 +269,27 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("uncertain_at", "uncertain_at DATETIME"),
         ],
     )
-    await _sqlite_add_columns(
+    added_mailing_state_columns = await _sqlite_add_columns(
         conn,
         "mailing_states",
         [
             ("consultation_cycle", "consultation_cycle INTEGER NOT NULL DEFAULT 0"),
+            ("consultation_state", "consultation_state VARCHAR(24) NOT NULL DEFAULT 'ready'"),
         ],
+    )
+    if "consultation_state" in added_mailing_state_columns:
+        await conn.exec_driver_sql(
+            """
+            UPDATE mailing_states
+            SET consultation_state = CASE
+                WHEN awaiting_phone = 1 THEN 'awaiting_phone'
+                WHEN consultation_completed = 1 AND consultation_no = 0 THEN 'completed'
+                ELSE 'ready'
+            END
+            """
+        )
+    await conn.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_mailing_states_consultation_state ON mailing_states (consultation_state)"
     )
     await _sqlite_add_columns(
         conn,
@@ -234,6 +311,7 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("cycle", "cycle INTEGER NOT NULL DEFAULT 1"),
         ],
     )
+    await _sqlite_upgrade_crm_notification_cycle_unique(conn)
     await conn.exec_driver_sql(
         "CREATE INDEX IF NOT EXISTS ix_mailing_jobs_lease_until ON mailing_jobs (lease_until)"
     )

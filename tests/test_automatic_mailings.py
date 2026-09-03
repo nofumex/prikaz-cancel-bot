@@ -9,9 +9,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import get_settings
+from app.database import _sqlite_upgrade_crm_notification_cycle_unique
 from app.models import (
     Base,
     Case,
@@ -50,6 +52,50 @@ async def _user(session, user_id: int = 1) -> User:
     session.add(user)
     await session.commit()
     return user
+
+
+@pytest.mark.asyncio
+async def test_notification_unique_constraint_migrates_to_deal_type_cycle() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    old_schema = """
+        CREATE TABLE crm_deal_notifications (
+            id INTEGER PRIMARY KEY,
+            amocrm_deal_id BIGINT NOT NULL,
+            notification_type VARCHAR(64) NOT NULL,
+            cycle INTEGER NOT NULL DEFAULT 1,
+            user_id INTEGER NOT NULL,
+            case_id INTEGER NOT NULL,
+            lawyer_name VARCHAR(255) NOT NULL,
+            lawyer_phone VARCHAR(64) NOT NULL,
+            message_text TEXT NOT NULL,
+            status VARCHAR(16) NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            claimed_at DATETIME,
+            lease_until DATETIME,
+            sent_at DATETIME,
+            uncertain_at DATETIME,
+            error_message TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+            UNIQUE (amocrm_deal_id, notification_type)
+        )
+    """
+    insert_sql = """
+        INSERT INTO crm_deal_notifications (
+            id, amocrm_deal_id, notification_type, cycle, user_id, case_id,
+            lawyer_name, lawyer_phone, message_text, status
+        ) VALUES (?, 7000, 'lawyer_call', ?, 1, 1, 'Павел', '+7000', 'text', 'sent')
+    """
+    try:
+        async with engine.begin() as connection:
+            await connection.exec_driver_sql(old_schema)
+            await connection.exec_driver_sql(insert_sql, (1, 1))
+            await _sqlite_upgrade_crm_notification_cycle_unique(connection)
+            await connection.exec_driver_sql(insert_sql, (2, 2))
+        async with engine.begin() as connection:
+            with pytest.raises(IntegrityError):
+                await connection.exec_driver_sql(insert_sql, (3, 2))
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -534,6 +580,8 @@ async def test_amocrm_polling_reenables_and_sales_excludes_without_duplicates(
         state = await mailings.ensure_mailing_started(session, user)
         state.participating = False
         state.consultation_completed = True
+        state.consultation_cycle = 1
+        state.consultation_state = "completed"
         state.next_stage = 2
         case = Case(user_id=user.id, platform="telegram", amocrm_lead_id=777)
         session.add(case)
@@ -596,6 +644,8 @@ async def test_consultation_no_from_sales_sends_and_restores_exact_future_positi
         state.next_stage = 2
         state.participating = False
         state.excluded_sales = True
+        state.consultation_cycle = 1
+        state.consultation_state = "completed"
         first_job = await session.scalar(select(MailingJob).where(MailingJob.stage == 1))
         first_job.status = "sent"
         session.add(
@@ -673,6 +723,225 @@ async def test_consultation_button_path_never_waits_for_amocrm(mailing_db, monke
     send.assert_awaited_once()
 
 
+async def _complete_consultation_click(
+    session, settings, user: User, case: Case, send: AsyncMock
+) -> int:
+    selected_case, ready = await mailings.begin_consultation(
+        session, settings, user, chat_id=str(user.id)
+    )
+    assert selected_case.id == case.id
+    assert ready is True
+    state = await mailings.get_mailing_state(session, user.id)
+    cycle = state.consultation_cycle
+    assert state.consultation_state == "requested"
+    assert await mailings.prepare_consultation(session, settings, user, case)
+    assert await mailings.deliver_pavel_message(
+        session, settings, user, case, send
+    )
+    await session.refresh(state)
+    assert state.consultation_state == "completed"
+    return cycle
+
+
+@pytest.mark.asyncio
+async def test_explicit_click_cycles_resume_stage2_then_stage3(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    crm = SimpleNamespace(
+        get_lead_location=AsyncMock(
+            return_value=(settings.amocrm_pipeline_name, "Консультация-НО")
+        ),
+        get_lead_lawyer=AsyncMock(return_value=("Павел", "+79230165336")),
+    )
+    pavel_send = AsyncMock(return_value=object())
+    missed_call_send = AsyncMock(return_value=True)
+    monkeypatch.setattr(mailings, "record_action", AsyncMock(return_value=True))
+    monkeypatch.setattr(crm_polling, "record_action", AsyncMock(return_value=True))
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+    monkeypatch.setattr(crm_polling, "_send_user_message", missed_call_send)
+
+    async with mailing_db() as session:
+        user = await _user(session)
+        user.phone = "+79990000000"
+        state = await mailings.ensure_mailing_started(session, user)
+        case = Case(user_id=user.id, platform="telegram", amocrm_lead_id=8800)
+        session.add(case)
+        stage1 = await session.scalar(select(MailingJob).where(MailingJob.stage == 1))
+        stage1.status = "sent"
+        state.next_stage = 2
+        session.add(
+            MailingJob(
+                user_id=user.id,
+                stage=2,
+                due_at=datetime.utcnow() + timedelta(days=7),
+                status="pending",
+            )
+        )
+        await session.commit()
+
+        assert await _complete_consultation_click(
+            session, settings, user, case, pavel_send
+        ) == 1
+        await crm_polling._process_consultation_no_lead(
+            session, settings, None, {"id": 8800}
+        )
+        await session.refresh(state)
+        stage2 = await session.scalar(select(MailingJob).where(MailingJob.stage == 2))
+        assert state.consultation_cycle == 1
+        assert state.consultation_state == "ready"
+        assert stage2.status == "pending"
+
+        stage2.status = "sent"
+        state.next_stage = 3
+        session.add(
+            MailingJob(
+                user_id=user.id,
+                stage=3,
+                due_at=datetime.utcnow() + timedelta(days=21),
+                status="pending",
+            )
+        )
+        await session.commit()
+
+        assert await _complete_consultation_click(
+            session, settings, user, case, pavel_send
+        ) == 2
+        await crm_polling._process_consultation_no_lead(
+            session, settings, None, {"id": 8800}
+        )
+        await session.refresh(state)
+        stage3 = await session.scalar(select(MailingJob).where(MailingJob.stage == 3))
+        notifications = list(
+            (
+                await session.scalars(
+                    select(CrmDealNotification)
+                    .where(CrmDealNotification.amocrm_deal_id == 8800)
+                    .order_by(CrmDealNotification.cycle)
+                )
+            ).all()
+        )
+
+    assert state.consultation_cycle == 2
+    assert state.consultation_state == "ready"
+    assert stage3.status == "pending"
+    assert [row.cycle for row in notifications] == [1, 2]
+    assert all(row.status == "sent" for row in notifications)
+    assert pavel_send.await_count == 2
+    assert missed_call_send.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_parallel_consultation_clicks_create_exactly_one_cycle(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    monkeypatch.setattr(mailings, "record_action", AsyncMock(return_value=True))
+    async with mailing_db() as setup:
+        user = await _user(setup)
+        user.phone = "+79990000000"
+        await mailings.ensure_mailing_started(setup, user)
+        case = Case(user_id=user.id, platform="telegram")
+        setup.add(case)
+        await setup.commit()
+        user_id = user.id
+
+    async with mailing_db() as first, mailing_db() as second:
+        first_user = await first.get(User, user_id)
+        second_user = await second.get(User, user_id)
+        results = await asyncio.gather(
+            mailings.begin_consultation(first, settings, first_user, chat_id="1"),
+            mailings.begin_consultation(second, settings, second_user, chat_id="1"),
+        )
+
+    async with mailing_db() as session:
+        state = await session.scalar(select(MailingState))
+    assert sorted(ready for _, ready in results) == [False, True]
+    assert state.consultation_cycle == 1
+    assert state.consultation_state == "requested"
+
+
+@pytest.mark.asyncio
+async def test_disabled_regular_reminders_do_not_block_explicit_consultation_click(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    monkeypatch.setattr(mailings, "record_action", AsyncMock(return_value=True))
+    async with mailing_db() as session:
+        user = await _user(session)
+        user.phone = "+79990000000"
+        state = await mailings.ensure_mailing_started(session, user)
+        state.reminders_disabled = True
+        case = Case(user_id=user.id, platform="telegram")
+        session.add(case)
+        await session.commit()
+
+        selected_case, ready = await mailings.begin_consultation(
+            session, settings, user, chat_id="1"
+        )
+        await session.refresh(state)
+
+    assert selected_case.id == case.id
+    assert ready is True
+    assert state.consultation_cycle == 1
+    assert state.consultation_state == "requested"
+
+
+@pytest.mark.asyncio
+async def test_click_sales_no_keeps_same_cycle_and_one_notification(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    location = ["Отдел продаж", "Новая заявка"]
+    crm = SimpleNamespace(
+        get_lead_location=AsyncMock(side_effect=lambda deal_id: tuple(location)),
+        get_lead_lawyer=AsyncMock(return_value=("Павел", "+79230165336")),
+    )
+    monkeypatch.setattr(mailings, "record_action", AsyncMock(return_value=True))
+    monkeypatch.setattr(crm_polling, "record_action", AsyncMock(return_value=True))
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+    monkeypatch.setattr(crm_polling, "_send_user_message", AsyncMock(return_value=True))
+
+    async with mailing_db() as session:
+        user = await _user(session)
+        user.phone = "+79990000000"
+        state = await mailings.ensure_mailing_started(session, user)
+        case = Case(user_id=user.id, platform="telegram", amocrm_lead_id=8801)
+        session.add(case)
+        await session.commit()
+        assert await _complete_consultation_click(
+            session, settings, user, case, AsyncMock(return_value=object())
+        ) == 1
+
+        await crm_polling._process_sales_lead(session, settings, {"id": 8801})
+        await session.refresh(state)
+        assert state.excluded_sales is True
+        assert state.consultation_cycle == 1
+
+        location[:] = [settings.amocrm_pipeline_name, "Консультация-НО"]
+        await crm_polling._process_consultation_no_lead(
+            session, settings, None, {"id": 8801}
+        )
+        await crm_polling._process_consultation_no_lead(
+            session, settings, None, {"id": 8801}
+        )
+        notifications = list(
+            (
+                await session.scalars(
+                    select(CrmDealNotification).where(
+                        CrmDealNotification.amocrm_deal_id == 8801
+                    )
+                )
+            ).all()
+        )
+        await session.refresh(state)
+
+    assert state.consultation_cycle == 1
+    assert len(notifications) == 1
+    assert notifications[0].cycle == 1
+    assert notifications[0].status == "sent"
+
+
 @pytest.mark.asyncio
 async def test_repeated_no_cycles_get_distinct_pavel_delivery_keys(
     mailing_db, monkeypatch
@@ -740,7 +1009,9 @@ async def test_polling_processes_deals_in_parallel(mailing_db, monkeypatch) -> N
     async with mailing_db() as session:
         for user_id, deal_id in ((1, 1001), (2, 1002)):
             user = await _user(session, user_id)
-            await mailings.ensure_mailing_started(session, user)
+            state = await mailings.ensure_mailing_started(session, user)
+            state.consultation_cycle = 1
+            state.consultation_state = "completed"
             session.add(Case(user_id=user.id, platform="telegram", amocrm_lead_id=deal_id))
         await session.commit()
 
@@ -887,6 +1158,12 @@ async def test_incremental_sales_is_immediate_with_501_local_deals(
 
     async with mailing_db() as session:
         await _add_mailing_deals(session, 501, first_deal_id=target_deal_id)
+        target_state = await session.get(MailingState, 1)
+        target_state.consultation_cycle = 1
+        target_state.consultation_state = "completed"
+        target_state.consultation_completed = True
+        target_state.participating = False
+        await session.commit()
 
     await asyncio.wait_for(crm_polling.poll_crm_mailing_once(settings), timeout=2)
 
@@ -931,6 +1208,12 @@ async def test_incremental_consultation_no_is_immediate_with_501_local_deals(
 
     async with mailing_db() as session:
         await _add_mailing_deals(session, 501, first_deal_id=target_deal_id)
+        target_state = await session.get(MailingState, 1)
+        target_state.consultation_cycle = 1
+        target_state.consultation_state = "completed"
+        target_state.consultation_completed = True
+        target_state.participating = False
+        await session.commit()
 
     await asyncio.wait_for(crm_polling.poll_crm_mailing_once(settings), timeout=2)
 
@@ -961,12 +1244,22 @@ async def test_incremental_overlap_dedupes_same_amocrm_event(
     crm = SimpleNamespace(
         list_lead_status_changes=AsyncMock(return_value=[event]),
         get_lead_location=AsyncMock(
-            return_value=(settings.amocrm_pipeline_name, "Не было коммуникации")
+            return_value=(settings.amocrm_pipeline_name, "Консультация-НО")
         ),
+        get_lead_lawyer=AsyncMock(return_value=("Павел", "+79230165336")),
     )
     monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+    sender = AsyncMock(return_value=True)
+    monkeypatch.setattr(crm_polling, "_send_user_message", sender)
+    monkeypatch.setattr(crm_polling, "record_action", AsyncMock(return_value=True))
     async with mailing_db() as session:
         await _add_mailing_deals(session, 1, first_deal_id=5500)
+        state = await session.get(MailingState, 1)
+        state.consultation_cycle = 1
+        state.consultation_state = "completed"
+        state.consultation_completed = True
+        state.participating = False
+        await session.commit()
 
     await crm_polling.poll_crm_mailing_once(settings)
     await crm_polling.poll_crm_mailing_once(settings)
@@ -974,10 +1267,17 @@ async def test_incremental_overlap_dedupes_same_amocrm_event(
     async with mailing_db() as session:
         changes = list((await session.scalars(select(CrmMailingChange))).all())
         cursor = await session.get(CrmMailingCursor, crm_polling.POLLING_CURSOR_NAME)
+        notifications = list(
+            (await session.scalars(select(CrmDealNotification))).all()
+        )
     assert len(changes) == 1
     assert changes[0].status == "completed"
     assert cursor.cursor_at > 0
-    crm.get_lead_location.assert_awaited_once_with(5500)
+    assert len(notifications) == 1
+    assert notifications[0].cycle == 1
+    assert notifications[0].status == "sent"
+    sender.assert_awaited_once()
+    assert crm.get_lead_location.await_count == 3
     assert crm.list_lead_status_changes.await_count == 2
 
 
@@ -1120,57 +1420,7 @@ async def test_stale_sales_list_cannot_exclude_a_deal_already_moved_to_no(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_notification_is_rearmed_but_uncertain_is_never_resent(
-    mailing_db, monkeypatch
-) -> None:
-    settings = replace(get_settings(), amocrm_enabled=True)
-    crm = SimpleNamespace(
-        get_lead_location=AsyncMock(
-            return_value=(settings.amocrm_pipeline_name, "Консультация-НО")
-        ),
-        get_lead_lawyer=AsyncMock(return_value=("Павел", "+79230165336")),
-    )
-    sender = AsyncMock(return_value=True)
-    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
-    monkeypatch.setattr(crm_polling, "_send_user_message", sender)
-    monkeypatch.setattr(crm_polling, "record_action", AsyncMock(return_value=True))
-
-    async with mailing_db() as session:
-        user = await _user(session)
-        await mailings.ensure_mailing_started(session, user)
-        case = Case(user_id=user.id, platform="telegram", amocrm_lead_id=1004)
-        session.add(case)
-        await session.commit()
-        row, _ = await crm_polling._ensure_notification(
-            session,
-            deal_id=1004,
-            case=case,
-            user=user,
-            lawyer_name="Павел",
-            lawyer_phone="+79230165336",
-        )
-        row.status = "cancelled"
-        await session.commit()
-        await crm_polling._process_consultation_no_lead(session, settings, None, {"id": 1004})
-        await session.refresh(row)
-        assert row.status == "sent"
-        assert row.cycle == 2
-
-        row.status = "uncertain"
-        state = await mailings.get_mailing_state(session, user.id)
-        state.excluded_sales = True
-        state.consultation_no = False
-        await session.commit()
-        await crm_polling._process_consultation_no_lead(session, settings, None, {"id": 1004})
-        await session.refresh(row)
-
-    assert row.status == "uncertain"
-    assert row.cycle == 2
-    assert sender.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_sent_notification_rearms_only_after_sales_not_during_deferred_stage_move(
+async def test_cancelled_or_uncertain_notification_is_never_duplicated_in_same_cycle(
     mailing_db, monkeypatch
 ) -> None:
     settings = replace(get_settings(), amocrm_enabled=True)
@@ -1188,6 +1438,60 @@ async def test_sent_notification_rearms_only_after_sales_not_during_deferred_sta
     async with mailing_db() as session:
         user = await _user(session)
         state = await mailings.ensure_mailing_started(session, user)
+        state.consultation_cycle = 1
+        state.consultation_state = "completed"
+        case = Case(user_id=user.id, platform="telegram", amocrm_lead_id=1004)
+        session.add(case)
+        await session.commit()
+        row, _ = await crm_polling._ensure_notification(
+            session,
+            deal_id=1004,
+            case=case,
+            user=user,
+            lawyer_name="Павел",
+            lawyer_phone="+79230165336",
+            cycle=1,
+        )
+        row.status = "cancelled"
+        await session.commit()
+        await crm_polling._process_consultation_no_lead(session, settings, None, {"id": 1004})
+        await session.refresh(row)
+        assert row.status == "cancelled"
+        assert row.cycle == 1
+
+        row.status = "uncertain"
+        state.excluded_sales = True
+        state.consultation_no = False
+        await session.commit()
+        await crm_polling._process_consultation_no_lead(session, settings, None, {"id": 1004})
+        await session.refresh(row)
+
+    assert row.status == "uncertain"
+    assert row.cycle == 1
+    assert sender.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_sent_notification_is_never_rearmed_from_sales_or_no_flags(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    crm = SimpleNamespace(
+        get_lead_location=AsyncMock(
+            return_value=(settings.amocrm_pipeline_name, "Консультация-НО")
+        ),
+        get_lead_lawyer=AsyncMock(return_value=("Павел", "+79230165336")),
+    )
+    sender = AsyncMock(return_value=True)
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+    monkeypatch.setattr(crm_polling, "_send_user_message", sender)
+    monkeypatch.setattr(crm_polling, "record_action", AsyncMock(return_value=True))
+
+    async with mailing_db() as session:
+        user = await _user(session)
+        state = await mailings.ensure_mailing_started(session, user)
+        state.consultation_cycle = 1
+        state.consultation_state = "completed"
         case = Case(user_id=user.id, platform="telegram", amocrm_lead_id=1005)
         session.add(case)
         await session.commit()
@@ -1198,6 +1502,7 @@ async def test_sent_notification_rearms_only_after_sales_not_during_deferred_sta
             user=user,
             lawyer_name="Павел",
             lawyer_phone="+79230165336",
+            cycle=1,
         )
         row.status = "sent"
         row.sent_at = datetime.utcnow()
@@ -1228,6 +1533,8 @@ async def test_uncertain_delivery_resolved_in_sales_does_not_resume_campaign(
     async with mailing_db() as session:
         user = await _user(session)
         state = await mailings.ensure_mailing_started(session, user)
+        state.consultation_cycle = 1
+        state.consultation_state = "completed"
         case = Case(user_id=user.id, platform="telegram", amocrm_lead_id=1006)
         session.add(case)
         await session.commit()
@@ -1238,6 +1545,7 @@ async def test_uncertain_delivery_resolved_in_sales_does_not_resume_campaign(
             user=user,
             lawyer_name="Павел",
             lawyer_phone="+79230165336",
+            cycle=1,
         )
         row.status = "uncertain"
         row.claimed_at = datetime.utcnow()
@@ -1255,6 +1563,7 @@ async def test_uncertain_delivery_resolved_in_sales_does_not_resume_campaign(
 
     assert state.participating is False
     assert state.excluded_sales is True
+    assert state.consultation_state == "ready"
     assert job.status == "cancelled"
 
 
@@ -1413,6 +1722,7 @@ async def test_two_pollers_cannot_send_same_deal_notification(mailing_db, monkey
             user=user,
             lawyer_name="Анна",
             lawyer_phone="+79990000000",
+            cycle=1,
         )
         notification_id = row.id
 
@@ -1456,6 +1766,7 @@ async def test_notification_pre_send_timeout_returns_to_pending(
             user=user,
             lawyer_name="Анна",
             lawyer_phone="+79990000000",
+            cycle=1,
         )
 
         assert await crm_polling._deliver_notification(session, settings, None, row.id) is False
@@ -1495,6 +1806,7 @@ async def test_notification_post_send_timeout_becomes_uncertain(
             user=user,
             lawyer_name="Анна",
             lawyer_phone="+79990000000",
+            cycle=1,
         )
 
         assert await crm_polling._deliver_notification(session, settings, None, row.id) is False
@@ -1522,6 +1834,7 @@ async def test_expired_polling_delivery_lease_is_not_assumed_sent(mailing_db) ->
             user=user,
             lawyer_name="Анна",
             lawyer_phone="+79990000000",
+            cycle=1,
         )
         row.status = "sending"
         row.lease_until = datetime.utcnow() - timedelta(seconds=1)

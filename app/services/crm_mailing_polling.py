@@ -123,45 +123,16 @@ async def _ensure_notification(
     user: User,
     lawyer_name: str,
     lawyer_phone: str,
-    new_cycle: bool = False,
+    cycle: int,
 ) -> tuple[CrmDealNotification, bool]:
     existing = await session.scalar(
         select(CrmDealNotification).where(
             CrmDealNotification.amocrm_deal_id == deal_id,
             CrmDealNotification.notification_type == LAWYER_CALL,
+            CrmDealNotification.cycle == cycle,
         )
     )
     if existing is not None:
-        should_rearm = existing.status == "cancelled" or (
-            new_cycle and existing.status == "sent"
-        )
-        if should_rearm:
-            next_message = (
-                f"Вам звонил юрисконсульт {h(lawyer_name)} с номера {h(lawyer_phone)}. "
-                "Перезвоните ему."
-            )
-            rearmed = await session.execute(
-                update(CrmDealNotification)
-                .where(
-                    CrmDealNotification.id == existing.id,
-                    CrmDealNotification.status == existing.status,
-                )
-                .values(
-                    cycle=CrmDealNotification.cycle + 1,
-                    lawyer_name=lawyer_name,
-                    lawyer_phone=lawyer_phone,
-                    message_text=next_message,
-                    status="pending",
-                    claimed_at=None,
-                    lease_until=None,
-                    sent_at=None,
-                    uncertain_at=None,
-                    error_message=None,
-                )
-            )
-            await session.commit()
-            await session.refresh(existing)
-            return existing, bool(rearmed.rowcount)
         return existing, False
     message = (
         f"Вам звонил юрисконсульт {h(lawyer_name)} с номера {h(lawyer_phone)}. "
@@ -170,7 +141,7 @@ async def _ensure_notification(
     row = CrmDealNotification(
         amocrm_deal_id=deal_id,
         notification_type=LAWYER_CALL,
-        cycle=1,
+        cycle=cycle,
         user_id=user.id,
         case_id=case.id,
         lawyer_name=lawyer_name,
@@ -188,6 +159,7 @@ async def _ensure_notification(
             select(CrmDealNotification).where(
                 CrmDealNotification.amocrm_deal_id == deal_id,
                 CrmDealNotification.notification_type == LAWYER_CALL,
+                CrmDealNotification.cycle == cycle,
             )
         )
         if row is None:
@@ -325,11 +297,14 @@ async def _mark_notification_sent(
     row.sent_at = sent_at
     row.lease_until = None
     row.error_message = None
+    # A confirmed delivery completes this explicit consultation cycle even if
+    # amoCRM moved the deal while the Bot API call was in flight. Only campaign
+    # resumption and Sales flags remain conditional on the confirmed location.
+    state.consultation_state = "ready"
     if resume_campaign:
         state.participating = not state.reminders_disabled
         state.consultation_completed = False
         state.consultation_no = True
-        state.consultation_cycle = row.cycle
         state.excluded_sales = False
         if state.participating:
             await _resume_saved_mailing_position(session, state, sent_at)
@@ -452,6 +427,10 @@ async def _process_consultation_no_lead(
     )
     if not _is_consultation_no_location(settings, pipeline_name, status_name):
         return
+    cycle = int(state.consultation_cycle)
+    if cycle <= 0:
+        # NO without a user-created consultation cycle is not a notification trigger.
+        return
     get_lead_details = getattr(crm, "get_lead_details", None)
     if callable(get_lead_details):
         lead = await _crm_call(settings, get_lead_details(deal_id))
@@ -463,10 +442,7 @@ async def _process_consultation_no_lead(
         user=user,
         lawyer_name=lawyer_name,
         lawyer_phone=lawyer_phone,
-        # A sent notification starts a new cycle only after a confirmed sales
-        # exclusion. consultation_no=False alone is insufficient: the fast
-        # consultation callback changes it before its background CRM stage move.
-        new_cycle=state.excluded_sales,
+        cycle=cycle,
     )
     if created:
         await record_action(

@@ -236,6 +236,9 @@ class MailingState(Base):
     awaiting_phone: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     consultation_no: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     consultation_cycle: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    consultation_state: Mapped[str] = mapped_column(
+        String(24), default="ready", nullable=False, index=True
+    )
     excluded_sales: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     next_stage: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     last_sent_stage: Mapped[int | None] = mapped_column(Integer)
@@ -312,7 +315,12 @@ class CrmDealNotification(Base):
 
     __tablename__ = "crm_deal_notifications"
     __table_args__ = (
-        UniqueConstraint("amocrm_deal_id", "notification_type", name="uq_crm_deal_notification"),
+        UniqueConstraint(
+            "amocrm_deal_id",
+            "notification_type",
+            "cycle",
+            name="uq_crm_deal_notification_cycle",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
