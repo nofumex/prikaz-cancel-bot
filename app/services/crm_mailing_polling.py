@@ -204,54 +204,93 @@ async def _deliver_notification(
     await session.commit()
     if not claim.rowcount:
         return False
-    row = await session.get(CrmDealNotification, notification_id)
-    case = await session.get(Case, row.case_id)
-    user = await session.get(User, row.user_id)
-    state = await get_mailing_state(session, row.user_id)
-    if case is None or user is None or state is None:
-        raise RuntimeError(f"CRM notification target missing id={notification_id}")
-    await session.refresh(state)
-    if state.reminders_disabled:
-        row.status = "cancelled"
-        row.lease_until = None
+    async def release(status: str, error: str) -> None:
+        # Recover a session whose transaction may have failed while finalizing
+        # the delivery, then update only a still-claimed notification.
+        await session.rollback()
+        values = {
+            "status": status,
+            "lease_until": None,
+            "error_message": error[:2000],
+        }
+        if status == "pending":
+            values.update(claimed_at=None, uncertain_at=None)
+        else:
+            values.update(uncertain_at=datetime.utcnow())
+        await session.execute(
+            update(CrmDealNotification)
+            .where(
+                CrmDealNotification.id == notification_id,
+                CrmDealNotification.status == "sending",
+            )
+            .values(**values)
+        )
         await session.commit()
+
+    try:
+        row = await session.get(CrmDealNotification, notification_id)
+        if row is None:
+            raise RuntimeError(f"CRM notification missing id={notification_id}")
+        case = await session.get(Case, row.case_id)
+        user = await session.get(User, row.user_id)
+        state = await get_mailing_state(session, row.user_id)
+        if case is None or user is None or state is None:
+            raise RuntimeError(f"CRM notification target missing id={notification_id}")
+        await session.refresh(state)
+        if state.reminders_disabled:
+            row.status = "cancelled"
+            row.lease_until = None
+            await session.commit()
+            return False
+
+        crm = get_amocrm_service(settings)
+        pipeline_name, status_name = await _crm_call(
+            settings, crm.get_lead_location(row.amocrm_deal_id)
+        )
+        if not _is_consultation_no_location(settings, pipeline_name, status_name):
+            row.status = "cancelled"
+            row.lease_until = None
+            await session.commit()
+            return False
+    except asyncio.CancelledError:
+        await release("pending", "delivery cancelled before Bot API call")
+        raise
+    except Exception as exc:
+        await release("pending", f"pre-delivery check failed: {exc}")
+        logger.exception("CRM notification pre-delivery check failed id=%s", notification_id)
         return False
 
-    crm = get_amocrm_service(settings)
-    pipeline_name, status_name = await _crm_call(
-        settings, crm.get_lead_location(row.amocrm_deal_id)
-    )
-    if not _is_consultation_no_location(settings, pipeline_name, status_name):
-        row.status = "cancelled"
-        row.lease_until = None
-        await session.commit()
-        return False
+    try:
+        sent = await _send_user_message(settings, bot, user, row.message_text)
+        if not sent:
+            await release("uncertain", "delivery outcome was not confirmed")
+            return False
 
-    sent = await _send_user_message(settings, bot, user, row.message_text)
-    if not sent:
-        row.status = "uncertain"
-        row.uncertain_at = datetime.utcnow()
-        row.lease_until = None
-        row.error_message = "delivery outcome was not confirmed"
-        await session.commit()
+        # The deal may move while the Bot API request is in flight. The one-off
+        # message remains delivered, but the regular campaign is resumed only if
+        # amoCRM still confirms Consultation-NO.
+        pipeline_name, status_name = await _crm_call(
+            settings, crm.get_lead_location(row.amocrm_deal_id)
+        )
+        await _mark_notification_sent(
+            session,
+            settings,
+            row,
+            case,
+            user,
+            state,
+            datetime.utcnow(),
+            resume_campaign=_is_consultation_no_location(
+                settings, pipeline_name, status_name
+            ),
+        )
+    except asyncio.CancelledError:
+        await release("uncertain", "delivery interrupted during or after Bot API call")
+        raise
+    except Exception as exc:
+        await release("uncertain", f"delivery outcome requires reconciliation: {exc}")
+        logger.exception("CRM notification delivery became uncertain id=%s", notification_id)
         return False
-
-    # The deal may move while the Bot API request is in flight. The one-off
-    # message remains delivered, but the regular campaign is resumed only if
-    # amoCRM still confirms Consultation-NO.
-    pipeline_name, status_name = await _crm_call(
-        settings, crm.get_lead_location(row.amocrm_deal_id)
-    )
-    await _mark_notification_sent(
-        session,
-        settings,
-        row,
-        case,
-        user,
-        state,
-        datetime.utcnow(),
-        resume_campaign=_is_consultation_no_location(settings, pipeline_name, status_name),
-    )
     return True
 
 
@@ -442,7 +481,9 @@ async def _process_sales_lead(
     case, user, state = await _local_deal(session, deal_id)
     if case is None or user is None or state is None:
         return
-    pipeline_name, _ = known_location or await _crm_call(
+    # The discovery result may already be stale. Confirm Sales immediately
+    # before mutating the mailing state.
+    pipeline_name, _ = await _crm_call(
         settings, get_amocrm_service(settings).get_lead_location(deal_id)
     )
     if pipeline_name != "Отдел продаж":

@@ -836,11 +836,10 @@ async def test_stale_sales_list_cannot_exclude_a_deal_already_moved_to_no(
 ) -> None:
     settings = replace(get_settings(), amocrm_enabled=True)
     crm = SimpleNamespace(
-        list_leads_in_status=AsyncMock(return_value=[]),
-        list_leads_in_pipeline=AsyncMock(return_value=[{"id": 1003}]),
-        get_lead_location=AsyncMock(
-            return_value=(settings.amocrm_pipeline_name, "Консультация-НО")
-        ),
+        get_lead_location=AsyncMock(side_effect=[
+            ("Отдел продаж", "Новая заявка"),
+            (settings.amocrm_pipeline_name, "Консультация-НО"),
+        ]),
     )
     monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
     monkeypatch.setattr(mailings, "record_action", AsyncMock(return_value=True))
@@ -859,6 +858,7 @@ async def test_stale_sales_list_cannot_exclude_a_deal_already_moved_to_no(
     assert state.excluded_sales is False
     assert state.participating is True
     assert job.status == "pending"
+    assert crm.get_lead_location.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -1173,6 +1173,80 @@ async def test_two_pollers_cannot_send_same_deal_notification(mailing_db, monkey
         row = await session.get(CrmDealNotification, notification_id)
     assert row.status == "sent"
     assert row.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_notification_pre_send_timeout_returns_to_pending(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    crm = SimpleNamespace(get_lead_location=AsyncMock(side_effect=TimeoutError("amo timeout")))
+    sender = AsyncMock(return_value=True)
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+    monkeypatch.setattr(crm_polling, "_send_user_message", sender)
+
+    async with mailing_db() as session:
+        user = await _user(session)
+        await mailings.ensure_mailing_started(session, user)
+        case = Case(user_id=user.id, platform="telegram", amocrm_lead_id=910)
+        session.add(case)
+        await session.commit()
+        row, _ = await crm_polling._ensure_notification(
+            session,
+            deal_id=910,
+            case=case,
+            user=user,
+            lawyer_name="Анна",
+            lawyer_phone="+79990000000",
+        )
+
+        assert await crm_polling._deliver_notification(session, settings, None, row.id) is False
+        await session.refresh(row)
+
+    assert row.status == "pending"
+    assert row.claimed_at is None
+    assert row.lease_until is None
+    assert row.uncertain_at is None
+    assert "pre-delivery check failed" in row.error_message
+    sender.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_notification_post_send_timeout_becomes_uncertain(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    crm = SimpleNamespace(get_lead_location=AsyncMock(side_effect=[
+        (settings.amocrm_pipeline_name, "Консультация-НО"),
+        TimeoutError("amo timeout after send"),
+    ]))
+    sender = AsyncMock(return_value=True)
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+    monkeypatch.setattr(crm_polling, "_send_user_message", sender)
+
+    async with mailing_db() as session:
+        user = await _user(session)
+        await mailings.ensure_mailing_started(session, user)
+        case = Case(user_id=user.id, platform="telegram", amocrm_lead_id=911)
+        session.add(case)
+        await session.commit()
+        row, _ = await crm_polling._ensure_notification(
+            session,
+            deal_id=911,
+            case=case,
+            user=user,
+            lawyer_name="Анна",
+            lawyer_phone="+79990000000",
+        )
+
+        assert await crm_polling._deliver_notification(session, settings, None, row.id) is False
+        await session.refresh(row)
+
+    assert row.status == "uncertain"
+    assert row.lease_until is None
+    assert row.uncertain_at is not None
+    assert "requires reconciliation" in row.error_message
+    sender.assert_awaited_once()
 
 
 @pytest.mark.asyncio
