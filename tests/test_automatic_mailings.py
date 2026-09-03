@@ -750,6 +750,87 @@ async def test_polling_processes_deals_in_parallel(mailing_db, monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_polling_uses_only_local_deals_and_never_lists_pipelines(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    crm = SimpleNamespace(
+        list_leads_in_status=AsyncMock(side_effect=AssertionError("pipeline scan")),
+        list_leads_in_pipeline=AsyncMock(side_effect=AssertionError("pipeline scan")),
+        get_lead_location=AsyncMock(return_value=("Судебный приказ", "Не было коммуникации")),
+    )
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+
+    async with mailing_db() as session:
+        user = await _user(session)
+        await mailings.ensure_mailing_started(session, user)
+        session.add(Case(user_id=user.id, platform="telegram", amocrm_lead_id=2001))
+        await session.commit()
+
+    await crm_polling.poll_crm_mailing_once(settings)
+
+    crm.list_leads_in_status.assert_not_awaited()
+    crm.list_leads_in_pipeline.assert_not_awaited()
+    crm.get_lead_location.assert_awaited_once_with(2001)
+
+
+@pytest.mark.asyncio
+async def test_polling_timeout_isolated_to_one_local_deal(mailing_db, monkeypatch) -> None:
+    settings = replace(
+        get_settings(), amocrm_enabled=True, crm_sync_timeout_seconds=1
+    )
+    slow_started = asyncio.Event()
+    fast_checked = asyncio.Event()
+
+    async def location(deal_id: int):
+        if deal_id == 2002:
+            slow_started.set()
+            await asyncio.Event().wait()
+        fast_checked.set()
+        return "Судебный приказ", "Не было коммуникации"
+
+    crm = SimpleNamespace(get_lead_location=AsyncMock(side_effect=location))
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+
+    async with mailing_db() as session:
+        for user_id, deal_id in ((1, 2002), (2, 2003)):
+            user = await _user(session, user_id)
+            await mailings.ensure_mailing_started(session, user)
+            session.add(Case(user_id=user.id, platform="telegram", amocrm_lead_id=deal_id))
+        await session.commit()
+
+    polling = asyncio.create_task(crm_polling.poll_crm_mailing_once(settings))
+    await asyncio.wait_for(slow_started.wait(), timeout=0.5)
+    await asyncio.wait_for(fast_checked.wait(), timeout=0.5)
+    await asyncio.wait_for(polling, timeout=1.5)
+
+
+@pytest.mark.asyncio
+async def test_polling_prefers_current_case_over_historical_deals(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    crm = SimpleNamespace(
+        get_lead_location=AsyncMock(return_value=("Судебный приказ", "Не было коммуникации"))
+    )
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+
+    async with mailing_db() as session:
+        user = await _user(session)
+        await mailings.ensure_mailing_started(session, user)
+        current = Case(user_id=user.id, platform="telegram", amocrm_lead_id=2004)
+        newer_historical = Case(user_id=user.id, platform="telegram", amocrm_lead_id=2005)
+        session.add_all([current, newer_historical])
+        await session.flush()
+        user.amocrm_current_case_id = current.id
+        await session.commit()
+
+    await crm_polling.poll_crm_mailing_once(settings)
+
+    crm.get_lead_location.assert_awaited_once_with(2004)
+
+
+@pytest.mark.asyncio
 async def test_stale_sales_list_cannot_exclude_a_deal_already_moved_to_no(
     mailing_db, monkeypatch
 ) -> None:

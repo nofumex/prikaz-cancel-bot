@@ -29,10 +29,61 @@ POLL_INTERVAL_SECONDS = 5
 DELIVERY_LEASE = timedelta(minutes=5)
 NO_STATUS_NAMES = ("Консультация-НО", "Консультация - НО")
 POLLING_CONCURRENCY = 8
+POLLING_CRM_TIMEOUT_SECONDS = 5
 
 
 def _is_consultation_no_location(settings, pipeline_name: str | None, status_name: str | None) -> bool:
     return pipeline_name == settings.amocrm_pipeline_name and status_name in NO_STATUS_NAMES
+
+
+async def _crm_call(settings, awaitable):
+    """Bound one amoCRM operation so a single lead cannot stall a poll cycle."""
+    timeout = max(
+        1,
+        int(getattr(settings, "crm_sync_timeout_seconds", POLLING_CRM_TIMEOUT_SECONDS)),
+    )
+    return await asyncio.wait_for(awaitable, timeout=timeout)
+
+
+async def _local_polling_deal_ids(session: AsyncSession) -> list[int]:
+    """Return one current local CRM deal for every active mailing lifecycle."""
+    rows = (
+        await session.execute(
+            select(
+                User.id,
+                User.amocrm_current_case_id,
+                Case.id,
+                Case.amocrm_lead_id,
+                Case.amo_lead_id,
+            )
+            .join(MailingState, MailingState.user_id == User.id)
+            .join(Case, Case.user_id == User.id)
+            .where(
+                MailingState.reminders_disabled.is_(False),
+                or_(
+                    MailingState.participating.is_(True),
+                    MailingState.consultation_completed.is_(True),
+                    MailingState.consultation_no.is_(True),
+                    MailingState.excluded_sales.is_(True),
+                ),
+                or_(
+                    Case.amocrm_lead_id.is_not(None),
+                    Case.amo_lead_id.is_not(None),
+                ),
+            )
+            .order_by(User.id, Case.id.desc())
+        )
+    ).all()
+    by_user: dict[int, tuple[int, int]] = {}
+    for user_id, current_case_id, case_id, amocrm_lead_id, amo_lead_id in rows:
+        deal_id = amocrm_lead_id or amo_lead_id
+        if not deal_id:
+            continue
+        selected = by_user.get(int(user_id))
+        is_current = current_case_id is not None and int(case_id) == int(current_case_id)
+        if selected is None or is_current:
+            by_user[int(user_id)] = (int(case_id), int(deal_id))
+    return sorted({deal_id for _, deal_id in by_user.values()})
 
 
 async def _local_deal(
@@ -167,7 +218,9 @@ async def _deliver_notification(
         return False
 
     crm = get_amocrm_service(settings)
-    pipeline_name, status_name = await crm.get_lead_location(row.amocrm_deal_id)
+    pipeline_name, status_name = await _crm_call(
+        settings, crm.get_lead_location(row.amocrm_deal_id)
+    )
     if not _is_consultation_no_location(settings, pipeline_name, status_name):
         row.status = "cancelled"
         row.lease_until = None
@@ -186,7 +239,9 @@ async def _deliver_notification(
     # The deal may move while the Bot API request is in flight. The one-off
     # message remains delivered, but the regular campaign is resumed only if
     # amoCRM still confirms Consultation-NO.
-    pipeline_name, status_name = await crm.get_lead_location(row.amocrm_deal_id)
+    pipeline_name, status_name = await _crm_call(
+        settings, crm.get_lead_location(row.amocrm_deal_id)
+    )
     await _mark_notification_sent(
         session,
         settings,
@@ -285,8 +340,9 @@ async def resolve_uncertain_notification(
     state = await get_mailing_state(session, row.user_id)
     if case is None or user is None or state is None:
         raise RuntimeError(f"CRM notification target missing id={notification_id}")
-    pipeline_name, status_name = await get_amocrm_service(settings).get_lead_location(
-        row.amocrm_deal_id
+    pipeline_name, status_name = await _crm_call(
+        settings,
+        get_amocrm_service(settings).get_lead_location(row.amocrm_deal_id),
     )
     await _mark_notification_sent(
         session,
@@ -323,7 +379,12 @@ async def recover_notification_leases(session: AsyncSession) -> None:
 
 
 async def _process_consultation_no_lead(
-    session: AsyncSession, settings, bot: Bot | None, lead: dict
+    session: AsyncSession,
+    settings,
+    bot: Bot | None,
+    lead: dict,
+    *,
+    known_location: tuple[str | None, str | None] | None = None,
 ) -> None:
     deal_id = int(lead["id"])
     case, user, state = await _local_deal(session, deal_id)
@@ -332,10 +393,15 @@ async def _process_consultation_no_lead(
     if state.reminders_disabled:
         return
     crm = get_amocrm_service(settings)
-    pipeline_name, status_name = await crm.get_lead_location(deal_id)
+    pipeline_name, status_name = known_location or await _crm_call(
+        settings, crm.get_lead_location(deal_id)
+    )
     if not _is_consultation_no_location(settings, pipeline_name, status_name):
         return
-    lawyer_name, lawyer_phone = await crm.get_lead_lawyer(lead)
+    get_lead_details = getattr(crm, "get_lead_details", None)
+    if callable(get_lead_details):
+        lead = await _crm_call(settings, get_lead_details(deal_id))
+    lawyer_name, lawyer_phone = await _crm_call(settings, crm.get_lead_lawyer(lead))
     row, created = await _ensure_notification(
         session,
         deal_id=deal_id,
@@ -365,12 +431,20 @@ async def _process_consultation_no_lead(
     await _deliver_notification(session, settings, bot, row.id)
 
 
-async def _process_sales_lead(session: AsyncSession, settings, lead: dict) -> None:
+async def _process_sales_lead(
+    session: AsyncSession,
+    settings,
+    lead: dict,
+    *,
+    known_location: tuple[str | None, str | None] | None = None,
+) -> None:
     deal_id = int(lead["id"])
     case, user, state = await _local_deal(session, deal_id)
     if case is None or user is None or state is None:
         return
-    pipeline_name, _ = await get_amocrm_service(settings).get_lead_location(deal_id)
+    pipeline_name, _ = known_location or await _crm_call(
+        settings, get_amocrm_service(settings).get_lead_location(deal_id)
+    )
     if pipeline_name != "Отдел продаж":
         return
     await exclude_user_for_sales(session, settings, user, case, state, deal_id)
@@ -387,39 +461,49 @@ async def _process_sales_lead(session: AsyncSession, settings, lead: dict) -> No
 
 async def poll_crm_mailing_once(settings, bot: Bot | None = None) -> None:
     crm = get_amocrm_service(settings)
-    no_leads, sales_leads = await asyncio.gather(
-        crm.list_leads_in_status(settings.amocrm_pipeline_name, NO_STATUS_NAMES),
-        crm.list_leads_in_pipeline("Отдел продаж"),
-    )
-
     async with SessionLocal() as session:
         await recover_notification_leases(session)
+        deal_ids = await _local_polling_deal_ids(session)
 
     semaphore = asyncio.Semaphore(POLLING_CONCURRENCY)
 
-    async def process_lead(kind: str, lead: dict) -> None:
+    async def process_deal(deal_id: int) -> None:
         async with semaphore:
             try:
+                location = await _crm_call(settings, crm.get_lead_location(deal_id))
+                pipeline_name, status_name = location
                 async with SessionLocal() as session:
-                    if kind == "consultation_no":
-                        await _process_consultation_no_lead(session, settings, bot, lead)
-                    else:
-                        await _process_sales_lead(session, settings, lead)
+                    lead = {"id": deal_id}
+                    if pipeline_name == "Отдел продаж":
+                        await _process_sales_lead(
+                            session, settings, lead, known_location=location
+                        )
+                    elif _is_consultation_no_location(
+                        settings, pipeline_name, status_name
+                    ):
+                        await _process_consultation_no_lead(
+                            session,
+                            settings,
+                            bot,
+                            lead,
+                            known_location=location,
+                        )
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "amoCRM mailing deal timed out deal_id=%s",
+                    deal_id,
+                )
             except Exception:
                 logger.exception(
-                    "amoCRM mailing lead processing failed kind=%s deal_id=%s",
-                    kind,
-                    lead.get("id"),
+                    "amoCRM mailing deal processing failed deal_id=%s",
+                    deal_id,
                 )
 
-    # Every deal owns an independent session. One slow lead no longer blocks
-    # other client notifications or sales exclusions in the same poll cycle.
-    await asyncio.gather(
-        *(process_lead("consultation_no", lead) for lead in no_leads),
-        *(process_lead("sales", lead) for lead in sales_leads),
-    )
+    # Every deal owns an independent session. Discovery is strictly local;
+    # amoCRM is queried only for the exact deal ids already known by the bot.
+    await asyncio.gather(*(process_deal(deal_id) for deal_id in deal_ids))
 
 
 async def run_crm_mailing_polling(settings, bot: Bot | None = None) -> None:

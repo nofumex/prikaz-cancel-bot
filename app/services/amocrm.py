@@ -739,6 +739,13 @@ class AmoCrmService:
                 break
         return str(pipeline.get("name") or "") or None, status_name
 
+    async def get_lead_details(self, lead_id: int) -> dict[str, Any]:
+        """Fetch one exact lead for event-specific data without scanning a pipeline."""
+        lead, error = await self.request("GET", f"/leads/{int(lead_id)}")
+        if error or not isinstance(lead, dict):
+            raise RuntimeError(error or f"amoCRM lead {lead_id} was not returned")
+        return lead
+
     async def add_lead_note(
         self, case: Case, text: str, *, verify_after_uncertain: bool = False
     ) -> bool:
