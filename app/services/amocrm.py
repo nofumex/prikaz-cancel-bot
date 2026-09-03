@@ -728,7 +728,9 @@ class AmoCrmService:
                 break
         return str(pipeline.get("name") or "") or None, status_name
 
-    async def add_lead_note(self, case: Case, text: str) -> bool:
+    async def add_lead_note(
+        self, case: Case, text: str, *, verify_after_uncertain: bool = False
+    ) -> bool:
         lead_id = case.amocrm_lead_id or case.amo_lead_id
         _LAST_NOTE_ERROR.set(None)
         if not lead_id:
@@ -738,12 +740,12 @@ class AmoCrmService:
             "POST",
             f"/leads/{int(lead_id)}/notes",
             json_body=[{"entity_id": int(lead_id), "note_type": "common", "params": {"text": text[:65000]}}],
-            retries=1 if "[mailing:" in text else 3,
+            retries=1 if verify_after_uncertain else 3,
         )
         if error:
             _LAST_NOTE_ERROR.set(error)
             logger.error("amoCRM note creation failed lead_id=%s error=%s", lead_id, error)
-            if "[mailing:" in text and not str(error).lstrip().startswith("HTTP 4"):
+            if verify_after_uncertain and not str(error).lstrip().startswith("HTTP 4"):
                 raise AmoNoteVerificationPending(
                     f"amoCRM note POST outcome is uncertain on lead {lead_id}: {error}"
                 )
@@ -766,6 +768,28 @@ class AmoCrmService:
                 params = item.get("params") if isinstance(item, dict) else None
                 text = params.get("text") if isinstance(params, dict) else None
                 if marker in str(text or ""):
+                    return True
+            if len(notes) < 250:
+                return False
+        return False
+
+    async def lead_note_has_text(self, lead_id: int, expected_text: str) -> bool:
+        """Check for an exact, human-readable note without exposing a technical marker."""
+        for page in range(1, 11):
+            data, error = await self.request(
+                "GET",
+                f"/leads/{int(lead_id)}/notes",
+                params={"filter[note_type]": "common", "limit": 250, "page": page},
+            )
+            if error:
+                raise RuntimeError(f"amoCRM note verification failed: {error}")
+            if not isinstance(data, dict):
+                raise RuntimeError("amoCRM returned an invalid notes list")
+            notes = data.get("_embedded", {}).get("notes", [])
+            for item in notes:
+                params = item.get("params") if isinstance(item, dict) else None
+                text = params.get("text") if isinstance(params, dict) else None
+                if str(text or "").strip() == expected_text.strip():
                     return True
             if len(notes) < 250:
                 return False
@@ -1179,8 +1203,11 @@ class AmoCrmService:
                 response_payload["status_name"] = status_name
                 response_payload["status_id"] = case.amocrm_status_id
 
-            note_parts = [f"Событие: {event_type}"]
-            if new_cycle:
+            # Mailing notes are operator-facing. Internal event names and
+            # idempotency keys stay in our database/logs, never in the CRM UI.
+            is_mailing_event = event_type.startswith("mailing_")
+            note_parts = [] if is_mailing_event else [f"Событие: {event_type}"]
+            if new_cycle and not is_mailing_event:
                 if current_case_id:
                     note_parts.append(f"Новая заявка #{case.id} начата")
                 else:
@@ -1210,26 +1237,29 @@ class AmoCrmService:
             if attached_files:
                 response_payload["attached_files"] = attached_files
 
-            marker = str(payload.get("mailing_marker") or "").strip()
             note_text = "\n".join(note_parts)
-            if marker:
-                note_text = f"{note_text}\n{marker}"
+            human_note = str(payload.get("note") or "").strip() if is_mailing_event else ""
             _LAST_NOTE_ERROR.set(None)
             note_added = bool(
-                marker
+                human_note
                 and current_lead_id
-                and await self.lead_note_has_marker(int(current_lead_id), marker)
+                and await self.lead_note_has_text(int(current_lead_id), human_note)
             )
             if not note_added:
-                note_added = await self.add_lead_note(case, note_text)
+                if human_note:
+                    note_added = await self.add_lead_note(
+                        case, note_text, verify_after_uncertain=True
+                    )
+                else:
+                    note_added = await self.add_lead_note(case, note_text)
             if not note_added:
                 lead_id = case.amocrm_lead_id or case.amo_lead_id
                 note_error = _LAST_NOTE_ERROR.get()
                 detail = f": {note_error}" if note_error else ""
                 raise RuntimeError(f"amoCRM did not add note to lead {lead_id}{detail}")
-            if marker and current_lead_id and not await self.lead_note_has_marker(int(current_lead_id), marker):
+            if human_note and current_lead_id and not await self.lead_note_has_text(int(current_lead_id), human_note):
                 raise AmoNoteVerificationPending(
-                    f"amoCRM note marker is awaiting visibility on lead {current_lead_id}"
+                    f"amoCRM note is awaiting visibility on lead {current_lead_id}"
                 )
 
             if session:

@@ -25,7 +25,7 @@ from app.utils import h
 logger = logging.getLogger(__name__)
 
 LAWYER_CALL = "lawyer_call"
-POLL_INTERVAL_SECONDS = 60
+POLL_INTERVAL_SECONDS = 5
 DELIVERY_LEASE = timedelta(minutes=5)
 NO_STATUS_NAMES = ("Консультация-НО", "Консультация - НО")
 
@@ -52,6 +52,7 @@ async def _ensure_notification(
     user: User,
     lawyer_name: str,
     lawyer_phone: str,
+    new_cycle: bool = False,
 ) -> tuple[CrmDealNotification, bool]:
     existing = await session.scalar(
         select(CrmDealNotification).where(
@@ -60,6 +61,21 @@ async def _ensure_notification(
         )
     )
     if existing is not None:
+        if new_cycle and existing.status == "sent":
+            existing.lawyer_name = lawyer_name
+            existing.lawyer_phone = lawyer_phone
+            existing.message_text = (
+                f"Вам звонил юрисконсульт {h(lawyer_name)} с номера {h(lawyer_phone)}. "
+                "Перезвоните ему."
+            )
+            existing.status = "pending"
+            existing.claimed_at = None
+            existing.lease_until = None
+            existing.sent_at = None
+            existing.uncertain_at = None
+            existing.error_message = None
+            await session.commit()
+            return existing, True
         return existing, False
     message = (
         f"Вам звонил юрисконсульт {h(lawyer_name)} с номера {h(lawyer_phone)}. "
@@ -122,7 +138,7 @@ async def _deliver_notification(
     state = await get_mailing_state(session, row.user_id)
     if case is None or user is None or state is None:
         raise RuntimeError(f"CRM notification target missing id={notification_id}")
-    if state.reminders_disabled or state.excluded_sales:
+    if state.reminders_disabled:
         row.status = "cancelled"
         row.lease_until = None
         await session.commit()
@@ -169,17 +185,45 @@ async def _mark_notification_sent(
     state.consultation_no = True
     state.excluded_sales = False
     if state.participating:
-        await _schedule_job(session, state, state.next_stage, due_for_stage(state.next_stage, sent_at))
+        await _resume_saved_mailing_position(session, state, sent_at)
     await session.commit()
     await record_action(
         session,
         settings,
         user,
         case,
-        f"poll-lawyer-call-sent:{row.amocrm_deal_id}",
+        f"poll-lawyer-call-sent:{row.amocrm_deal_id}:attempt:{row.attempts}",
         "mailing_consultation_no_message",
-        f"Система рассылок: отправлено уведомление пользователю по сделке {row.amocrm_deal_id}",
+        "Клиенту отправлено уведомление после пропущенного звонка юрисконсульта.\n\n"
+        f"Текст сообщения:\n{row.message_text}",
+        execute_immediately=False,
     )
+
+
+async def _resume_saved_mailing_position(
+    session: AsyncSession, state: MailingState, resumed_at: datetime
+) -> None:
+    """Resume the exact next stage without ever firing an overdue message immediately."""
+    from app.models import MailingJob
+
+    job = await session.scalar(
+        select(MailingJob).where(
+            MailingJob.user_id == state.user_id,
+            MailingJob.stage == state.next_stage,
+        )
+    )
+    safe_due_at = due_for_stage(state.next_stage, resumed_at)
+    if job is None:
+        await _schedule_job(session, state, state.next_stage, safe_due_at)
+        return
+    if job.status == "cancelled":
+        job.status = "pending"
+        job.cancelled_at = None
+        job.error_message = None
+        job.claimed_at = None
+        job.lease_until = None
+    if job.status == "pending" and job.due_at <= resumed_at:
+        job.due_at = safe_due_at
 
 
 async def resolve_uncertain_notification(
@@ -245,7 +289,7 @@ async def _process_consultation_no_lead(
     case, user, state = await _local_deal(session, deal_id)
     if case is None or user is None or state is None:
         return
-    if state.reminders_disabled or state.excluded_sales:
+    if state.reminders_disabled:
         return
     crm = get_amocrm_service(settings)
     lawyer_name, lawyer_phone = await crm.get_lead_lawyer(lead)
@@ -256,6 +300,7 @@ async def _process_consultation_no_lead(
         user=user,
         lawyer_name=lawyer_name,
         lawyer_phone=lawyer_phone,
+        new_cycle=state.excluded_sales or not state.consultation_no,
     )
     if created:
         await record_action(
@@ -263,20 +308,13 @@ async def _process_consultation_no_lead(
             settings,
             user,
             case,
-            f"poll-consultation-no-detected:{deal_id}",
+            f"poll-consultation-no-detected:{deal_id}:attempt:{row.attempts + 1}",
             "mailing_consultation_no",
-            "Система рассылок: сделка переведена в «Консультация - НО», пользователь возвращен в рассылку",
+            "Сделка переведена в этап «Консультация-НО». Клиенту отправляется просьба перезвонить, "
+            "после чего регулярная рассылка продолжится с сохраненного шага.",
+            execute_immediately=False,
         )
     elif row.status == "sent":
-        await record_action(
-            session,
-            settings,
-            user,
-            case,
-            f"poll-lawyer-call-skipped:{deal_id}",
-            "mailing_consultation_no_duplicate",
-            f"Система рассылок: уведомление по сделке {deal_id} пропущено — уже отправлено",
-        )
         return
     await _deliver_notification(session, settings, bot, row.id)
 
@@ -300,10 +338,9 @@ async def _process_sales_lead(session: AsyncSession, settings, lead: dict) -> No
 
 async def poll_crm_mailing_once(settings, bot: Bot | None = None) -> None:
     crm = get_amocrm_service(settings)
-
-    no_leads = await crm.list_leads_in_status(
-        settings.amocrm_pipeline_name,
-        NO_STATUS_NAMES,
+    no_leads, sales_leads = await asyncio.gather(
+        crm.list_leads_in_status(settings.amocrm_pipeline_name, NO_STATUS_NAMES),
+        crm.list_leads_in_pipeline("Отдел продаж"),
     )
 
     async with SessionLocal() as session:
@@ -311,8 +348,6 @@ async def poll_crm_mailing_once(settings, bot: Bot | None = None) -> None:
 
         for lead in no_leads:
             await _process_consultation_no_lead(session, settings, bot, lead)
-
-    sales_leads = await crm.list_leads_in_pipeline("Отдел продаж")
 
     async with SessionLocal() as session:
         for lead in sales_leads:

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import html
 import json
 import logging
+import re
 from calendar import monthrange
 from datetime import datetime, timedelta
 from collections.abc import Awaitable, Callable
@@ -151,13 +152,12 @@ async def record_action(
     note: str,
     *,
     extra: dict[str, Any] | None = None,
+    execute_immediately: bool = True,
 ) -> bool:
-    """Atomically reserve and eventually execute one verifiable amoCRM note."""
-    marker = f"[mailing:{hashlib.sha256(f'{user.id}:{action_key}'.encode()).hexdigest()}]"
+    """Atomically reserve a human-readable amoCRM note and optionally send it now."""
     payload = {
         "note": note,
         "mailing_action_key": action_key,
-        "mailing_marker": marker,
         **(extra or {}),
     }
     action = await session.scalar(
@@ -187,6 +187,8 @@ async def record_action(
             )
             if action is None:
                 raise
+    if not execute_immediately:
+        return True
     return await _execute_action(session, settings, action.id)
 
 
@@ -225,9 +227,9 @@ async def _execute_action(session: AsyncSession, settings, action_id: int) -> bo
         payload = json.loads(action.payload_json or "{}")
         crm = get_amocrm_service(settings)
         if verification_only:
-            marker = str(payload.get("mailing_marker") or "")
+            note_text = str(payload.get("note") or "").strip()
             lead_id = case.amocrm_lead_id or case.amo_lead_id
-            if not marker or not lead_id or not await crm.lead_note_has_marker(int(lead_id), marker):
+            if not note_text or not lead_id or not await crm.lead_note_has_text(int(lead_id), note_text):
                 await session.execute(
                     update(MailingAction)
                     .where(MailingAction.id == action_id)
@@ -328,7 +330,8 @@ async def begin_consultation(
         case,
         f"consult-click:{state.next_stage}",
         "mailing_consultation_clicked",
-        "Система рассылок: пользователь нажал «Получить консультацию»",
+        "Клиент нажал кнопку «Получить консультацию». Заявка передана юрисконсульту.",
+        execute_immediately=False,
     )
     if state.consultation_completed and not state.consultation_no:
         return case, False
@@ -342,7 +345,8 @@ async def begin_consultation(
             case,
             f"phone-request:{state.next_stage}",
             "mailing_phone_requested",
-            "Система рассылок: запрошен номер телефона",
+            "Для консультации у клиента запрошен номер телефона.",
+            execute_immediately=False,
         )
         return case, False
     return case, True
@@ -366,7 +370,8 @@ async def save_campaign_phone(
         case,
         f"phone-received:{phone}",
         "mailing_phone_received",
-        "Система рассылок: получен номер телефона из Telegram",
+        f"Клиент указал номер телефона для консультации: {phone}.",
+        execute_immediately=False,
     )
     return phone
 
@@ -374,18 +379,10 @@ async def save_campaign_phone(
 async def prepare_consultation(
     session: AsyncSession, settings, user: User, case: Case
 ) -> bool:
-    """Persist and verify CRM phone and lead stage before Telegram confirmation."""
+    """Queue CRM updates without delaying the confirmation shown to the client."""
     state = await get_mailing_state(session, user.id)
     if state and state.consultation_completed and not state.consultation_no:
         return False
-    crm = get_amocrm_service(settings)
-    if settings.amocrm_enabled:
-        contact_id = await crm.create_or_update_contact(user)
-        if not contact_id or not await crm.verify_contact_phone(contact_id, user.phone or ""):
-            raise RuntimeError("amoCRM contact phone was not persisted")
-        user.amocrm_contact_id = contact_id
-        case.amocrm_contact_id = contact_id
-        await session.commit()
     await record_action(
         session,
         settings,
@@ -393,7 +390,8 @@ async def prepare_consultation(
         case,
         f"phone-saved-amocrm:{user.phone}",
         "mailing_phone_saved_amocrm",
-        "Система рассылок: номер телефона записан в контакт amoCRM",
+        f"Номер телефона клиента для консультации: {user.phone}.",
+        execute_immediately=False,
     )
     await record_action(
         session,
@@ -402,11 +400,10 @@ async def prepare_consultation(
         case,
         f"consultation-stage:{state.next_stage if state else 1}",
         "mailing_consultation_stage",
-        f"Система рассылок: сделка переведена в «{CONSULTATION_LOCATION}»",
+        f"Клиент запросил консультацию. Сделка переводится в этап «{CONSULTATION_STATUS}».",
         extra={"status_name_override": CONSULTATION_STATUS, "force_status": True},
+        execute_immediately=False,
     )
-    if settings.amocrm_enabled and not await crm.verify_lead_status(case, CONSULTATION_STATUS):
-        raise RuntimeError("amoCRM lead status was not persisted")
     return True
 
 
@@ -434,7 +431,9 @@ async def finish_consultation(
         case,
         f"pavel-message:{consultation_key or state.next_stage}",
         "mailing_pavel_message_sent",
-        "Система рассылок: отправлено сообщение с номером юрисконсульта Павла",
+        "Клиенту отправлено уведомление о звонке юрисконсульта.\n\n"
+        f"Текст сообщения:\n{plain_message_text(PAVEL_MESSAGE)}",
+        execute_immediately=False,
     )
     await record_action(
         session,
@@ -443,7 +442,8 @@ async def finish_consultation(
         case,
         f"jobs-cancelled-consultation:{consultation_key or state.next_stage}",
         "mailing_jobs_cancelled",
-        f"Система рассылок: отменены будущие задания рассылки ({cancelled})",
+        f"Регулярная рассылка с предложением консультации приостановлена. Отменено заданий: {cancelled}.",
+        execute_immediately=False,
     )
 
 
@@ -687,6 +687,11 @@ def _eligible(state: MailingState | None) -> bool:
     )
 
 
+def plain_message_text(text: str) -> str:
+    """Render a bot HTML message as readable plain text for an amoCRM note."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
+
+
 async def exclude_user_for_sales(
     session: AsyncSession,
     settings,
@@ -701,22 +706,17 @@ async def exclude_user_for_sales(
     state.excluded_sales = True
     await cancel_future_jobs(session, user.id)
     await session.commit()
-    actions = (
-        (
-            f"poll-sales-excluded:{deal_id}",
-            "mailing_sales_excluded",
-            "Система рассылок: пользователь исключен из рассылки из-за перехода в «Отдел продаж»",
-        ),
-        (
-            f"poll-sales-jobs-cancelled:{deal_id}",
-            "mailing_jobs_cancelled",
-            "Система рассылок: отменены будущие задания рассылки",
-        ),
-    )
+    actions = ((
+        f"poll-sales-excluded:{deal_id}",
+        "mailing_sales_excluded",
+        "Регулярная рассылка с кнопкой «Получить консультацию» приостановлена, "
+        "потому что сделка переведена в воронку «Отдел продаж». Остальные уведомления продолжают работать.",
+    ),)
     for action_key, event_type, note in actions:
         try:
             await record_action(
-                session, settings, user, case, action_key, event_type, note
+                session, settings, user, case, action_key, event_type, note,
+                execute_immediately=False,
             )
         except Exception:
             # record_action has already persisted a retryable outbox row.
@@ -872,7 +872,9 @@ async def _complete_job(
         case,
         f"message:{job.stage}",
         "mailing_message_sent",
-        f"Система рассылок: отправлено сообщение №{job.stage}",
+        f"Клиенту отправлено сообщение регулярной рассылки №{job.stage}.\n\n"
+        f"Текст сообщения:\n{plain_message_text(stage_text(job.stage))}",
+        execute_immediately=False,
     )
     logger.info("Система рассылок: отправлено сообщение №%s user_id=%s", job.stage, user.id)
 
@@ -929,7 +931,6 @@ async def run_automatic_mailings(settings, bot: Bot | None = None) -> None:
             async with SessionLocal() as session:
                 await recover_uncertain_jobs(session)
                 await recover_pavel_delivery_leases(session)
-                await retry_pending_actions(session, settings)
                 ids = list(
                     (await session.execute(
                         select(MailingJob.id)
@@ -938,8 +939,17 @@ async def run_automatic_mailings(settings, bot: Bot | None = None) -> None:
                         .limit(100)
                     )).scalars()
                 )
-            for job_id in ids:
-                await _deliver_job(settings, bot, job_id)
+
+            async def retry_actions() -> None:
+                async with SessionLocal() as action_session:
+                    await retry_pending_actions(action_session, settings)
+
+            # Slow amoCRM note synchronization must never hold up due client
+            # deliveries. Each delivery owns its DB session and runs independently.
+            await asyncio.gather(
+                retry_actions(),
+                *(_deliver_job(settings, bot, job_id) for job_id in ids),
+            )
         except asyncio.CancelledError:
             raise
         except Exception:

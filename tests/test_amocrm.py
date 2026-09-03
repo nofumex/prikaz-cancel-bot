@@ -422,7 +422,7 @@ async def test_duplicate_crm_event_skips_note_and_network_calls():
 
 
 @pytest.mark.asyncio
-async def test_mailing_note_marker_prevents_second_post_after_local_crash_window():
+async def test_human_mailing_note_prevents_second_post_without_visible_marker():
     service = AmoCrmService(_settings(amocrm_enabled=True))
     case = Case(id=63, user_id=1, amocrm_lead_id=123)
     user = User(id=1, platform="telegram", platform_user_id="1", amocrm_current_case_id=63)
@@ -454,6 +454,9 @@ async def test_mailing_note_marker_prevents_second_post_after_local_crash_window
     await service.sync_case_event(None, case, user, "mailing_message_sent", payload)
 
     assert post_count == 1
+    assert stored_notes == ["Система рассылок: отправлено сообщение №1"]
+    assert "Событие:" not in stored_notes[0]
+    assert "[mailing:" not in stored_notes[0]
 
 
 @pytest.mark.asyncio

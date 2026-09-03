@@ -323,7 +323,9 @@ async def test_crm_sales_is_checked_before_job_send_and_cancels_all_jobs(
     sender.assert_not_awaited()
     crm.get_lead_location.assert_awaited_once_with(777)
     notes = [call.args[6] for call in note.await_args_list]
-    assert notes.count("Система рассылок: отменены будущие задания рассылки") == 1
+    assert len(notes) == 1
+    assert "Регулярная рассылка с кнопкой «Получить консультацию» приостановлена" in notes[0]
+    assert "Остальные уведомления продолжают работать" in notes[0]
 
 
 @pytest.mark.asyncio
@@ -505,10 +507,7 @@ async def test_amocrm_polling_reenables_and_sales_excludes_without_duplicates(
         assert notification.lawyer_name == "Анна"
     assert sender.await_count == 1
     note_texts = [call.args[6] for call in note.await_args_list]
-    assert (
-        "Система рассылок: сделка переведена в «Консультация - НО», пользователь возвращен в рассылку"
-        in note_texts
-    )
+    assert any("с сохраненного шага" in text for text in note_texts)
 
     location[:] = ["Отдел продаж", "Новая заявка"]
     no_leads.clear()
@@ -523,7 +522,107 @@ async def test_amocrm_polling_reenables_and_sales_excludes_without_duplicates(
     assert state.excluded_sales is True
     assert stage_two.status == "cancelled"
     note_texts = [call.args[6] for call in note.await_args_list]
-    assert "Система рассылок: отменены будущие задания рассылки" in note_texts
+    assert any("Остальные уведомления продолжают работать" in text for text in note_texts)
+
+
+@pytest.mark.asyncio
+async def test_consultation_no_from_sales_sends_and_restores_exact_future_position(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    preserved_due_at = datetime.utcnow() + timedelta(days=4)
+    crm = SimpleNamespace(
+        get_lead_lawyer=AsyncMock(return_value=("Павел", "+79230165336")),
+        get_lead_location=AsyncMock(
+            return_value=(settings.amocrm_pipeline_name, "Консультация-НО")
+        ),
+    )
+    sender = AsyncMock(return_value=True)
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+    monkeypatch.setattr(crm_polling, "_send_user_message", sender)
+    monkeypatch.setattr(crm_polling, "record_action", AsyncMock(return_value=True))
+
+    async with mailing_db() as session:
+        user = await _user(session)
+        state = await mailings.ensure_mailing_started(session, user)
+        state.next_stage = 2
+        state.participating = False
+        state.excluded_sales = True
+        first_job = await session.scalar(select(MailingJob).where(MailingJob.stage == 1))
+        first_job.status = "sent"
+        session.add(
+            MailingJob(
+                user_id=user.id,
+                stage=2,
+                due_at=preserved_due_at,
+                status="cancelled",
+                cancelled_at=datetime.utcnow(),
+            )
+        )
+        session.add(Case(user_id=user.id, platform="telegram", amocrm_lead_id=902))
+        await session.commit()
+        await crm_polling._process_consultation_no_lead(
+            session, settings, None, {"id": 902, "responsible_user_id": 1}
+        )
+
+        await session.refresh(state)
+        resumed = await session.scalar(select(MailingJob).where(MailingJob.stage == 2))
+
+    sender.assert_awaited_once()
+    assert state.excluded_sales is False
+    assert state.participating is True
+    assert state.next_stage == 2
+    assert resumed.status == "pending"
+    assert resumed.due_at == preserved_due_at
+
+
+@pytest.mark.asyncio
+async def test_consultation_no_never_releases_an_overdue_mailing_immediately(
+    mailing_db
+) -> None:
+    resumed_at = datetime.utcnow()
+    async with mailing_db() as session:
+        user = await _user(session)
+        state = await mailings.ensure_mailing_started(session, user)
+        state.next_stage = 1
+        job = await session.scalar(select(MailingJob).where(MailingJob.stage == 1))
+        job.status = "cancelled"
+        job.due_at = resumed_at - timedelta(days=1)
+        await crm_polling._resume_saved_mailing_position(session, state, resumed_at)
+        await session.commit()
+        await session.refresh(job)
+
+    assert job.status == "pending"
+    assert job.due_at == mailings.due_for_stage(1, resumed_at)
+
+
+@pytest.mark.asyncio
+async def test_consultation_button_path_never_waits_for_amocrm(mailing_db, monkeypatch) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+
+    def unexpected_crm_call(settings):
+        raise AssertionError("interactive consultation path must not call amoCRM inline")
+
+    monkeypatch.setattr(mailings, "get_amocrm_service", unexpected_crm_call)
+    send = AsyncMock(return_value=object())
+    async with mailing_db() as session:
+        user = await _user(session)
+        user.phone = "+79990000000"
+        await mailings.ensure_mailing_started(session, user)
+        case = Case(user_id=user.id, platform="telegram")
+        session.add(case)
+        await session.commit()
+
+        selected_case, ready = await mailings.begin_consultation(
+            session, settings, user, chat_id="1"
+        )
+        assert ready is True
+        assert await mailings.prepare_consultation(session, settings, user, selected_case)
+        assert await mailings.deliver_pavel_message(
+            session, settings, user, selected_case, send
+        )
+
+    send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
