@@ -363,6 +363,47 @@ async def test_pipeline_lead_ids_are_loaded_in_pages():
 
 
 @pytest.mark.asyncio
+async def test_incremental_status_events_use_fixed_time_window_and_pages():
+    service = AmoCrmService(_settings(amocrm_enabled=True))
+    requests = []
+
+    async def fake_request(method, path, **kwargs):
+        requests.append((method, path, kwargs["params"]))
+        page = kwargs["params"]["page"]
+        if page == 1:
+            return {
+                "_embedded": {
+                    "events": [
+                        {
+                            "id": f"event-{index}",
+                            "entity_id": index,
+                            "created_at": 1000,
+                        }
+                        for index in range(100)
+                    ]
+                }
+            }, None
+        return {
+            "_embedded": {
+                "events": [{"id": "event-last", "entity_id": 999, "created_at": 1001}]
+            }
+        }, None
+
+    service.request = fake_request
+    events = await service.list_lead_status_changes(997, 1002)
+
+    assert len(events) == 101
+    assert [request[2]["page"] for request in requests] == [1, 2]
+    for method, path, params in requests:
+        assert method == "GET"
+        assert path == "/events"
+        assert params["filter[entity]"] == "lead"
+        assert params["filter[type]"] == "lead_status_changed"
+        assert params["filter[created_at][from]"] == 997
+        assert params["filter[created_at][to]"] == 1002
+
+
+@pytest.mark.asyncio
 async def test_sync_case_event_exposes_amocrm_note_http_error():
     service = AmoCrmService(_settings(amocrm_enabled=True))
     case = Case(id=63, user_id=1, amocrm_lead_id=32404037)

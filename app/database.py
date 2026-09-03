@@ -243,6 +243,48 @@ async def _upgrade_sqlite_schema(conn) -> None:
     await conn.exec_driver_sql(
         "CREATE INDEX IF NOT EXISTS ix_mailing_actions_lease_until ON mailing_actions (lease_until)"
     )
+    await conn.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS crm_mailing_cursors (
+            name VARCHAR(64) PRIMARY KEY,
+            cursor_at BIGINT NOT NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL
+        )
+        """
+    )
+    await conn.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS crm_mailing_changes (
+            event_id VARCHAR(64) PRIMARY KEY,
+            amocrm_deal_id BIGINT NOT NULL,
+            changed_at BIGINT NOT NULL,
+            status VARCHAR(16) NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            lease_until DATETIME,
+            claim_token VARCHAR(64),
+            processed_at DATETIME,
+            error_message TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL
+        )
+        """
+    )
+    await conn.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_crm_mailing_changes_deal ON crm_mailing_changes (amocrm_deal_id)"
+    )
+    await conn.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_crm_mailing_changes_status ON crm_mailing_changes (status)"
+    )
+    await conn.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_crm_mailing_changes_lease ON crm_mailing_changes (lease_until)"
+    )
+    await _sqlite_add_columns(
+        conn,
+        "crm_mailing_changes",
+        [("claim_token", "claim_token VARCHAR(64)")],
+    )
+    await conn.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_crm_mailing_changes_claim ON crm_mailing_changes (claim_token)"
+    )
 
 async def init_db() -> None:
     async with engine.begin() as conn:

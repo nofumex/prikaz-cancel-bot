@@ -332,3 +332,32 @@ class CrmDealNotification(Base):
     uncertain_at: Mapped[datetime | None] = mapped_column(DateTime)
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class CrmMailingCursor(Base):
+    """Durable high-water mark for incremental amoCRM status events."""
+
+    __tablename__ = "crm_mailing_cursors"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    cursor_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class CrmMailingChange(Base):
+    """Durable inbox entry; overlap and worker retries are deduplicated by event id."""
+
+    __tablename__ = "crm_mailing_changes"
+
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    amocrm_deal_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    changed_at: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    claim_token: Mapped[str | None] = mapped_column(String(64), index=True)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)

@@ -16,6 +16,8 @@ from app.models import (
     Base,
     Case,
     CrmDealNotification,
+    CrmMailingChange,
+    CrmMailingCursor,
     MailingAction,
     MailingJob,
     MailingState,
@@ -538,8 +540,8 @@ async def test_amocrm_polling_reenables_and_sales_excludes_without_duplicates(
         await mailings.cancel_future_jobs(session, user.id)
         await session.commit()
 
-    await crm_polling.poll_crm_mailing_once(settings)
-    await crm_polling.poll_crm_mailing_once(settings)
+    await crm_polling.reconcile_crm_mailing_once(settings)
+    await crm_polling.reconcile_crm_mailing_once(settings)
 
     async with mailing_db() as session:
         state = await session.scalar(select(MailingState))
@@ -558,8 +560,8 @@ async def test_amocrm_polling_reenables_and_sales_excludes_without_duplicates(
     location[:] = ["Отдел продаж", "Новая заявка"]
     no_leads.clear()
     sales_leads.append({"id": 777})
-    await crm_polling.poll_crm_mailing_once(settings)
-    await crm_polling.poll_crm_mailing_once(settings)
+    await crm_polling.reconcile_crm_mailing_once(settings)
+    await crm_polling.reconcile_crm_mailing_once(settings)
 
     async with mailing_db() as session:
         state = await session.scalar(select(MailingState))
@@ -742,7 +744,7 @@ async def test_polling_processes_deals_in_parallel(mailing_db, monkeypatch) -> N
             session.add(Case(user_id=user.id, platform="telegram", amocrm_lead_id=deal_id))
         await session.commit()
 
-    polling = asyncio.create_task(crm_polling.poll_crm_mailing_once(settings))
+    polling = asyncio.create_task(crm_polling.reconcile_crm_mailing_once(settings))
     await asyncio.wait_for(first_started.wait(), timeout=1)
     await asyncio.wait_for(second_sent.wait(), timeout=1)
     release_first.set()
@@ -767,7 +769,7 @@ async def test_polling_uses_only_local_deals_and_never_lists_pipelines(
         session.add(Case(user_id=user.id, platform="telegram", amocrm_lead_id=2001))
         await session.commit()
 
-    await crm_polling.poll_crm_mailing_once(settings)
+    await crm_polling.reconcile_crm_mailing_once(settings)
 
     crm.list_leads_in_status.assert_not_awaited()
     crm.list_leads_in_pipeline.assert_not_awaited()
@@ -799,7 +801,7 @@ async def test_polling_timeout_isolated_to_one_local_deal(mailing_db, monkeypatc
             session.add(Case(user_id=user.id, platform="telegram", amocrm_lead_id=deal_id))
         await session.commit()
 
-    polling = asyncio.create_task(crm_polling.poll_crm_mailing_once(settings))
+    polling = asyncio.create_task(crm_polling.reconcile_crm_mailing_once(settings))
     await asyncio.wait_for(slow_started.wait(), timeout=0.5)
     await asyncio.wait_for(fast_checked.wait(), timeout=0.5)
     await asyncio.wait_for(polling, timeout=1.5)
@@ -825,9 +827,265 @@ async def test_polling_prefers_current_case_over_historical_deals(
         user.amocrm_current_case_id = current.id
         await session.commit()
 
-    await crm_polling.poll_crm_mailing_once(settings)
+    await crm_polling.reconcile_crm_mailing_once(settings)
 
     crm.get_lead_location.assert_awaited_once_with(2004)
+
+
+async def _add_mailing_deals(session, count: int, *, first_deal_id: int) -> list[int]:
+    started_at = datetime.utcnow()
+    deal_ids: list[int] = []
+    for offset in range(count):
+        user_id = offset + 1
+        deal_id = first_deal_id + offset
+        deal_ids.append(deal_id)
+        session.add(
+            User(
+                id=user_id,
+                platform="telegram",
+                platform_user_id=str(user_id),
+                telegram_id=100000 + user_id,
+            )
+        )
+        session.add(
+            MailingState(
+                user_id=user_id,
+                started_at=started_at,
+                participating=True,
+            )
+        )
+        session.add(
+            Case(
+                user_id=user_id,
+                platform="telegram",
+                amocrm_lead_id=deal_id,
+            )
+        )
+    await session.commit()
+    return deal_ids
+
+
+@pytest.mark.asyncio
+async def test_incremental_sales_is_immediate_with_501_local_deals(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    target_deal_id = 3500
+    event_time = int(datetime.utcnow().timestamp())
+    crm = SimpleNamespace(
+        list_lead_status_changes=AsyncMock(return_value=[{
+            "id": "sales-event-1",
+            "entity_id": target_deal_id,
+            "created_at": event_time,
+        }]),
+        list_leads_in_status=AsyncMock(side_effect=AssertionError("full scan")),
+        list_leads_in_pipeline=AsyncMock(side_effect=AssertionError("full scan")),
+        get_lead_location=AsyncMock(return_value=("Отдел продаж", "Новая заявка")),
+    )
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+    monkeypatch.setattr(mailings, "record_action", AsyncMock(return_value=True))
+
+    async with mailing_db() as session:
+        await _add_mailing_deals(session, 501, first_deal_id=target_deal_id)
+
+    await asyncio.wait_for(crm_polling.poll_crm_mailing_once(settings), timeout=2)
+
+    async with mailing_db() as session:
+        case = await session.scalar(
+            select(Case).where(Case.amocrm_lead_id == target_deal_id)
+        )
+        state = await session.scalar(
+            select(MailingState).where(MailingState.user_id == case.user_id)
+        )
+    assert state.excluded_sales is True
+    assert state.participating is False
+    assert crm.get_lead_location.await_count == 2  # discovery + final Sales guard
+    crm.list_leads_in_status.assert_not_awaited()
+    crm.list_leads_in_pipeline.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_incremental_consultation_no_is_immediate_with_501_local_deals(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    target_deal_id = 4500
+    event_time = int(datetime.utcnow().timestamp())
+    crm = SimpleNamespace(
+        list_lead_status_changes=AsyncMock(return_value=[{
+            "id": "no-event-1",
+            "entity_id": target_deal_id,
+            "created_at": event_time,
+        }]),
+        list_leads_in_status=AsyncMock(side_effect=AssertionError("full scan")),
+        list_leads_in_pipeline=AsyncMock(side_effect=AssertionError("full scan")),
+        get_lead_location=AsyncMock(
+            return_value=(settings.amocrm_pipeline_name, "Консультация-НО")
+        ),
+        get_lead_lawyer=AsyncMock(return_value=("Павел", "+79230165336")),
+    )
+    sender = AsyncMock(return_value=True)
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+    monkeypatch.setattr(crm_polling, "_send_user_message", sender)
+    monkeypatch.setattr(crm_polling, "record_action", AsyncMock(return_value=True))
+
+    async with mailing_db() as session:
+        await _add_mailing_deals(session, 501, first_deal_id=target_deal_id)
+
+    await asyncio.wait_for(crm_polling.poll_crm_mailing_once(settings), timeout=2)
+
+    async with mailing_db() as session:
+        notification = await session.scalar(
+            select(CrmDealNotification).where(
+                CrmDealNotification.amocrm_deal_id == target_deal_id
+            )
+        )
+    assert notification.status == "sent"
+    assert crm.get_lead_location.await_count == 3
+    assert crm.get_lead_location.await_count < 10
+    sender.assert_awaited_once()
+    crm.list_leads_in_status.assert_not_awaited()
+    crm.list_leads_in_pipeline.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_incremental_overlap_dedupes_same_amocrm_event(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    event = {
+        "id": "overlap-event",
+        "entity_id": 5500,
+        "created_at": int(datetime.utcnow().timestamp()),
+    }
+    crm = SimpleNamespace(
+        list_lead_status_changes=AsyncMock(return_value=[event]),
+        get_lead_location=AsyncMock(
+            return_value=(settings.amocrm_pipeline_name, "Не было коммуникации")
+        ),
+    )
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+    async with mailing_db() as session:
+        await _add_mailing_deals(session, 1, first_deal_id=5500)
+
+    await crm_polling.poll_crm_mailing_once(settings)
+    await crm_polling.poll_crm_mailing_once(settings)
+
+    async with mailing_db() as session:
+        changes = list((await session.scalars(select(CrmMailingChange))).all())
+        cursor = await session.get(CrmMailingCursor, crm_polling.POLLING_CURSOR_NAME)
+    assert len(changes) == 1
+    assert changes[0].status == "completed"
+    assert cursor.cursor_at > 0
+    crm.get_lead_location.assert_awaited_once_with(5500)
+    assert crm.list_lead_status_changes.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_incremental_failed_deal_is_retried_after_cursor_advances(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    event_time = int(datetime.utcnow().timestamp())
+    crm = SimpleNamespace(
+        list_lead_status_changes=AsyncMock(side_effect=[[
+            {"id": "retry-event", "entity_id": 5600, "created_at": event_time}
+        ], []]),
+        get_lead_location=AsyncMock(side_effect=[
+            TimeoutError("temporary timeout"),
+            (settings.amocrm_pipeline_name, "Не было коммуникации"),
+        ]),
+    )
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+    async with mailing_db() as session:
+        await _add_mailing_deals(session, 1, first_deal_id=5600)
+
+    await crm_polling.poll_crm_mailing_once(settings)
+    async with mailing_db() as session:
+        first = await session.get(CrmMailingChange, "retry-event")
+        first_cursor = (
+            await session.get(CrmMailingCursor, crm_polling.POLLING_CURSOR_NAME)
+        ).cursor_at
+        assert first.status == "pending"
+
+    await crm_polling.poll_crm_mailing_once(settings)
+    async with mailing_db() as session:
+        retried = await session.get(CrmMailingChange, "retry-event")
+        cursor = await session.get(CrmMailingCursor, crm_polling.POLLING_CURSOR_NAME)
+    assert retried.status == "completed"
+    assert retried.attempts == 2
+    assert cursor.cursor_at >= first_cursor
+
+
+@pytest.mark.asyncio
+async def test_incremental_feed_failure_does_not_block_durable_inbox(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(get_settings(), amocrm_enabled=True)
+    crm = SimpleNamespace(
+        list_lead_status_changes=AsyncMock(side_effect=RuntimeError("events unavailable")),
+        get_lead_location=AsyncMock(
+            return_value=(settings.amocrm_pipeline_name, "Не было коммуникации")
+        ),
+    )
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+    async with mailing_db() as session:
+        await _add_mailing_deals(session, 1, first_deal_id=5650)
+        session.add(
+            CrmMailingChange(
+                event_id="already-durable",
+                amocrm_deal_id=5650,
+                changed_at=int(datetime.utcnow().timestamp()),
+                status="pending",
+            )
+        )
+        await session.commit()
+
+    with pytest.raises(RuntimeError, match="events unavailable"):
+        await crm_polling.poll_crm_mailing_once(settings)
+
+    async with mailing_db() as session:
+        change = await session.get(CrmMailingChange, "already-durable")
+    assert change.status == "completed"
+    crm.get_lead_location.assert_awaited_once_with(5650)
+
+
+@pytest.mark.asyncio
+async def test_one_slow_incremental_deal_does_not_block_another(
+    mailing_db, monkeypatch
+) -> None:
+    settings = replace(
+        get_settings(), amocrm_enabled=True, crm_sync_timeout_seconds=1
+    )
+    now = int(datetime.utcnow().timestamp())
+    fast_seen = asyncio.Event()
+
+    async def location(deal_id: int):
+        if deal_id == 5700:
+            await asyncio.Event().wait()
+        fast_seen.set()
+        return settings.amocrm_pipeline_name, "Не было коммуникации"
+
+    crm = SimpleNamespace(
+        list_lead_status_changes=AsyncMock(return_value=[
+            {"id": "slow-change", "entity_id": 5700, "created_at": now},
+            {"id": "fast-change", "entity_id": 5701, "created_at": now},
+        ]),
+        get_lead_location=AsyncMock(side_effect=location),
+    )
+    monkeypatch.setattr(crm_polling, "get_amocrm_service", lambda settings: crm)
+    async with mailing_db() as session:
+        await _add_mailing_deals(session, 2, first_deal_id=5700)
+
+    polling = asyncio.create_task(crm_polling.poll_crm_mailing_once(settings))
+    await asyncio.wait_for(fast_seen.wait(), timeout=0.5)
+    await asyncio.wait_for(polling, timeout=1.5)
+
+    async with mailing_db() as session:
+        slow = await session.get(CrmMailingChange, "slow-change")
+        fast = await session.get(CrmMailingChange, "fast-change")
+    assert slow.status == "pending"
+    assert fast.status == "completed"
 
 
 @pytest.mark.asyncio
@@ -850,7 +1108,7 @@ async def test_stale_sales_list_cannot_exclude_a_deal_already_moved_to_no(
         session.add(Case(user_id=user.id, platform="telegram", amocrm_lead_id=1003))
         await session.commit()
 
-    await crm_polling.poll_crm_mailing_once(settings)
+    await crm_polling.reconcile_crm_mailing_once(settings)
 
     async with mailing_db() as session:
         state = await session.scalar(select(MailingState))

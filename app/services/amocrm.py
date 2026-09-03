@@ -582,6 +582,35 @@ class AmoCrmService:
             return []
         return await self._list_leads_filtered({"filter[pipeline_id]": int(pipeline["id"])})
 
+    async def list_lead_status_changes(
+        self, created_from: int, created_to: int
+    ) -> list[dict[str, Any]]:
+        """Load only lead status events from one fixed, bounded time window."""
+        events: list[dict[str, Any]] = []
+        limit = 100
+        for page in range(1, 101):
+            data, error = await self.request(
+                "GET",
+                "/events",
+                params={
+                    "filter[entity]": "lead",
+                    "filter[type]": "lead_status_changed",
+                    "filter[created_at][from]": int(created_from),
+                    "filter[created_at][to]": int(created_to),
+                    "limit": limit,
+                    "page": page,
+                },
+            )
+            if error:
+                raise RuntimeError(f"amoCRM incremental events failed: {error}")
+            if not isinstance(data, dict):
+                raise RuntimeError("amoCRM returned an invalid events response")
+            items = data.get("_embedded", {}).get("events", [])
+            events.extend(item for item in items if isinstance(item, dict))
+            if len(items) < limit:
+                return events
+        raise RuntimeError("amoCRM incremental events exceeded 100 pages; cursor was not advanced")
+
     @staticmethod
     def _custom_field_value(
         entity: dict[str, Any], *, hints: tuple[str, ...], excludes: tuple[str, ...] = ()

@@ -2,15 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+import uuid
 from datetime import datetime, timedelta
 
 from aiogram import Bot
-from sqlalchemy import or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import SessionLocal
-from app.models import Case, CrmDealNotification, MailingJob, MailingState, User
+from app.models import (
+    Case,
+    CrmDealNotification,
+    CrmMailingChange,
+    CrmMailingCursor,
+    MailingJob,
+    MailingState,
+    User,
+)
 from app.services.amocrm import get_amocrm_service
 from app.services.automatic_mailings import (
     _schedule_job,
@@ -30,6 +40,11 @@ DELIVERY_LEASE = timedelta(minutes=5)
 NO_STATUS_NAMES = ("Консультация-НО", "Консультация - НО")
 POLLING_CONCURRENCY = 8
 POLLING_CRM_TIMEOUT_SECONDS = 5
+POLLING_CURSOR_NAME = "lead_status_changes"
+POLLING_CURSOR_OVERLAP_SECONDS = 3
+POLLING_CHANGE_LEASE = timedelta(minutes=2)
+POLLING_CHANGE_BATCH = 1000
+POLLING_CHANGE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
 def _is_consultation_no_location(settings, pipeline_name: str | None, status_name: str | None) -> bool:
@@ -468,6 +483,11 @@ async def _process_consultation_no_lead(
     elif row.status == "sent":
         return
     await _deliver_notification(session, settings, bot, row.id)
+    await session.refresh(row)
+    if row.status == "pending":
+        raise RuntimeError(
+            f"CRM notification {row.id} was not delivered and must be retried"
+        )
 
 
 async def _process_sales_lead(
@@ -500,59 +520,308 @@ async def _process_sales_lead(
     await session.commit()
 
 
-async def poll_crm_mailing_once(settings, bot: Bot | None = None) -> None:
-    crm = get_amocrm_service(settings)
+async def _process_current_deal(
+    settings, bot: Bot | None, crm, deal_id: int
+) -> None:
+    location = await _crm_call(settings, crm.get_lead_location(deal_id))
+    pipeline_name, status_name = location
     async with SessionLocal() as session:
-        await recover_notification_leases(session)
-        deal_ids = await _local_polling_deal_ids(session)
+        lead = {"id": deal_id}
+        if pipeline_name == "Отдел продаж":
+            await _process_sales_lead(
+                session, settings, lead, known_location=location
+            )
+        elif _is_consultation_no_location(settings, pipeline_name, status_name):
+            await _process_consultation_no_lead(
+                session,
+                settings,
+                bot,
+                lead,
+                known_location=location,
+            )
 
+
+async def _run_deals_bounded(settings, bot: Bot | None, deal_ids: list[int]) -> bool:
+    crm = get_amocrm_service(settings)
     semaphore = asyncio.Semaphore(POLLING_CONCURRENCY)
+    successful = True
 
     async def process_deal(deal_id: int) -> None:
+        nonlocal successful
         async with semaphore:
             try:
-                location = await _crm_call(settings, crm.get_lead_location(deal_id))
-                pipeline_name, status_name = location
-                async with SessionLocal() as session:
-                    lead = {"id": deal_id}
-                    if pipeline_name == "Отдел продаж":
-                        await _process_sales_lead(
-                            session, settings, lead, known_location=location
-                        )
-                    elif _is_consultation_no_location(
-                        settings, pipeline_name, status_name
-                    ):
-                        await _process_consultation_no_lead(
-                            session,
-                            settings,
-                            bot,
-                            lead,
-                            known_location=location,
-                        )
+                await _process_current_deal(settings, bot, crm, deal_id)
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
-                logger.warning(
-                    "amoCRM mailing deal timed out deal_id=%s",
-                    deal_id,
-                )
+                successful = False
+                logger.warning("amoCRM mailing deal timed out deal_id=%s", deal_id)
             except Exception:
-                logger.exception(
-                    "amoCRM mailing deal processing failed deal_id=%s",
-                    deal_id,
-                )
+                successful = False
+                logger.exception("amoCRM mailing deal processing failed deal_id=%s", deal_id)
 
-    # Every deal owns an independent session. Discovery is strictly local;
-    # amoCRM is queried only for the exact deal ids already known by the bot.
     await asyncio.gather(*(process_deal(deal_id) for deal_id in deal_ids))
+    return successful
+
+
+async def reconcile_crm_mailing_once(settings, bot: Bot | None = None) -> None:
+    """One bounded startup reconciliation of locally known active deals."""
+    async with SessionLocal() as session:
+        await recover_notification_leases(session)
+        deal_ids = await _local_polling_deal_ids(session)
+    await _run_deals_bounded(settings, bot, deal_ids)
+
+
+async def _ensure_incremental_cursor(initial_at: int) -> CrmMailingCursor:
+    async with SessionLocal() as session:
+        cursor = await session.get(CrmMailingCursor, POLLING_CURSOR_NAME)
+        if cursor is not None:
+            return cursor
+        try:
+            async with session.begin_nested():
+                cursor = CrmMailingCursor(
+                    name=POLLING_CURSOR_NAME, cursor_at=int(initial_at)
+                )
+                session.add(cursor)
+                await session.flush()
+            await session.commit()
+            return cursor
+        except IntegrityError:
+            await session.rollback()
+            cursor = await session.get(CrmMailingCursor, POLLING_CURSOR_NAME)
+            if cursor is None:
+                raise
+            return cursor
+
+
+async def _ingest_incremental_changes(settings) -> None:
+    observed_now = int(time.time())
+    cursor = await _ensure_incremental_cursor(
+        observed_now - POLLING_CURSOR_OVERLAP_SECONDS
+    )
+    # Never move the high-water mark backwards if the host clock is adjusted.
+    window_to = max(observed_now, int(cursor.cursor_at))
+    window_from = max(
+        0, int(cursor.cursor_at) - POLLING_CURSOR_OVERLAP_SECONDS
+    )
+    crm = get_amocrm_service(settings)
+    events = await _crm_call(
+        settings, crm.list_lead_status_changes(window_from, window_to)
+    )
+
+    async with SessionLocal() as session:
+        local_deal_ids = set(await _local_polling_deal_ids(session))
+        seen_event_ids: set[str] = set()
+        for event in events:
+            event_id = str(event.get("id") or "").strip()
+            try:
+                deal_id = int(event.get("entity_id") or 0)
+                changed_at = int(event.get("created_at") or 0)
+            except (TypeError, ValueError):
+                logger.warning("Ignoring malformed amoCRM event id=%s", event_id)
+                continue
+            if (
+                not event_id
+                or event_id in seen_event_ids
+                or deal_id not in local_deal_ids
+                or changed_at <= 0
+            ):
+                continue
+            seen_event_ids.add(event_id)
+            try:
+                async with session.begin_nested():
+                    session.add(
+                        CrmMailingChange(
+                            event_id=event_id,
+                            amocrm_deal_id=deal_id,
+                            changed_at=changed_at,
+                            status="pending",
+                        )
+                    )
+                    await session.flush()
+            except IntegrityError:
+                # Expected for the overlap window or another polling process.
+                pass
+        await session.execute(
+            update(CrmMailingCursor)
+            .where(
+                CrmMailingCursor.name == POLLING_CURSOR_NAME,
+                CrmMailingCursor.cursor_at < window_to,
+            )
+            .values(cursor_at=window_to, updated_at=datetime.utcnow())
+        )
+        await session.commit()
+
+
+async def _process_pending_changes(settings, bot: Bot | None = None) -> None:
+    now = datetime.utcnow()
+    async with SessionLocal() as session:
+        await session.execute(
+            delete(CrmMailingChange).where(
+                CrmMailingChange.status == "completed",
+                CrmMailingChange.changed_at
+                < int(time.time()) - POLLING_CHANGE_RETENTION_SECONDS,
+            )
+        )
+        await session.execute(
+            update(CrmMailingChange)
+            .where(
+                CrmMailingChange.status == "processing",
+                or_(
+                    CrmMailingChange.lease_until.is_(None),
+                    CrmMailingChange.lease_until < now,
+                ),
+            )
+            .values(status="pending", lease_until=None, claim_token=None)
+        )
+        await session.commit()
+        deal_ids = list(
+            (
+                await session.scalars(
+                    select(CrmMailingChange.amocrm_deal_id)
+                    .where(CrmMailingChange.status == "pending")
+                    .group_by(CrmMailingChange.amocrm_deal_id)
+                    .order_by(func.min(CrmMailingChange.changed_at))
+                    .limit(POLLING_CHANGE_BATCH)
+                )
+            ).all()
+        )
+        changes = list(
+            (
+                await session.scalars(
+                    select(CrmMailingChange)
+                    .where(
+                        CrmMailingChange.status == "pending",
+                        CrmMailingChange.amocrm_deal_id.in_(deal_ids),
+                    )
+                    .order_by(
+                        CrmMailingChange.changed_at,
+                        CrmMailingChange.event_id,
+                    )
+                )
+            ).all()
+        ) if deal_ids else []
+
+    by_deal: dict[int, list[str]] = {}
+    for change in changes:
+        by_deal.setdefault(int(change.amocrm_deal_id), []).append(change.event_id)
+    semaphore = asyncio.Semaphore(POLLING_CONCURRENCY)
+    crm = get_amocrm_service(settings)
+
+    async def process_deal(deal_id: int, event_ids: list[str]) -> None:
+        claim_token = uuid.uuid4().hex
+        async with semaphore:
+            async with SessionLocal() as session:
+                claimed = await session.execute(
+                    update(CrmMailingChange)
+                    .where(
+                        CrmMailingChange.event_id.in_(event_ids),
+                        CrmMailingChange.status == "pending",
+                    )
+                    .values(
+                        status="processing",
+                        attempts=CrmMailingChange.attempts + 1,
+                        lease_until=datetime.utcnow() + POLLING_CHANGE_LEASE,
+                        claim_token=claim_token,
+                        error_message=None,
+                    )
+                )
+                await session.commit()
+                if not claimed.rowcount:
+                    return
+            try:
+                await _process_current_deal(settings, bot, crm, deal_id)
+            except asyncio.CancelledError:
+                async with SessionLocal() as session:
+                    await session.execute(
+                        update(CrmMailingChange)
+                        .where(CrmMailingChange.claim_token == claim_token)
+                        .values(
+                            status="pending",
+                            lease_until=None,
+                            claim_token=None,
+                            error_message="incremental processing cancelled",
+                        )
+                    )
+                    await session.commit()
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "amoCRM incremental mailing change failed deal_id=%s", deal_id
+                )
+                async with SessionLocal() as session:
+                    await session.execute(
+                        update(CrmMailingChange)
+                        .where(CrmMailingChange.claim_token == claim_token)
+                        .values(
+                            status="pending",
+                            lease_until=None,
+                            claim_token=None,
+                            error_message=str(exc)[:2000],
+                        )
+                    )
+                    await session.commit()
+                return
+            async with SessionLocal() as session:
+                await session.execute(
+                    update(CrmMailingChange)
+                    .where(CrmMailingChange.claim_token == claim_token)
+                    .values(
+                        status="completed",
+                        lease_until=None,
+                        claim_token=None,
+                        processed_at=datetime.utcnow(),
+                        error_message=None,
+                    )
+                )
+                await session.commit()
+
+    await asyncio.gather(
+        *(process_deal(deal_id, event_ids) for deal_id, event_ids in by_deal.items())
+    )
+
+
+async def poll_crm_mailing_once(settings, bot: Bot | None = None) -> None:
+    """Ingest and process only amoCRM lead status changes since the cursor."""
+    ingest_error: Exception | None = None
+    try:
+        await _ingest_incremental_changes(settings)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # A temporary feed outage must not prevent already durable inbox rows
+        # from being retried in this cycle.
+        ingest_error = exc
+    await _process_pending_changes(settings, bot)
+    if ingest_error is not None:
+        raise ingest_error
 
 
 async def run_crm_mailing_polling(settings, bot: Bot | None = None) -> None:
-    while True:
+    startup_at = int(time.time())
+    await _ensure_incremental_cursor(startup_at)
+
+    async def startup_reconciliation() -> None:
         try:
-            await poll_crm_mailing_once(settings, bot)
+            await reconcile_crm_mailing_once(settings, bot)
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("amoCRM mailing polling cycle failed")
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            logger.exception("amoCRM mailing startup reconciliation failed")
+
+    reconciliation_task = asyncio.create_task(
+        startup_reconciliation(), name="crm-mailing-startup-reconciliation"
+    )
+    try:
+        while True:
+            try:
+                await poll_crm_mailing_once(settings, bot)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("amoCRM mailing polling cycle failed")
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+    finally:
+        if not reconciliation_task.done():
+            reconciliation_task.cancel()
+        await asyncio.gather(reconciliation_task, return_exceptions=True)
