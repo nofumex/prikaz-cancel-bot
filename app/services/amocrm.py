@@ -5,6 +5,7 @@ from contextvars import ContextVar
 import json
 import logging
 import mimetypes
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,16 @@ _LAST_NOTE_ERROR: ContextVar[str | None] = ContextVar("amocrm_last_note_error", 
 
 class AmoNoteVerificationPending(RuntimeError):
     """The note POST succeeded, but read-after-write is not visible yet."""
+
+
+_TECHNICAL_MAILING_LINE = re.compile(
+    r"(?mi)^\s*Событие:\s*mailing_[^\r\n]*(?:\r?\n)?|\s*\[mailing:[^\]\r\n]+\]"
+)
+
+
+def sanitize_visible_mailing_note(text: str) -> str:
+    """Last line of defence against leaking internal mailing metadata to amoCRM."""
+    return _TECHNICAL_MAILING_LINE.sub("", text).strip()
 
 PIPELINE_STATUSES = [
     "Подписался на бота",
@@ -1217,7 +1228,11 @@ class AmoCrmService:
             if event_type == "documents_delivered":
                 note_parts.append(f"Заявка #{case.id} завершена")
             if payload.get("note"):
-                note_parts.append(str(payload["note"]))
+                note_parts.append(
+                    str(payload.get("mailing_note_text") or payload["note"])
+                    if is_mailing_event
+                    else str(payload["note"])
+                )
             if payload.get("text"):
                 note_parts.append(str(payload["text"]))
             if payload.get("received_date"):
@@ -1237,8 +1252,8 @@ class AmoCrmService:
             if attached_files:
                 response_payload["attached_files"] = attached_files
 
-            note_text = "\n".join(note_parts)
-            human_note = str(payload.get("note") or "").strip() if is_mailing_event else ""
+            note_text = sanitize_visible_mailing_note("\n".join(note_parts))
+            human_note = note_text if is_mailing_event else ""
             _LAST_NOTE_ERROR.set(None)
             note_added = bool(
                 human_note

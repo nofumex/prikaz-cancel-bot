@@ -86,7 +86,9 @@ class DocumentReviewOutcome:
 
 
 def document_ai_review_mode(settings: Settings) -> str:
-    mode = str(getattr(settings, "document_ai_review_mode", "shadow") or "shadow").strip().lower()
+    # Lightweight/internal settings objects that do not explicitly opt in must
+    # stay deterministic and must not unexpectedly invoke an LLM.
+    mode = str(getattr(settings, "document_ai_review_mode", "off") or "off").strip().lower()
     return mode if mode in VALID_DOCUMENT_AI_REVIEW_MODES else "shadow"
 
 
@@ -288,15 +290,6 @@ async def create_case_documents_reviewed(
     *,
     restore_reason: str | None = None,
 ) -> DocumentReviewOutcome:
-    artifacts = create_case_documents_with_qa(case, user, settings, restore_reason=restore_reason)
-    return DocumentReviewOutcome(
-        ok=True,
-        artifacts=artifacts,
-        review={"ok": True, "severity": "ok", "needs_regeneration": False, "issues": [], "clean_fields": {}, "mode": "off"},
-    )
-
-    # Legacy AI review implementation is intentionally unreachable: production
-    # delivery uses the single facts/render extraction response directly.
     mode = document_ai_review_mode(settings)
     if mode in {"off", "shadow"}:
         artifacts = create_case_documents_with_qa(case, user, settings, restore_reason=restore_reason)

@@ -19,7 +19,12 @@ from app.adapters.max import keyboards as max_keyboards
 from app.database import SessionLocal
 from app.keyboards.common import automatic_mailing_menu
 from app.models import Case, MailingAction, MailingJob, MailingState, PavelMessageDelivery, User
-from app.services.amocrm import AmoNoteVerificationPending, PIPELINE_STATUSES, get_amocrm_service
+from app.services.amocrm import (
+    AmoNoteVerificationPending,
+    PIPELINE_STATUSES,
+    get_amocrm_service,
+    sanitize_visible_mailing_note,
+)
 from app.services.cases import ensure_user_has_case
 from app.services.reminders import _send_user_message
 from app.utils import normalize_phone
@@ -55,6 +60,19 @@ LAST_STAGE = 12
 ACTION_LEASE = timedelta(minutes=5)
 JOB_LEASE = timedelta(minutes=5)
 PAVEL_DELIVERY_LEASE = timedelta(minutes=5)
+MAILING_DELIVERY_CONCURRENCY = 10
+MAILING_ACTION_CONCURRENCY = 8
+
+
+def _visible_mailing_note(note: str, occurred_at: datetime, action_id: int) -> str:
+    """Give each real event a readable, stable identity without technical markers."""
+    timestamp = occurred_at.strftime("%d.%m.%Y %H:%M:%S UTC")
+    note = sanitize_visible_mailing_note(note)
+    return (
+        f"{note.strip()}\n\n"
+        f"Время события: {timestamp}\n"
+        f"Запись рассылки №{action_id}"
+    )
 
 
 def _add_months(value: datetime, months: int) -> datetime:
@@ -155,8 +173,10 @@ async def record_action(
     execute_immediately: bool = True,
 ) -> bool:
     """Atomically reserve a human-readable amoCRM note and optionally send it now."""
+    occurred_at = datetime.utcnow()
     payload = {
         "note": note,
+        "mailing_event_at": occurred_at.isoformat(timespec="microseconds"),
         "mailing_action_key": action_key,
         **(extra or {}),
     }
@@ -172,11 +192,16 @@ async def record_action(
             action_key=action_key,
             event_type=event_type,
             note_text=note,
-            payload_json=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            payload_json=None,
             status="pending",
         )
         session.add(action)
         try:
+            await session.flush()
+            payload["mailing_note_text"] = _visible_mailing_note(
+                note, occurred_at, action.id
+            )
+            action.payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             await session.commit()
         except IntegrityError:
             await session.rollback()
@@ -225,9 +250,23 @@ async def _execute_action(session: AsyncSession, settings, action_id: int) -> bo
         raise RuntimeError(f"mailing action target is missing action_id={action_id}")
     try:
         payload = json.loads(action.payload_json or "{}")
+        if not payload.get("mailing_note_text"):
+            # Upgrade already queued actions from older deployments. created_at
+            # is stable, so retries verify the same visible note every time.
+            occurred_at = action.created_at or datetime.utcnow()
+            payload["mailing_note_text"] = _visible_mailing_note(
+                str(payload.get("note") or action.note_text or "Обновление рассылки."),
+                occurred_at,
+                action.id,
+            )
+            payload.pop("mailing_marker", None)
+            action.payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            await session.commit()
         crm = get_amocrm_service(settings)
         if verification_only:
-            note_text = str(payload.get("note") or "").strip()
+            note_text = sanitize_visible_mailing_note(
+                str(payload.get("mailing_note_text") or "")
+            )
             lead_id = case.amocrm_lead_id or case.amo_lead_id
             if not note_text or not lead_id or not await crm.lead_note_has_text(int(lead_id), note_text):
                 await session.execute(
@@ -279,9 +318,9 @@ async def _execute_action(session: AsyncSession, settings, action_id: int) -> bo
 
 async def retry_pending_actions(session: AsyncSession, settings, *, limit: int = 100) -> None:
     now = datetime.utcnow()
-    ids = list(
+    rows = list(
         (await session.execute(
-            select(MailingAction.id)
+            select(MailingAction.id, MailingAction.user_id)
             .where(
                 MailingAction.status != "completed",
                 or_(
@@ -292,13 +331,31 @@ async def retry_pending_actions(session: AsyncSession, settings, *, limit: int =
             )
             .order_by(MailingAction.id)
             .limit(limit)
-        )).scalars()
+        )).all()
     )
-    for action_id in ids:
-        try:
-            await _execute_action(session, settings, action_id)
-        except Exception:
-            logger.exception("Mailing CRM action retry failed action_id=%s", action_id)
+    by_user: dict[int, list[int]] = {}
+    for action_id, user_id in rows:
+        by_user.setdefault(int(user_id), []).append(int(action_id))
+    semaphore = asyncio.Semaphore(MAILING_ACTION_CONCURRENCY)
+
+    async def retry_user_actions(user_id: int, action_ids: list[int]) -> None:
+        async with semaphore, SessionLocal() as action_session:
+            # Keep causal order for one client, while unrelated clients sync in parallel.
+            for action_id in action_ids:
+                try:
+                    await _execute_action(action_session, settings, action_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Mailing CRM action retry failed user_id=%s action_id=%s",
+                        user_id,
+                        action_id,
+                    )
+
+    await asyncio.gather(
+        *(retry_user_actions(user_id, action_ids) for user_id, action_ids in by_user.items())
+    )
 
 
 async def resolve_verifying_action(
@@ -448,8 +505,8 @@ async def finish_consultation(
 
 
 def pavel_consultation_key(state: MailingState, case: Case) -> str:
-    cycle = "after-no" if state.consultation_no else "initial"
-    return f"case:{case.id}:stage:{state.next_stage}:{cycle}"
+    cycle = state.consultation_cycle if state.consultation_no else 0
+    return f"case:{case.id}:stage:{state.next_stage}:consultation-cycle:{cycle}"
 
 
 async def _ensure_pavel_delivery(
@@ -663,7 +720,8 @@ async def disable_reminders(session: AsyncSession, settings, user: User) -> bool
         case,
         "reminders-disabled",
         "mailing_reminders_disabled",
-        "Система рассылок: пользователь отключил напоминания",
+        "Клиент отключил регулярную рассылку с предложением консультации.",
+        execute_immediately=False,
     )
     await record_action(
         session,
@@ -672,7 +730,8 @@ async def disable_reminders(session: AsyncSession, settings, user: User) -> bool
         case,
         "jobs-cancelled-disabled",
         "mailing_jobs_cancelled",
-        f"Система рассылок: отменены будущие задания рассылки ({cancelled})",
+        f"Будущие сообщения регулярной рассылки отменены. Отменено заданий: {cancelled}.",
+        execute_immediately=False,
     )
     return True
 
@@ -823,6 +882,16 @@ async def _deliver_job(settings, bot: Bot | None, job_id: int) -> None:
             await session.commit()
             logger.exception("Mailing CRM preflight failed job_id=%s", job_id)
             return
+        # The CRM preflight can take seconds. Re-read local state immediately
+        # before the irreversible Bot API call so a concurrent disable,
+        # consultation click or sales exclusion wins the race.
+        await session.refresh(state)
+        if not _eligible(state):
+            job.status = "cancelled"
+            job.cancelled_at = datetime.utcnow()
+            job.lease_until = None
+            await session.commit()
+            return
         telegram_markup = automatic_mailing_menu(allow_disable=job.stage >= 2)
         max_markup = max_keyboards.automatic_mailing_menu(allow_disable=job.stage >= 2)
         sent = await _send_user_message(
@@ -944,11 +1013,22 @@ async def run_automatic_mailings(settings, bot: Bot | None = None) -> None:
                 async with SessionLocal() as action_session:
                     await retry_pending_actions(action_session, settings)
 
+            delivery_semaphore = asyncio.Semaphore(MAILING_DELIVERY_CONCURRENCY)
+
+            async def deliver_job_safely(job_id: int) -> None:
+                async with delivery_semaphore:
+                    try:
+                        await _deliver_job(settings, bot, job_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("Automatic mailing delivery failed job_id=%s", job_id)
+
             # Slow amoCRM note synchronization must never hold up due client
             # deliveries. Each delivery owns its DB session and runs independently.
             await asyncio.gather(
                 retry_actions(),
-                *(_deliver_job(settings, bot, job_id) for job_id in ids),
+                *(deliver_job_safely(job_id) for job_id in ids),
             )
         except asyncio.CancelledError:
             raise

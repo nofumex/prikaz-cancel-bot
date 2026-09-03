@@ -209,6 +209,13 @@ async def _upgrade_sqlite_schema(conn) -> None:
     )
     await _sqlite_add_columns(
         conn,
+        "mailing_states",
+        [
+            ("consultation_cycle", "consultation_cycle INTEGER NOT NULL DEFAULT 0"),
+        ],
+    )
+    await _sqlite_add_columns(
+        conn,
         "mailing_actions",
         [
             ("note_text", "note_text TEXT"),
@@ -218,6 +225,13 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("lease_until", "lease_until DATETIME"),
             ("completed_at", "completed_at DATETIME"),
             ("error_message", "error_message TEXT"),
+        ],
+    )
+    await _sqlite_add_columns(
+        conn,
+        "crm_deal_notifications",
+        [
+            ("cycle", "cycle INTEGER NOT NULL DEFAULT 1"),
         ],
     )
     await conn.exec_driver_sql(

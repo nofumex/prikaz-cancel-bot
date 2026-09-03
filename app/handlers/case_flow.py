@@ -27,15 +27,22 @@ from app.services.cases import generated_case_for_user, generated_cases, get_or_
 from app.services.documents import MANUAL_REVIEW_USER_TEXT, create_case_documents_reviewed, extraction_preview
 from app.services.document_background import start_document_preparation, wait_started_document_preparation
 from app.services.app_settings import payments_enabled
+from app.services.amount_recovery import (
+    AmountRecoveryResult,
+    recover_amounts_from_mismatch,
+    save_amount_debug_snapshot,
+)
 from app.services.legal_data import (
     FIELD_LABELS,
+    AmountValidationResult,
     is_deadline_missed,
     missing_order_fields,
     normalize_debtor_name_fields,
     normalize_order_data,
     suggest_nominative_full_name,
+    validate_amounts,
 )
-from app.services.llm import extract_envelope_date, extract_order_data
+from app.services.llm import extract_envelope_date, extract_order_amounts, extract_order_data
 from app.services.order_background import start_order_extraction, wait_order_extraction
 from app.services.order_confirmation import (
     apply_confirmation_answer,
@@ -73,6 +80,87 @@ from app.services.automatic_mailings import (
 
 router = Router(name="case_flow")
 logger = logging.getLogger(__name__)
+
+
+async def _notify_admin_amount_warning(
+    bot: Bot, settings: Settings, case: Case, recovery: AmountRecoveryResult
+) -> None:
+    text = (
+        f"⚠️ Заявка #{case.id}: суммы автоматически восстановлены ({recovery.recovery_method}).\n"
+        f"Было: {recovery.old_debt_amount}\n"
+        f"Стало: {recovery.new_debt_amount}"
+    )
+    for admin_id in settings.admin_ids:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            logger.exception("Failed to notify admin %s about amount recovery", admin_id)
+
+
+async def _resolve_amount_mismatch(
+    settings: Settings,
+    session: AsyncSession | None,
+    case: Case,
+    current_user: User,
+    data: dict,
+    *,
+    bot: Bot | None = None,
+    force_retry: bool = False,
+) -> tuple[dict, AmountValidationResult, AmountRecoveryResult | None, dict | None]:
+    """Compatibility entry point for targeted, evidence-backed amount recovery."""
+    amount_check = validate_amounts(data)
+    if amount_check.ok and not force_retry:
+        return data, amount_check, None, None
+
+    retry_amounts: dict | None = None
+    recovery: AmountRecoveryResult | None = None
+    should_retry = settings.amount_retry_on_mismatch and case.order_photo_path and (
+        "amount_mismatch" in amount_check.errors or force_retry
+    )
+    if should_retry:
+        try:
+            retry_amounts = await extract_order_amounts(
+                settings,
+                session,
+                case_id=case.id,
+                user_id=current_user.id,
+                order_photo_path=case.order_photo_path,
+            )
+        except Exception:
+            logger.exception("Targeted amount OCR failed for case %s", case.id)
+
+    if settings.auto_recover_amount_mismatch:
+        recovery = recover_amounts_from_mismatch(
+            data,
+            retry_amounts,
+            min_confidence=settings.auto_recover_amount_min_confidence,
+            auto_recover=True,
+        )
+        if recovery.applied:
+            data = recovery.order_data
+            case.extracted_json = json.dumps(data, ensure_ascii=False)
+            if session is not None:
+                await session.commit()
+            amount_check = validate_amounts(data)
+            save_amount_debug_snapshot(
+                case.id,
+                {
+                    "amount_recovery_applied": True,
+                    "recovery_method": recovery.recovery_method,
+                    "qa_report": recovery.qa_report,
+                },
+            )
+            if bot:
+                await _notify_admin_amount_warning(bot, settings, case, recovery)
+            logger.warning(
+                "Amount recovery applied for case %s method=%s old=%s new=%s",
+                case.id,
+                recovery.recovery_method,
+                recovery.old_debt_amount,
+                recovery.new_debt_amount,
+            )
+
+    return data, amount_check, recovery, retry_amounts
 
 
 class CaseStates(StatesGroup):

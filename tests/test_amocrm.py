@@ -460,6 +460,36 @@ async def test_human_mailing_note_prevents_second_post_without_visible_marker():
 
 
 @pytest.mark.asyncio
+async def test_mailing_note_sanitizes_legacy_metadata_even_inside_note_text():
+    service = AmoCrmService(_settings(amocrm_enabled=True))
+    case = Case(id=70, user_id=1, amocrm_lead_id=123)
+    user = User(id=1, platform="telegram", platform_user_id="1", amocrm_current_case_id=70)
+    stored = []
+
+    async def fake_request(method, path, *, json_body=None, params=None, files=None, retries=3):
+        if method == "POST":
+            stored.append(json_body[0]["params"]["text"])
+            return {"_embedded": {"notes": [{"id": 1}]}}, None
+        return {"_embedded": {"notes": [{"params": {"text": text}} for text in stored]}}, None
+
+    service.request = fake_request
+    await service.sync_case_event(
+        None,
+        case,
+        user,
+        "mailing_message_sent",
+        {
+            "note": "Понятное примечание [mailing:legacy-secret]",
+            "mailing_note_text": "Событие: mailing_message_sent\nПонятное примечание\n[mailing:legacy-secret]",
+        },
+    )
+
+    assert stored == ["Понятное примечание"]
+
+
+
+
+@pytest.mark.asyncio
 async def test_update_lead_status_skips_backward_without_new_cycle():
     service = AmoCrmService(_settings(amocrm_enabled=True))
     calls = []
