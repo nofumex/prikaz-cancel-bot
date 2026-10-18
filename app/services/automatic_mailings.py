@@ -988,8 +988,8 @@ async def _deliver_job(settings, bot: Bot | None, job_id: int) -> None:
             await session.commit()
             return
         if job.stage in USEFUL_MAILING_TEXTS:
-            telegram_markup = useful_mailing_menu()
-            max_markup = max_keyboards.useful_mailing_menu()
+            telegram_markup = None if job.stage == -1 else useful_mailing_menu()
+            max_markup = None if job.stage == -1 else max_keyboards.useful_mailing_menu()
             message_text = USEFUL_MAILING_TEXTS[job.stage]
         else:
             telegram_markup = automatic_mailing_menu(allow_disable=job.stage >= 2)
