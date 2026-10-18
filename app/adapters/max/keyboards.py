@@ -56,6 +56,10 @@ def automatic_mailing_menu(*, allow_disable: bool) -> MaxKeyboard:
     return rows
 
 
+def useful_mailing_menu() -> MaxKeyboard:
+    return [[btn("Не присылать напоминания", "mailing:disable")]]
+
+
 def main_menu() -> MaxKeyboard:
     return [
         [btn("📝 Подготовить заявление", "case:new")],

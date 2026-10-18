@@ -44,6 +44,13 @@ def automatic_mailing_menu(*, allow_disable: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def useful_mailing_menu() -> InlineKeyboardMarkup:
+    # No consultation CTA in informational messages; allow unsubscribe.
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Не присылать напоминания", "mailing:disable")],
+    ])
+
+
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[

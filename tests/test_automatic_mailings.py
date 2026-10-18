@@ -108,9 +108,12 @@ async def test_repeated_start_creates_one_durable_first_job(mailing_db) -> None:
         jobs = list((await session.execute(select(MailingJob))).scalars())
 
     assert first.id == second.id
-    assert len(jobs) == 1
-    assert jobs[0].stage == 1
-    assert jobs[0].due_at == started + timedelta(days=7)
+    assert {job.stage for job in jobs} == {-3, -2, -1, 1}
+    due = {job.stage: job.due_at for job in jobs}
+    assert due[1] == started + timedelta(days=7)
+    assert due[-1] == started + timedelta(days=3)
+    assert due[-2] == started + timedelta(days=10)
+    assert due[-3] == started + timedelta(days=17)
 
 
 @pytest.mark.asyncio
@@ -128,7 +131,7 @@ async def test_sent_stage_schedules_only_the_next_stage(mailing_db, monkeypatch)
     await mailings._deliver_job(settings, SimpleNamespace(), job_id)
 
     async with mailing_db() as session:
-        jobs = list((await session.execute(select(MailingJob).order_by(MailingJob.stage))).scalars())
+        jobs = list((await session.execute(select(MailingJob).where(MailingJob.stage > 0).order_by(MailingJob.stage))).scalars())
         state = await session.scalar(select(MailingState))
     assert [(job.stage, job.status) for job in jobs] == [(1, "sent"), (2, "pending")]
     assert state.last_sent_stage == 1
@@ -1844,3 +1847,78 @@ async def test_expired_polling_delivery_lease_is_not_assumed_sent(mailing_db) ->
 
     assert row.status == "uncertain"
     assert row.sent_at is None
+
+
+@pytest.mark.asyncio
+async def test_useful_delivery_preserves_consultation_schedule(mailing_db, monkeypatch) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    sender = AsyncMock(return_value=True)
+    note = AsyncMock(return_value=True)
+    monkeypatch.setattr(mailings, "_send_user_message", sender)
+    monkeypatch.setattr(mailings, "record_action", note)
+    async with mailing_db() as session:
+        user = await _user(session)
+        await mailings.ensure_mailing_started(
+            session, user, started_at=datetime.utcnow() - timedelta(days=4)
+        )
+        tip_job_id = await session.scalar(select(MailingJob.id).where(MailingJob.stage == -1))
+
+    await mailings._deliver_job(settings, None, tip_job_id)
+
+    async with mailing_db() as session:
+        state = await session.scalar(select(MailingState))
+        tip = await session.get(MailingJob, tip_job_id)
+        stages = set((await session.execute(select(MailingJob.stage))).scalars())
+    assert tip.status == "sent"
+    assert state.next_stage == 1
+    assert state.last_sent_stage is None
+    assert state.last_sent_at is None
+    assert stages == {-3, -2, -1, 1}
+    assert sender.await_args.args[3] == mailings.USEFUL_MAILING_TEXTS[-1]
+    buttons = sender.await_args.kwargs["telegram_markup"].inline_keyboard
+    assert [button.callback_data for row in buttons for button in row] == ["mailing:disable"]
+    assert "Получить консультацию" not in sender.await_args.args[3]
+    assert note.await_args.args[4] == "useful-message:1"
+    assert "Клиенту отправлено сообщение полезной рассылки №1" in note.await_args.args[6]
+
+
+@pytest.mark.asyncio
+async def test_backfill_is_delayed_once_and_skips_disabled_users(mailing_db) -> None:
+    async with mailing_db() as session:
+        active = await _user(session, 1)
+        disabled = await _user(session, 2)
+        old = datetime.utcnow() - timedelta(days=100)
+        session.add(MailingState(user_id=active.id, started_at=old, next_stage=3))
+        session.add(MailingState(
+            user_id=disabled.id, started_at=old, participating=False,
+            reminders_disabled=True,
+        ))
+        await session.commit()
+        now_before = datetime.utcnow()
+        assert await mailings.backfill_useful_mailings(session) == 1
+        assert await mailings.backfill_useful_mailings(session) == 0
+        jobs = list((await session.execute(select(MailingJob))).scalars())
+    assert len(jobs) == 3
+    assert {job.stage for job in jobs} == {-1, -2, -3}
+    assert {job.user_id for job in jobs} == {active.id}
+    assert all(job.status == "pending" for job in jobs)
+    assert min(job.due_at for job in jobs) >= now_before + timedelta(days=3)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_uncertain_tip_does_not_advance_campaign(mailing_db, monkeypatch) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    monkeypatch.setattr(mailings, "record_action", AsyncMock(return_value=True))
+    async with mailing_db() as session:
+        user = await _user(session)
+        await mailings.ensure_mailing_started(session, user)
+        job = await session.scalar(select(MailingJob).where(MailingJob.stage == -2))
+        job.status = "uncertain"
+        await session.commit()
+        assert await mailings.resolve_uncertain_job(
+            session, settings, job.id, delivered=True
+        ) is True
+        state = await session.scalar(select(MailingState))
+        assert job.status == "sent"
+        assert state.next_stage == 1
+        assert state.last_sent_stage is None

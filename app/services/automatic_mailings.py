@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.max import keyboards as max_keyboards
 from app.database import SessionLocal
-from app.keyboards.common import automatic_mailing_menu
+from app.keyboards.common import automatic_mailing_menu, useful_mailing_menu
 from app.models import Case, MailingAction, MailingJob, MailingState, PavelMessageDelivery, User
 from app.services.amocrm import (
     AmoNoteVerificationPending,
@@ -56,6 +56,27 @@ FOLLOWUP_TEXT = (
     "Сегодня у нас день консультаций по решению проблем с долгами!\n\n"
     "Нажмите кнопку ниже и мы проконсультируем вас!"
 )
+# Separate durable jobs. Negative stages never advance the consultation campaign.
+# One helpful message per user; the dates are offset from joining or backfill.
+USEFUL_MAILING_TEXTS = {
+    -1: (
+        "📩 <b>Получили извещение из суда?</b>\n\n"
+        "Судебное письмо хранится на почте всего <b>7 дней</b>. "
+        "Заберите его вовремя — иначе можно пропустить срок отмены приказа."
+    ),
+    -2: (
+        "📮 <b>Отправили возражения в суд?</b>\n\n"
+        "<b>Сохраните почтовую квитанцию и трек-номер.</b> "
+        "Они помогут доказать, что вы отправили документы вовремя."
+    ),
+    -3: (
+        "⏳ <b>Получили судебный приказ?</b>\n\n"
+        "У вас есть <b>10 дней с момента получения</b>, чтобы подать возражения.\n\n"
+        "Не откладывайте — иначе отменить приказ будет сложнее."
+    ),
+}
+USEFUL_MAILING_DAYS = {-1: 3, -2: 10, -3: 17}
+
 LAST_STAGE = 12
 ACTION_LEASE = timedelta(minutes=5)
 JOB_LEASE = timedelta(minutes=5)
@@ -106,7 +127,13 @@ async def get_mailing_state(session: AsyncSession, user_id: int) -> MailingState
 
 
 async def _schedule_job(session: AsyncSession, state: MailingState, stage: int, due_at: datetime) -> MailingJob | None:
-    if stage > LAST_STAGE or state.reminders_disabled or state.excluded_sales or not state.participating:
+    if (
+        (stage < 1 and stage not in USEFUL_MAILING_TEXTS)
+        or stage > LAST_STAGE
+        or state.reminders_disabled
+        or state.excluded_sales
+        or not state.participating
+    ):
         return None
     job = await session.scalar(
         select(MailingJob).where(MailingJob.user_id == state.user_id, MailingJob.stage == stage)
@@ -120,6 +147,13 @@ async def _schedule_job(session: AsyncSession, state: MailingState, stage: int, 
         job.cancelled_at = None
         job.error_message = None
     return job
+
+
+async def _schedule_useful_jobs(
+    session: AsyncSession, state: MailingState, anchor: datetime
+) -> None:
+    for stage, days in USEFUL_MAILING_DAYS.items():
+        await _schedule_job(session, state, stage, anchor + timedelta(days=days))
 
 
 async def ensure_mailing_started(
@@ -141,8 +175,41 @@ async def ensure_mailing_started(
             raise
         return existing
     await _schedule_job(session, state, 1, due_for_stage(1, started_at))
+    await _schedule_useful_jobs(session, state, started_at)
     await session.commit()
     return state
+
+
+async def backfill_useful_mailings(session: AsyncSession, *, limit: int = 100) -> int:
+    """Schedule tips for older subscribers without releasing old overdue messages.
+
+    Existing non-eligible users and anyone with the first tip already recorded
+    are excluded. A bounded batch is processed each worker cycle.
+    """
+    has_first_tip = select(MailingJob.id).where(
+        MailingJob.user_id == MailingState.user_id,
+        MailingJob.stage == -1,
+    ).exists()
+    states = list((await session.execute(
+        select(MailingState)
+        .where(
+            MailingState.participating.is_(True),
+            MailingState.reminders_disabled.is_(False),
+            MailingState.excluded_sales.is_(False),
+            MailingState.consultation_completed.is_(False),
+            ~has_first_tip,
+        )
+        .order_by(MailingState.id)
+        .limit(limit)
+    )).scalars())
+    if not states:
+        return 0
+    anchor = datetime.utcnow()
+    for state in states:
+        await _schedule_useful_jobs(session, state, anchor)
+    await session.commit()
+    logger.info("Scheduled useful mailings for %s existing subscribers", len(states))
+    return len(states)
 
 
 async def cancel_future_jobs(session: AsyncSession, user_id: int, *, now: datetime | None = None) -> int:
@@ -920,13 +987,19 @@ async def _deliver_job(settings, bot: Bot | None, job_id: int) -> None:
             job.lease_until = None
             await session.commit()
             return
-        telegram_markup = automatic_mailing_menu(allow_disable=job.stage >= 2)
-        max_markup = max_keyboards.automatic_mailing_menu(allow_disable=job.stage >= 2)
+        if job.stage in USEFUL_MAILING_TEXTS:
+            telegram_markup = useful_mailing_menu()
+            max_markup = max_keyboards.useful_mailing_menu()
+            message_text = USEFUL_MAILING_TEXTS[job.stage]
+        else:
+            telegram_markup = automatic_mailing_menu(allow_disable=job.stage >= 2)
+            max_markup = max_keyboards.automatic_mailing_menu(allow_disable=job.stage >= 2)
+            message_text = stage_text(job.stage)
         sent = await _send_user_message(
             settings,
             bot,
             user,
-            stage_text(job.stage),
+            message_text,
             telegram_markup=telegram_markup,
             max_keyboard=max_markup,
         )
@@ -956,24 +1029,33 @@ async def _complete_job(
     job.lease_until = None
     job.uncertain_at = None
     job.error_message = None
-    state.last_sent_stage = job.stage
-    state.last_sent_at = sent_at
-    state.next_stage = job.stage + 1
-    await _schedule_job(session, state, state.next_stage, due_for_stage(state.next_stage, sent_at))
+    is_useful = job.stage in USEFUL_MAILING_TEXTS
+    if not is_useful:
+        # Tip jobs must never alter the saved consultation campaign position.
+        state.last_sent_stage = job.stage
+        state.last_sent_at = sent_at
+        state.next_stage = job.stage + 1
+        await _schedule_job(session, state, state.next_stage, due_for_stage(state.next_stage, sent_at))
     await session.commit()
     case = await _case_for_user(session, user)
+    action_key = f"useful-message:{-job.stage}" if is_useful else f"message:{job.stage}"
+    message_text = USEFUL_MAILING_TEXTS[job.stage] if is_useful else stage_text(job.stage)
+    description = (
+        f"полезной рассылки №{-job.stage}" if is_useful
+        else f"регулярной рассылки №{job.stage}"
+    )
     await record_action(
         session,
         settings,
         user,
         case,
-        f"message:{job.stage}",
+        action_key,
         "mailing_message_sent",
-        f"Клиенту отправлено сообщение регулярной рассылки №{job.stage}.\n\n"
-        f"Текст сообщения:\n{plain_message_text(stage_text(job.stage))}",
+        f"Клиенту отправлено сообщение {description}.\n\n"
+        f"Текст сообщения:\n{plain_message_text(message_text)}",
         execute_immediately=False,
     )
-    logger.info("Система рассылок: отправлено сообщение №%s user_id=%s", job.stage, user.id)
+    logger.info("Система рассылок: отправлено сообщение %s user_id=%s", action_key, user.id)
 
 
 async def recover_uncertain_jobs(session: AsyncSession) -> None:
@@ -1026,6 +1108,7 @@ async def run_automatic_mailings(settings, bot: Bot | None = None) -> None:
     while True:
         try:
             async with SessionLocal() as session:
+                await backfill_useful_mailings(session)
                 await recover_uncertain_jobs(session)
                 await recover_pavel_delivery_leases(session)
                 ids = list(
