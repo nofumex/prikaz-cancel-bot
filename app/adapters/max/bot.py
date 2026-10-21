@@ -43,7 +43,7 @@ from app.services.consultations import CONSULTATION_ACCEPTED_TEXT, CONSULTATION_
 from app.services.automatic_mailings import (
     PAVEL_MESSAGE, PHONE_REQUEST_TEXT, REMINDERS_DISABLED_TEXT, begin_consultation,
     deliver_pavel_message, disable_reminders, ensure_mailing_started,
-    prepare_consultation, save_campaign_phone,
+    prepare_consultation, save_campaign_phone, schedule_unpaid_consultation,
 )
 from app.texts import help_text, manual_received_date_prompt_text, payment_text, profile_text, welcome_text
 from app.utils import ensure_dir, h, normalize_phone, normalize_receipt_contact, parse_russian_date, parse_structured_date
@@ -265,6 +265,7 @@ async def _deliver_prepared_preview(client: MaxBotClient, event: IncomingEvent, 
     preview_file = case.preview_pdf_path or case.preview_doc_path
     if preview_file:
         await client.send_file(event.chat_id, preview_file, caption="Скрытый предпросмотр заявления.")
+        await schedule_unpaid_consultation(session, user, case)
     return await _finalize_payment(client, event, session, settings, user, case)
 
 
@@ -1319,6 +1320,7 @@ async def _generate_documents(client: MaxBotClient, event: IncomingEvent, sessio
         return
     if preview_file:
         await client.send_file(event.chat_id, preview_file, caption="Скрытый предпросмотр заявления.")
+        await schedule_unpaid_consultation(session, user, case)
     await _finalize_payment(client, event, session, settings, user, case)
 
 

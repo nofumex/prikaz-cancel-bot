@@ -76,6 +76,7 @@ from app.services.automatic_mailings import (
     disable_reminders,
     prepare_consultation,
     save_campaign_phone,
+    schedule_unpaid_consultation,
 )
 
 router = Router(name="case_flow")
@@ -418,6 +419,7 @@ async def _deliver_prepared_preview(
     preview_file = case.preview_pdf_path or case.preview_doc_path
     if preview_file:
         await message.answer_document(FSInputFile(preview_file), reply_markup=ReplyKeyboardRemove(), caption="Скрытый предпросмотр заявления.")
+        await schedule_unpaid_consultation(session, current_user, case)
     return await _finalize_payment(message, state, session, settings, current_user, case)
 
 
@@ -1328,6 +1330,7 @@ async def _generate_documents_flow(
             reply_markup=preview_reply_markup,
             caption="Скрытый предпросмотр заявления." if preview_pdf else "Скрытый предпросмотр заявления (dev-only DOCX).",
         )
+        await schedule_unpaid_consultation(session, current_user, case)
     return await _finalize_payment(message, state, session, settings, current_user, case)
 
 

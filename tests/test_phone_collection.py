@@ -17,6 +17,42 @@ from app.models import Case, User
 from app.services.amocrm import AmoCrmService
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", ["telegram", "max"])
+@pytest.mark.parametrize("preview_fails", [False, True])
+async def test_preview_schedules_consultation_before_payment_provider_failure(
+    monkeypatch, platform, preview_fails
+) -> None:
+    module = case_flow if platform == "telegram" else max_bot
+    monkeypatch.setattr(module, "payments_enabled", lambda: True)
+    schedule = AsyncMock()
+    monkeypatch.setattr(module, "schedule_unpaid_consultation", schedule)
+
+    async def payment(*args):
+        schedule.assert_awaited_once()
+        raise RuntimeError("payment provider unavailable")
+
+    monkeypatch.setattr(module, "_finalize_payment", payment)
+    preview_send = AsyncMock(side_effect=RuntimeError("preview unavailable") if preview_fails else None)
+    case = Case(id=1, user_id=7, preview_pdf_path="preview.pdf")
+    user = User(id=7, platform=platform, platform_user_id="42")
+    session, settings = SimpleNamespace(), get_settings()
+    with pytest.raises(RuntimeError, match="preview unavailable" if preview_fails else "payment provider unavailable"):
+        if platform == "telegram":
+            await module._deliver_prepared_preview(
+                SimpleNamespace(answer_document=preview_send), SimpleNamespace(), session, settings, user, case
+            )
+        else:
+            await module._deliver_prepared_preview(
+                SimpleNamespace(send_file=preview_send),
+                IncomingEvent(platform_user_id="42", chat_id="99"), session, settings, user, case
+            )
+    if preview_fails:
+        schedule.assert_not_awaited()
+    else:
+        schedule.assert_awaited_once_with(session, user, case)
+
+
 def _settings(**kwargs):
     settings = get_settings()
     return settings.__class__(**{**settings.__dict__, **kwargs})

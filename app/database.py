@@ -265,6 +265,7 @@ async def _upgrade_sqlite_schema(conn) -> None:
         conn,
         "mailing_jobs",
         [
+            ("case_id", "case_id INTEGER REFERENCES cases(id)"),
             ("lease_until", "lease_until DATETIME"),
             ("uncertain_at", "uncertain_at DATETIME"),
         ],

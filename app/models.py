@@ -254,6 +254,7 @@ class MailingJob(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    case_id: Mapped[int | None] = mapped_column(ForeignKey("cases.id"))
     stage: Mapped[int] = mapped_column(Integer, nullable=False)
     due_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True, nullable=False)

@@ -17,8 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.max import keyboards as max_keyboards
 from app.database import SessionLocal
+from app.enums import CaseStatus, PaymentStatus
 from app.keyboards.common import automatic_mailing_menu, useful_mailing_menu
-from app.models import Case, MailingAction, MailingJob, MailingState, PavelMessageDelivery, User
+from app.models import Case, MailingAction, MailingJob, MailingState, PavelMessageDelivery, Payment, User
 from app.services.amocrm import (
     AmoNoteVerificationPending,
     PIPELINE_STATUSES,
@@ -55,6 +56,11 @@ SECOND_TEXT = (
 FOLLOWUP_TEXT = (
     "Сегодня у нас день консультаций по решению проблем с долгами!\n\n"
     "Нажмите кнопку ниже и мы проконсультируем вас!"
+)
+UNPAID_CONSULTATION_STAGE = -4
+UNPAID_CONSULTATION_TEXT = (
+    "Если не получилось отменить судебный приказ, можете получить консультацию "
+    "по ситуации с долгом."
 )
 # Separate durable jobs. Negative stages never advance the consultation campaign.
 # One helpful message per user; the dates are offset from joining or backfill.
@@ -119,6 +125,8 @@ def due_for_stage(stage: int, previous_at: datetime) -> datetime:
 
 
 def stage_text(stage: int) -> str:
+    if stage == UNPAID_CONSULTATION_STAGE:
+        return UNPAID_CONSULTATION_TEXT
     return FIRST_TEXT if stage == 1 else SECOND_TEXT if stage == 2 else FOLLOWUP_TEXT
 
 
@@ -147,6 +155,57 @@ async def _schedule_job(session: AsyncSession, state: MailingState, stage: int, 
         job.cancelled_at = None
         job.error_message = None
     return job
+
+
+async def schedule_unpaid_consultation(
+    session: AsyncSession, user: User, case: Case, *, preview_sent_at: datetime | None = None
+) -> MailingJob | None:
+    """One durable offer per client, 48 hours after a successfully sent preview.
+
+    Schedule before creating the payment so provider errors and abandoned receipt
+    contact collection are covered too. Re-sending a preview keeps the first due date.
+    """
+    state = await ensure_mailing_started(session, user)
+    if not _eligible(state) or state.consultation_state != "ready" or case.paid_at or case.delivered_at:
+        return None
+    existing = await session.scalar(select(MailingJob).where(
+        MailingJob.user_id == user.id, MailingJob.stage == UNPAID_CONSULTATION_STAGE
+    ))
+    if existing is not None:
+        return existing
+    job = MailingJob(
+        user_id=user.id,
+        case_id=case.id,
+        stage=UNPAID_CONSULTATION_STAGE,
+        due_at=(preview_sent_at or datetime.utcnow()) + timedelta(days=2),
+        status="pending",
+    )
+    session.add(job)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        return await session.scalar(select(MailingJob).where(
+            MailingJob.user_id == user.id, MailingJob.stage == UNPAID_CONSULTATION_STAGE
+        ))
+    return job
+
+
+async def _unpaid_offer_allowed(session: AsyncSession, job: MailingJob, state: MailingState) -> bool:
+    if job.stage != UNPAID_CONSULTATION_STAGE:
+        return True
+    case = await session.get(Case, job.case_id, populate_existing=True) if job.case_id else None
+    if (
+        case is None or case.user_id != job.user_id or case.paid_at or case.delivered_at
+        or case.status in {CaseStatus.PAID.value, CaseStatus.DELIVERED.value, CaseStatus.SUPERSEDED.value}
+        or state.consultation_state != "ready"
+    ):
+        return False
+    paid_payment = await session.scalar(select(Payment.id).where(
+        Payment.case_id == case.id,
+        or_(Payment.status == PaymentStatus.PAID.value, Payment.paid_at.is_not(None)),
+    ).limit(1))
+    return paid_payment is None
 
 
 async def _schedule_useful_jobs(
@@ -959,7 +1018,7 @@ async def _deliver_job(settings, bot: Bot | None, job_id: int) -> None:
         await session.refresh(job)
         state = await get_mailing_state(session, job.user_id)
         user = await session.get(User, job.user_id)
-        if user is None or not _eligible(state):
+        if user is None or not _eligible(state) or not await _unpaid_offer_allowed(session, job, state):
             job.status = "cancelled"
             job.cancelled_at = datetime.utcnow()
             job.lease_until = None
@@ -981,7 +1040,7 @@ async def _deliver_job(settings, bot: Bot | None, job_id: int) -> None:
         # before the irreversible Bot API call so a concurrent disable,
         # consultation click or sales exclusion wins the race.
         await session.refresh(state)
-        if not _eligible(state):
+        if not _eligible(state) or not await _unpaid_offer_allowed(session, job, state):
             job.status = "cancelled"
             job.cancelled_at = datetime.utcnow()
             job.lease_until = None
@@ -1030,18 +1089,22 @@ async def _complete_job(
     job.uncertain_at = None
     job.error_message = None
     is_useful = job.stage in USEFUL_MAILING_TEXTS
-    if not is_useful:
-        # Tip jobs must never alter the saved consultation campaign position.
+    is_unpaid_offer = job.stage == UNPAID_CONSULTATION_STAGE
+    if not is_useful and not is_unpaid_offer:
+        # Extra offers and tips must not alter the consultation campaign position.
         state.last_sent_stage = job.stage
         state.last_sent_at = sent_at
         state.next_stage = job.stage + 1
         await _schedule_job(session, state, state.next_stage, due_for_stage(state.next_stage, sent_at))
     await session.commit()
-    case = await _case_for_user(session, user)
+    case = await session.get(Case, job.case_id) if is_unpaid_offer else None
+    if case is None:
+        case = await _case_for_user(session, user)
     action_key = f"useful-message:{-job.stage}" if is_useful else f"message:{job.stage}"
     message_text = USEFUL_MAILING_TEXTS[job.stage] if is_useful else stage_text(job.stage)
     description = (
-        f"полезной рассылки №{-job.stage}" if is_useful
+        "с предложением консультации через два дня после неоплаченного превью" if is_unpaid_offer
+        else f"полезной рассылки №{-job.stage}" if is_useful
         else f"регулярной рассылки №{job.stage}"
     )
     await record_action(
