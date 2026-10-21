@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -247,10 +247,19 @@ class MailingState(Base):
 
 
 class MailingJob(Base):
-    """Database outbox entry; one durable job per user and campaign stage."""
+    """Durable jobs: campaign stages per user, unpaid preview offers per case."""
 
     __tablename__ = "mailing_jobs"
-    __table_args__ = (UniqueConstraint("user_id", "stage", name="uq_mailing_job_user_stage"),)
+    __table_args__ = (
+        Index(
+            "uq_mailing_job_regular_user_stage", "user_id", "stage", unique=True,
+            sqlite_where=text("stage != -4"), postgresql_where=text("stage != -4"),
+        ),
+        Index(
+            "uq_mailing_job_unpaid_user_case", "user_id", "case_id", unique=True,
+            sqlite_where=text("stage = -4"), postgresql_where=text("stage = -4"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)

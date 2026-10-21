@@ -5,7 +5,7 @@ from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import get_settings
-from app.models import Base
+from app.models import Base, MailingJob
 
 settings = get_settings()
 
@@ -94,6 +94,47 @@ async def _sqlite_upgrade_crm_notification_cycle_unique(conn) -> None:
         "CREATE INDEX ix_crm_deal_notifications_lease_until ON crm_deal_notifications (lease_until)",
     ):
         await conn.exec_driver_sql(index_sql)
+
+
+async def _sqlite_upgrade_mailing_job_case_unique(conn) -> None:
+    """Replace the old table constraint, preserving every queued delivery.
+
+    SQLite cannot drop a UNIQUE table constraint in place. Rebuild in a savepoint
+    so both the data and indexes survive a failure. This never schedules previews.
+    """
+    result = await conn.exec_driver_sql(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mailing_jobs'"
+    )
+    row = result.first()
+    table_sql = "".join(str(row[0] if row else "").lower().split())
+    if "unique(user_id,stage)" not in table_sql:
+        return
+    async with conn.begin_nested():
+        await conn.exec_driver_sql("""
+            CREATE TABLE mailing_jobs_case_scope (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                case_id INTEGER REFERENCES cases(id),
+                stage INTEGER NOT NULL,
+                due_at DATETIME NOT NULL,
+                status VARCHAR(16) NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                claimed_at DATETIME, lease_until DATETIME, sent_at DATETIME,
+                cancelled_at DATETIME, uncertain_at DATETIME, error_message TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL
+            )
+        """)
+        columns = (
+            "id, user_id, case_id, stage, due_at, status, attempts, claimed_at, "
+            "lease_until, sent_at, cancelled_at, uncertain_at, error_message, created_at"
+        )
+        await conn.exec_driver_sql(
+            f"INSERT INTO mailing_jobs_case_scope ({columns}) SELECT {columns} FROM mailing_jobs"
+        )
+        await conn.exec_driver_sql("DROP TABLE mailing_jobs")
+        await conn.exec_driver_sql("ALTER TABLE mailing_jobs_case_scope RENAME TO mailing_jobs")
+        for index in MailingJob.__table__.indexes:
+            await conn.run_sync(index.create)
 
 
 async def _upgrade_sqlite_schema(conn) -> None:
@@ -270,6 +311,7 @@ async def _upgrade_sqlite_schema(conn) -> None:
             ("uncertain_at", "uncertain_at DATETIME"),
         ],
     )
+    await _sqlite_upgrade_mailing_job_case_unique(conn)
     added_mailing_state_columns = await _sqlite_add_columns(
         conn,
         "mailing_states",

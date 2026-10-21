@@ -160,7 +160,7 @@ async def _schedule_job(session: AsyncSession, state: MailingState, stage: int, 
 async def schedule_unpaid_consultation(
     session: AsyncSession, user: User, case: Case, *, preview_sent_at: datetime | None = None
 ) -> MailingJob | None:
-    """One durable offer per client, 48 hours after a successfully sent preview.
+    """One durable offer per case, 48 hours after a successfully sent preview.
 
     Schedule before creating the payment so provider errors and abandoned receipt
     contact collection are covered too. Re-sending a preview keeps the first due date.
@@ -168,14 +168,16 @@ async def schedule_unpaid_consultation(
     state = await ensure_mailing_started(session, user)
     if not _eligible(state) or state.consultation_state != "ready" or case.paid_at or case.delivered_at:
         return None
+    user_id, case_id = user.id, case.id
     existing = await session.scalar(select(MailingJob).where(
-        MailingJob.user_id == user.id, MailingJob.stage == UNPAID_CONSULTATION_STAGE
+        MailingJob.user_id == user_id, MailingJob.stage == UNPAID_CONSULTATION_STAGE,
+        MailingJob.case_id == case_id,
     ))
     if existing is not None:
         return existing
     job = MailingJob(
-        user_id=user.id,
-        case_id=case.id,
+        user_id=user_id,
+        case_id=case_id,
         stage=UNPAID_CONSULTATION_STAGE,
         due_at=(preview_sent_at or datetime.utcnow()) + timedelta(days=2),
         status="pending",
@@ -185,9 +187,13 @@ async def schedule_unpaid_consultation(
         await session.commit()
     except IntegrityError:
         await session.rollback()
-        return await session.scalar(select(MailingJob).where(
-            MailingJob.user_id == user.id, MailingJob.stage == UNPAID_CONSULTATION_STAGE
+        existing = await session.scalar(select(MailingJob).where(
+            MailingJob.user_id == user_id, MailingJob.stage == UNPAID_CONSULTATION_STAGE,
+            MailingJob.case_id == case_id,
         ))
+        if existing is None:
+            raise
+        return existing
     return job
 
 
@@ -297,8 +303,15 @@ async def record_action(
     *,
     extra: dict[str, Any] | None = None,
     execute_immediately: bool = True,
+    commit: bool = True,
 ) -> bool:
-    """Atomically reserve a human-readable amoCRM note and optionally send it now."""
+    """Reserve a readable amoCRM note and optionally send it now.
+
+    Deferred callers may use commit=False to include the outbox row in their
+    own transaction. The default preserves the existing standalone behavior.
+    """
+    if not commit and execute_immediately:
+        raise ValueError("An uncommitted CRM action must remain in the outbox")
     occurred_at = datetime.utcnow()
     payload = {
         "note": note,
@@ -328,8 +341,13 @@ async def record_action(
                 note, occurred_at, action.id
             )
             action.payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-            await session.commit()
+            if commit:
+                await session.commit()
+            else:
+                await session.flush()
         except IntegrityError:
+            if not commit:
+                raise
             await session.rollback()
             action = await session.scalar(
                 select(MailingAction).where(
@@ -1083,28 +1101,51 @@ async def _complete_job(
     state: MailingState,
     sent_at: datetime,
 ) -> None:
+    if job.stage == UNPAID_CONSULTATION_STAGE:
+        # The Bot API call already happened. If persistence fails, keep the
+        # durable sending/uncertain state for reconciliation, never a sent job
+        # without its CRM outbox entry. Do not use helpers that commit here.
+        try:
+            case = await session.get(Case, job.case_id) if job.case_id else None
+            if case is None or case.user_id != user.id:
+                raise RuntimeError(f"unpaid preview case is missing job_id={job.id}")
+            action_key = f"unpaid-preview:case:{case.id}"
+            job.status = "sent"
+            job.sent_at = sent_at
+            job.lease_until = None
+            job.uncertain_at = None
+            job.error_message = None
+            await record_action(
+                session, settings, user, case, action_key, "mailing_message_sent",
+                "Клиенту отправлено сообщение с предложением консультации через два дня "
+                f"после неоплаченного превью. Заявление №{case.id}.\n\n"
+                f"Текст сообщения:\n{plain_message_text(UNPAID_CONSULTATION_TEXT)}",
+                execute_immediately=False, commit=False,
+            )
+            await session.commit()
+        except BaseException:
+            await session.rollback()
+            raise
+        logger.info("Система рассылок: отправлено сообщение %s user_id=%s", action_key, user.id)
+        return
     job.status = "sent"
     job.sent_at = sent_at
     job.lease_until = None
     job.uncertain_at = None
     job.error_message = None
     is_useful = job.stage in USEFUL_MAILING_TEXTS
-    is_unpaid_offer = job.stage == UNPAID_CONSULTATION_STAGE
-    if not is_useful and not is_unpaid_offer:
-        # Extra offers and tips must not alter the consultation campaign position.
+    if not is_useful:
+        # Tips must not alter the consultation campaign position.
         state.last_sent_stage = job.stage
         state.last_sent_at = sent_at
         state.next_stage = job.stage + 1
         await _schedule_job(session, state, state.next_stage, due_for_stage(state.next_stage, sent_at))
     await session.commit()
-    case = await session.get(Case, job.case_id) if is_unpaid_offer else None
-    if case is None:
-        case = await _case_for_user(session, user)
+    case = await _case_for_user(session, user)
     action_key = f"useful-message:{-job.stage}" if is_useful else f"message:{job.stage}"
     message_text = USEFUL_MAILING_TEXTS[job.stage] if is_useful else stage_text(job.stage)
     description = (
-        "с предложением консультации через два дня после неоплаченного превью" if is_unpaid_offer
-        else f"полезной рассылки №{-job.stage}" if is_useful
+        f"полезной рассылки №{-job.stage}" if is_useful
         else f"регулярной рассылки №{job.stage}"
     )
     await record_action(

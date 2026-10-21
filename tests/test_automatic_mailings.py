@@ -13,7 +13,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import get_settings
-from app.database import _sqlite_upgrade_crm_notification_cycle_unique, _upgrade_sqlite_schema
+from app.database import (
+    _sqlite_upgrade_crm_notification_cycle_unique,
+    _sqlite_upgrade_mailing_job_case_unique,
+    _upgrade_sqlite_schema,
+)
 from app.models import (
     Base,
     Case,
@@ -84,6 +88,122 @@ async def test_existing_mailing_jobs_gain_nullable_case_without_losing_queue() -
             assert result.one() == (1, "pending", None)
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_case_id", [False, True])
+@pytest.mark.parametrize("crash", [False, True])
+async def test_case_scope_migration_preserves_queue_and_regular_uniqueness(has_case_id, crash, monkeypatch) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as conn:
+            await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+            await conn.run_sync(lambda sync: Base.metadata.create_all(
+                sync, tables=[table for table in Base.metadata.sorted_tables if table.name != "mailing_jobs"]
+            ))
+            await conn.exec_driver_sql(
+                "INSERT INTO users (id, platform, platform_user_id, is_manager, is_admin, "
+                "admin_notifications_enabled) VALUES (1, 'telegram', '1', 0, 0, 1)"
+            )
+            # These previews are historical. Migration must not invent deliveries.
+            for case_id in (1, 2):
+                await conn.exec_driver_sql(
+                    "INSERT INTO cases (id, user_id, platform, status, preview_pdf_path, "
+                    "order_rephoto_attempts, paid_regeneration_count, reminders_sent, amocrm_synced) "
+                    "VALUES (?, 1, 'telegram', 'preview_ready', 'old-preview.pdf', 0, 0, 0, 0)",
+                    (case_id,),
+                )
+            optional_case = "case_id INTEGER REFERENCES cases(id)," if has_case_id else ""
+            await conn.exec_driver_sql(f"""
+                CREATE TABLE mailing_jobs (
+                    id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+                    {optional_case}
+                    stage INTEGER NOT NULL, due_at DATETIME NOT NULL,
+                    status VARCHAR(16) NOT NULL, attempts INTEGER NOT NULL,
+                    claimed_at DATETIME, lease_until DATETIME, sent_at DATETIME,
+                    cancelled_at DATETIME, uncertain_at DATETIME, error_message TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                    UNIQUE (user_id, stage)
+                )
+            """)
+            for stage, status in [(1, "pending"), (2, "sending"), (-1, "uncertain"), (-2, "sent"), (-3, "cancelled")]:
+                await conn.exec_driver_sql(
+                    "INSERT INTO mailing_jobs (user_id, stage, due_at, status, attempts, "
+                    "lease_until, error_message) VALUES (1, ?, '2026-10-23 12:00:00', ?, 3, "
+                    "'2026-10-23 12:05:00', 'preserve this')", (stage, status),
+                )
+            if has_case_id:
+                await conn.exec_driver_sql(
+                    "INSERT INTO mailing_jobs (user_id, case_id, stage, due_at, status, attempts) "
+                    "VALUES (1, 1, -4, '2026-10-23 12:00:00', 'uncertain', 4)"
+                )
+            before = (await conn.exec_driver_sql("SELECT * FROM mailing_jobs ORDER BY id")).mappings().all()
+            if not has_case_id:
+                before = [dict(row, case_id=None) for row in before]
+            if crash:
+                if not has_case_id:
+                    await conn.exec_driver_sql("ALTER TABLE mailing_jobs ADD COLUMN case_id INTEGER REFERENCES cases(id)")
+                # Fail after data copy and table replacement, while rebuilding indexes.
+                with monkeypatch.context() as patch:
+                    patch.setattr(type(conn), "run_sync", AsyncMock(side_effect=RuntimeError("index failed")))
+                    with pytest.raises(RuntimeError, match="index failed"):
+                        await _sqlite_upgrade_mailing_job_case_unique(conn)
+                rows = (await conn.exec_driver_sql("SELECT * FROM mailing_jobs ORDER BY id")).mappings().all()
+                assert [dict(row) for row in rows] == [dict(row) for row in before]
+                sql = await conn.exec_driver_sql("SELECT sql FROM sqlite_master WHERE name='mailing_jobs'")
+                assert "UNIQUE (user_id, stage)" in sql.scalar_one()
+                assert not (await conn.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE name='mailing_jobs_case_scope'"
+                )).all()
+            await _upgrade_sqlite_schema(conn)
+            await _upgrade_sqlite_schema(conn)
+            after = (await conn.exec_driver_sql("SELECT * FROM mailing_jobs ORDER BY id")).mappings().all()
+            assert [dict(row) for row in after] == [dict(row) for row in before]
+            assert sum(row["stage"] == -4 for row in after) == int(has_case_id)
+            # The original campaigns stay unique even with different or NULL case IDs.
+            for case_id in (None, 1, 2):
+                with pytest.raises(IntegrityError):
+                    async with conn.begin_nested():
+                        await conn.exec_driver_sql(
+                            "INSERT INTO mailing_jobs (user_id, case_id, stage, due_at) "
+                            "VALUES (1, ?, 1, '2026-10-23 12:00:00')", (case_id,),
+                        )
+            for case_id in ((2,) if has_case_id else (1, 2)):
+                await conn.exec_driver_sql(
+                    "INSERT INTO mailing_jobs (user_id, case_id, stage, due_at) "
+                    "VALUES (1, ?, -4, '2026-10-23 12:00:00')", (case_id,),
+                )
+            with pytest.raises(IntegrityError):
+                async with conn.begin_nested():
+                    await conn.exec_driver_sql(
+                        "INSERT INTO mailing_jobs (user_id, case_id, stage, due_at) "
+                        "VALUES (1, 1, -4, '2026-10-23 12:00:00')"
+                    )
+            assert not (await conn.exec_driver_sql("PRAGMA foreign_key_check")).all()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_migration_and_tip_backfill_never_schedule_historical_previews(mailing_db) -> None:
+    async with mailing_db() as session:
+        user = await _user(session)
+        state = MailingState(user_id=user.id, started_at=datetime(2025, 1, 1))
+        old_cases = [Case(user_id=user.id, platform="telegram", status="preview_ready",
+                          preview_pdf_path="historical.pdf") for _ in range(2)]
+        session.add_all([state, *old_cases])
+        await session.commit()
+        await _upgrade_sqlite_schema(await session.connection())
+        await session.commit()
+        await mailings.backfill_useful_mailings(session)
+        assert await session.scalar(select(MailingJob.id).where(MailingJob.stage == -4)) is None
+        # An old document actually sent again after updating is a new preview
+        # delivery event; only that event starts its 48-hour timer.
+        preview_at = datetime.utcnow()
+        job = await mailings.schedule_unpaid_consultation(session, user, old_cases[1], preview_sent_at=preview_at)
+        assert job.case_id == old_cases[1].id
+        assert job.due_at == preview_at + timedelta(hours=48)
+        assert len(list((await session.scalars(select(MailingJob).where(MailingJob.stage == -4))).all())) == 1
 
 
 @pytest.mark.asyncio
@@ -201,6 +321,243 @@ async def test_unpaid_offer_checks_payment_again_after_crm_preflight(mailing_db,
     monkeypatch.setattr(mailings, "_crm_allows_job_delivery", preflight)
     await mailings._deliver_job(settings, None, job_id)
     sender.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", ["telegram", "max"])
+async def test_each_unpaid_case_has_own_delivery_and_crm_note(mailing_db, monkeypatch, platform) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    sender = AsyncMock(return_value=True)
+    monkeypatch.setattr(mailings, "_send_user_message", sender)
+    async with mailing_db() as session:
+        user = await _user(session)
+        user.platform = platform
+        cases = [Case(user_id=user.id, platform=platform, status="payment_pending") for _ in range(2)]
+        session.add_all(cases)
+        await session.commit()
+        jobs = []
+        for case in cases:
+            first = await mailings.schedule_unpaid_consultation(session, user, case)
+            repeat = await mailings.schedule_unpaid_consultation(session, user, case)
+            assert first.id == repeat.id
+            jobs.append(first.id)
+        case_ids = [case.id for case in cases]
+    for job_id in jobs:
+        await mailings._deliver_job(settings, None, job_id)
+        await mailings._deliver_job(settings, None, job_id)
+    assert sender.await_count == 2
+    async with mailing_db() as session:
+        actions = list((await session.scalars(select(MailingAction).order_by(MailingAction.case_id))).all())
+        assert [action.case_id for action in actions] == case_ids
+        assert len({action.action_key for action in actions}) == 2
+        assert len({json.loads(action.payload_json)["mailing_note_text"] for action in actions}) == 2
+        for action in actions:
+            assert action.action_key == f"unpaid-preview:case:{action.case_id}"
+            assert f"Заявление №{action.case_id}" in action.note_text
+            case = await session.get(Case, action.case_id)
+            repeat = await mailings.schedule_unpaid_consultation(session, await session.get(User, case.user_id), case)
+            assert repeat.status == "sent"
+        state = await session.scalar(select(MailingState))
+        assert state.next_stage == 1
+        assert state.last_sent_stage is None
+
+
+@pytest.mark.asyncio
+async def test_paid_case_does_not_cancel_another_unpaid_case(mailing_db, monkeypatch) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    sender = AsyncMock(return_value=True)
+    monkeypatch.setattr(mailings, "_send_user_message", sender)
+    async with mailing_db() as session:
+        user = await _user(session)
+        cases = [Case(user_id=user.id, platform="telegram", status="payment_pending") for _ in range(2)]
+        session.add_all(cases)
+        await session.commit()
+        jobs = [await mailings.schedule_unpaid_consultation(session, user, case) for case in cases]
+        job_ids = [job.id for job in jobs]
+        cases[0].paid_at = datetime.utcnow()
+        await session.commit()
+    for job_id in job_ids:
+        await mailings._deliver_job(settings, None, job_id)
+    sender.assert_awaited_once()
+    async with mailing_db() as session:
+        assert (await session.get(MailingJob, job_ids[0])).status == "cancelled"
+        assert (await session.get(MailingJob, job_ids[1])).status == "sent"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["before_note", "after_note", "commit", "cancelled"])
+async def test_unpaid_sent_status_and_crm_outbox_rollback_together(mailing_db, monkeypatch, failure) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    original_record = mailings.record_action
+    async with mailing_db() as session:
+        user = await _user(session)
+        case = Case(user_id=user.id, platform="telegram", status="preview_ready")
+        session.add(case)
+        await session.commit()
+        job = await mailings.schedule_unpaid_consultation(session, user, case)
+        job_id = job.id
+        job.status = "sending"
+        job.lease_until = datetime.utcnow() - timedelta(minutes=1)
+        await session.commit()
+        state = await mailings.get_mailing_state(session, user.id)
+
+        async def failing_record(*args, **kwargs):
+            if failure == "before_note":
+                raise RuntimeError("outbox unavailable")
+            await original_record(*args, **kwargs)
+            if failure == "cancelled":
+                raise asyncio.CancelledError()
+            raise RuntimeError("crash after outbox flush")
+
+        with monkeypatch.context() as patch:
+            if failure == "commit":
+                patch.setattr(session, "commit", AsyncMock(side_effect=RuntimeError("commit failed")))
+            else:
+                patch.setattr(mailings, "record_action", failing_record)
+            with pytest.raises(asyncio.CancelledError if failure == "cancelled" else RuntimeError):
+                await mailings._complete_job(session, settings, job, user, state, datetime.utcnow())
+
+    async with mailing_db() as session:
+        job = await session.get(MailingJob, job_id)
+        assert job.status == "sending"
+        assert job.sent_at is None
+        assert await session.scalar(select(MailingAction.id)) is None
+        await mailings.recover_uncertain_jobs(session)
+        await session.refresh(job)
+        assert job.status == "uncertain"
+        # Delivery was confirmed by reconciliation; only persistence is retried.
+        assert await mailings.resolve_uncertain_job(session, settings, job_id, delivered=True)
+        assert not await mailings.resolve_uncertain_job(session, settings, job_id, delivered=True)
+        await session.refresh(job)
+        assert job.status == "sent"
+        actions = list((await session.scalars(select(MailingAction))).all())
+        assert len(actions) == 1
+        assert actions[0].status == "pending"
+        assert actions[0].case_id == job.case_id
+
+
+@pytest.mark.asyncio
+async def test_unpaid_crm_outage_retries_note_without_resending_message(mailing_db, monkeypatch) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    sender = AsyncMock(return_value=True)
+    monkeypatch.setattr(mailings, "_send_user_message", sender)
+    crm = SimpleNamespace(sync_case_event=AsyncMock(side_effect=[RuntimeError("CRM unavailable"), None]))
+    monkeypatch.setattr(mailings, "get_amocrm_service", lambda _: crm)
+    async with mailing_db() as session:
+        user = await _user(session)
+        case = Case(user_id=user.id, platform="telegram", status="preview_ready")
+        session.add(case)
+        await session.commit()
+        job_id = (await mailings.schedule_unpaid_consultation(session, user, case)).id
+    await mailings._deliver_job(settings, None, job_id)
+    async with mailing_db() as session:
+        action = await session.scalar(select(MailingAction))
+        action_id, payload = action.id, action.payload_json
+        with pytest.raises(RuntimeError, match="CRM unavailable"):
+            await mailings._execute_action(session, settings, action_id)
+        await session.refresh(action)
+        assert action.status == "pending"
+        assert (await session.get(MailingJob, job_id)).status == "sent"
+        assert await mailings._execute_action(session, settings, action_id)
+        await session.refresh(action)
+        assert action.status == "completed"
+        assert action.payload_json == payload
+    await mailings._deliver_job(settings, None, job_id)
+    sender.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivered", [False, True])
+async def test_uncertain_unpaid_offer_is_reconciled_with_one_case_note(mailing_db, monkeypatch, delivered) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    sender = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr(mailings, "_send_user_message", sender)
+    async with mailing_db() as session:
+        user = await _user(session)
+        case = Case(user_id=user.id, platform="telegram", status="preview_ready")
+        session.add(case)
+        await session.commit()
+        job_id = (await mailings.schedule_unpaid_consultation(session, user, case)).id
+    await mailings._deliver_job(settings, None, job_id)
+    await mailings._deliver_job(settings, None, job_id)
+    sender.assert_awaited_once()
+    async with mailing_db() as session:
+        assert (await session.get(MailingJob, job_id)).status == "uncertain"
+        assert await session.scalar(select(MailingAction.id)) is None
+        assert await mailings.resolve_uncertain_job(session, settings, job_id, delivered=delivered)
+    await mailings._deliver_job(settings, None, job_id)
+    assert sender.await_count == (1 if delivered else 2)
+    async with mailing_db() as session:
+        job = await session.get(MailingJob, job_id)
+        actions = list((await session.scalars(select(MailingAction))).all())
+        assert job.status == "sent"
+        assert len(actions) == 1
+        assert actions[0].case_id == job.case_id
+
+
+@pytest.mark.asyncio
+async def test_lost_commit_ack_preserves_sent_status_and_note(mailing_db, monkeypatch) -> None:
+    settings = replace(get_settings(), amocrm_enabled=False)
+    async with mailing_db() as session:
+        user = await _user(session)
+        case = Case(user_id=user.id, platform="telegram", status="preview_ready")
+        session.add(case)
+        await session.commit()
+        job = await mailings.schedule_unpaid_consultation(session, user, case)
+        job_id = job.id
+        job.status = "sending"
+        await session.commit()
+        state = await mailings.get_mailing_state(session, user.id)
+        original_commit = session.commit
+
+        async def lost_ack():
+            await original_commit()
+            raise RuntimeError("commit acknowledgement lost")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(session, "commit", lost_ack)
+            with pytest.raises(RuntimeError, match="acknowledgement lost"):
+                await mailings._complete_job(session, settings, job, user, state, datetime.utcnow())
+    async with mailing_db() as session:
+        job = await session.get(MailingJob, job_id)
+        assert job.status == "sent"
+        actions = list((await session.scalars(select(MailingAction))).all())
+        assert len(actions) == 1
+        assert actions[0].case_id == job.case_id
+        assert actions[0].status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_parallel_previews_deduplicate_only_the_same_case(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{(tmp_path / 'mailings.db').as_posix()}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with sessions() as session:
+            user = await _user(session)
+            await mailings.ensure_mailing_started(session, user)
+            cases = [Case(user_id=user.id, platform="telegram", status="preview_ready") for _ in range(2)]
+            session.add_all(cases)
+            await session.commit()
+            user_id, case_ids = user.id, [case.id for case in cases]
+
+        async def schedule(case_id):
+            async with sessions() as session:
+                user = await session.get(User, user_id)
+                case = await session.get(Case, case_id)
+                return (await mailings.schedule_unpaid_consultation(session, user, case)).id
+
+        results = await asyncio.gather(schedule(case_ids[0]), schedule(case_ids[0]), schedule(case_ids[1]))
+        assert results[0] == results[1]
+        assert results[0] != results[2]
+        async with sessions() as session:
+            jobs = list((await session.scalars(select(MailingJob).where(
+                MailingJob.stage == mailings.UNPAID_CONSULTATION_STAGE
+            ))).all())
+            assert len(jobs) == 2
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
